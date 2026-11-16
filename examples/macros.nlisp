@@ -1,0 +1,38 @@
+(define (offset Integer) 40)
+
+(define-macro add-offset
+  (syntax-rules/typed
+    ((add-offset value)
+     ((value (Syntax Integer)))
+     (Syntax Integer)
+     (+ offset value))))
+
+(define-macro with-temp
+  (syntax-rules/typed
+    ((with-temp expression)
+     ((expression (Syntax Integer)))
+     (Syntax Integer)
+     (let (((temp Integer) 1000)) expression))))
+
+(define-macro twice
+  (syntax-rules/typed
+    ((twice value)
+     ((value (Syntax Integer)))
+     (Syntax Integer)
+     (+ value value))))
+
+(define-macro when
+  (syntax-rules/typed
+    ((when condition body)
+     ((condition (Syntax Boolean)) (body (Syntax Unit)))
+     (Syntax Unit)
+     (if condition body unit))))
+
+(defun main () Integer
+  (let (((offset Integer) 9000)
+        ((temp Integer) 1)
+        ((+ (Function (Integer Integer) Integer))
+          (lambda ((a Integer) (b Integer)) Integer 9999)))
+    (begin
+      (when true unit)
+      (with-temp (add-offset (twice (twice temp)))))))

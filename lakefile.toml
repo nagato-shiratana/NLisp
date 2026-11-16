@@ -1,0 +1,6 @@
+name = "nagato_lisp"
+version = "0.2.0"
+defaultTargets = ["NLisp"]
+
+[[lean_lib]]
+name = "NLisp"

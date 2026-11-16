@@ -1,0 +1,10 @@
+(defun main () Integer
+  (let (((base Integer) 40)
+        ((apply (Function ((Function (Integer) Integer) Integer) Integer))
+          (lambda ((f (Function (Integer) Integer))
+                   (x Integer))
+            Integer
+            (f x))))
+    (apply
+      (lambda ((n Integer)) Integer (+ base n))
+      2)))

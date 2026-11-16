@@ -1,0 +1,41 @@
+# Local build output and temporary toolchains
+/.lake/
+/.tools/
+/build/
+/build-*/
+/out/
+
+# C / native compiler artifacts
+*.obj
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.pdb
+*.ilk
+*.idb
+*.pch
+
+# Lean artifacts (outside the Lake build directory)
+*.olean
+*.ilean
+
+# Local IDE and OS state
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.user
+*.suo
+*.swp
+*.swo
+*~
+
+# Local credentials
+.env
+.env.*
+!.env.example

@@ -1,0 +1,27 @@
+; Argument types alone determine type arguments.
+(defun identity
+  (forall (T) ((value T)) T)
+  value)
+
+(defun map
+  (forall (A B)
+    ((f (Function (A) B)) (items (List A)))
+    (List B))
+  (match items
+    ((Nil) (Nil B))
+    ((Cons head tail)
+      (Cons B (f head) (map f tail)))))
+
+(defun empty
+  (forall (T) () (List T))
+  (Nil T))
+
+(defun main () Integer
+  (let (((items (List Integer))
+          (map
+            (lambda ((n Integer)) Integer (+ n 1))
+            (Cons Integer (identity 41)
+              ((type-app empty Integer))))))
+    (match items
+      ((Nil) 0)
+      ((Cons head tail) head))))

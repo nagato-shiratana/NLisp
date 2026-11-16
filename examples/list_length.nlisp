@@ -1,0 +1,14 @@
+(defun length-int
+  ((items (List Integer)))
+  Integer
+  (match items
+    ((Nil) 0)
+    ((Cons head tail) (+ 1 (length-int tail)))))
+
+(define (numbers (List Integer))
+  (Cons Integer 10
+    (Cons Integer 20
+      (Cons Integer 30 (Nil Integer)))))
+
+(defun main () Integer
+  (length-int numbers))

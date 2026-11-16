@@ -1,0 +1,12 @@
+(defun even ((n Integer)) Boolean
+  (if (integer= n 0)
+      true
+      (odd (- n 1))))
+
+(defun odd ((n Integer)) Boolean
+  (if (integer= n 0)
+      false
+      (even (- n 1))))
+
+(defun main () Integer
+  (if (even 20) 1 0))

@@ -1,0 +1,10 @@
+(defun option-or
+  ((value (Option Integer))
+   (fallback Integer))
+  Integer
+  (match value
+    ((None) fallback)
+    ((Some item) item)))
+
+(defun main () Integer
+  (option-or (Some Integer 42) 0))

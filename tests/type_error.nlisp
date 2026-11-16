@@ -1,0 +1,2 @@
+(defun main () Integer
+  (if 1 2 3))
