@@ -1,0 +1,34 @@
+; A later macro can be referenced from a template.
+(define-macro sum
+  (syntax-rules/typed
+    ((sum)
+     ()
+     (Syntax Integer)
+     0)
+    ((sum x)
+     ((x (Syntax Integer)))
+     (Syntax Integer)
+     (add-later x 0))
+    ((sum x y)
+     ((x (Syntax Integer)) (y (Syntax Integer)))
+     (Syntax Integer)
+     (add-later x y))))
+
+(defrec
+  ((even ((n Integer)) Boolean
+     (if (integer= n 0) true (odd (- n 1))))
+   (odd ((n Integer)) Boolean
+     (if (integer= n 0) false (even (- n 1))))))
+
+; The call in main also precedes the macro declaration.
+(defun main () Integer
+  (if (even 20)
+      (sum (sum 40) (sum 2 (sum)))
+      0))
+
+(define-macro add-later
+  (syntax-rules/typed
+    ((add-later x y)
+     ((x (Syntax Integer)) (y (Syntax Integer)))
+     (Syntax Integer)
+     (+ x y))))

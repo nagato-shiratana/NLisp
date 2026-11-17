@@ -1,0 +1,64 @@
+; Exercise all 26 builtin functions. The result is 42 when every check holds.
+(define-macro require-all
+  (syntax-rules/typed
+    ((require-all condition)
+     ((condition (Syntax Boolean)))
+     (Syntax Integer)
+     (if condition 42 0))))
+
+(defun all ((items (List Boolean))) Boolean
+  (match items
+    ((Nil) true)
+    ((Cons head tail) (if head (all tail) false))))
+
+(defun main () Integer
+  (require-all
+    (all
+      (Cons Boolean
+      (integer= (+ 20 22) 42)
+      (Cons Boolean
+      (integer= (- 50 8) 42)
+      (Cons Boolean
+      (integer= (* 6 7) 42)
+      (Cons Boolean
+      (match (quotient -17 5) ((None) false) ((Some n) (integer= n -3)))
+      (Cons Boolean
+      (match (remainder -17 5) ((None) false) ((Some n) (integer= n -2)))
+      (Cons Boolean
+      (< 1 2)
+      (Cons Boolean
+      (<= 2 2)
+      (Cons Boolean
+      (> 3 2)
+      (Cons Boolean
+      (>= 2 2)
+      (Cons Boolean
+      (boolean= true true)
+      (Cons Boolean
+      (not false)
+      (Cons Boolean
+      (float= (float+ 0.5 1.5) 2.0)
+      (Cons Boolean
+      (float= (float- 2.5 0.5) 2.0)
+      (Cons Boolean
+      (float= (float* 0.5 4.0) 2.0)
+      (Cons Boolean
+      (float= (float/ 4.0 2.0) 2.0)
+      (Cons Boolean
+      (float< 1.0 2.0)
+      (Cons Boolean
+      (float<= 2.0 2.0)
+      (Cons Boolean
+      (float> 3.0 2.0)
+      (Cons Boolean
+      (float>= 2.0 2.0)
+      (Cons Boolean
+      (float= (to-float 42) 42.0)
+      (Cons Boolean
+      (match (float-truncate 42.9) ((None) false) ((Some n) (integer= n 42)))
+      (Cons Boolean
+      (string= (string-append "hello " "世界") "hello 世界")
+      (Cons Boolean
+      (character= #\a #\u{61})
+      (Nil Boolean)))))))))))))))))))))))))))
+

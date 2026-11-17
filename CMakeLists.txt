@@ -17,10 +17,40 @@ endif()
 
 add_executable(nlisp src/main.c)
 target_link_libraries(nlisp PRIVATE nlisp_core)
+find_path(GMP_INCLUDE_DIR gmp.h REQUIRED)
+find_library(GMP_LIBRARY NAMES gmp REQUIRED)
+target_include_directories(nlisp_core PRIVATE ${GMP_INCLUDE_DIR})
+target_link_libraries(nlisp_core PUBLIC ${GMP_LIBRARY})
+if(NOT MSVC)
+  target_link_libraries(nlisp_core PUBLIC m)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME builtins_run COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/builtins.py $<TARGET_FILE:nlisp>)
+    add_test(NAME syntax_run COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/syntax.py $<TARGET_FILE:nlisp>)
+    find_program(NLISP_LAKE lake HINTS ${CMAKE_CURRENT_SOURCE_DIR}/.tools/lean-4.8.0/bin)
+    if(NLISP_LAKE)
+      add_test(NAME lean_build COMMAND ${NLISP_LAKE} build)
+      set_tests_properties(lean_build PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} FIXTURES_SETUP lean_library)
+      add_test(NAME lean_bridge COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/lean_bridge.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
+      add_test(NAME macro_termination COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_termination.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
+      add_test(NAME source_reader COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/source_reader.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
+      set_tests_properties(lean_bridge macro_termination source_reader PROPERTIES
+        FIXTURES_REQUIRED lean_library)
+    endif()
+  endif()
   add_test(NAME factorial_check COMMAND nlisp check ${CMAKE_CURRENT_SOURCE_DIR}/examples/factorial.nlisp)
+  add_test(NAME builtins_example COMMAND nlisp run ${CMAKE_CURRENT_SOURCE_DIR}/examples/builtins.nlisp)
+  set_tests_properties(builtins_example PROPERTIES PASS_REGULAR_EXPRESSION "42")
   add_test(NAME factorial_run COMMAND nlisp run ${CMAKE_CURRENT_SOURCE_DIR}/examples/factorial.nlisp)
   set_tests_properties(factorial_run PROPERTIES PASS_REGULAR_EXPRESSION "120")
 
@@ -39,6 +69,6 @@ if(BUILD_TESTING)
   add_test(NAME reject_type_error COMMAND nlisp check ${CMAKE_CURRENT_SOURCE_DIR}/tests/type_error.nlisp)
   set_tests_properties(reject_type_error PROPERTIES WILL_FAIL TRUE)
 
-  add_test(NAME reject_overflow COMMAND nlisp run ${CMAKE_CURRENT_SOURCE_DIR}/tests/overflow.nlisp)
-  set_tests_properties(reject_overflow PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME integer_unbounded COMMAND nlisp run ${CMAKE_CURRENT_SOURCE_DIR}/tests/overflow.nlisp)
+  set_tests_properties(integer_unbounded PROPERTIES PASS_REGULAR_EXPRESSION "9223372036854775808")
 endif()

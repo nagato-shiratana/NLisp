@@ -22,6 +22,8 @@
 # Lean artifacts (outside the Lake build directory)
 *.olean
 *.ilean
+__pycache__/
+*.pyc
 
 # Local IDE and OS state
 .vs/

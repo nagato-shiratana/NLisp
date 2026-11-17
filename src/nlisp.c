@@ -1,14 +1,19 @@
 #include "nlisp.h"
 
 #include <ctype.h>
-#include <errno.h>
+#include <float.h>
 #include <limits.h>
+#include <math.h>
+#include <gmp.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+_Static_assert(CHAR_BIT == 8 && FLT_RADIX == 2 && DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024 &&
+               sizeof(double) == 8U, "NLisp requires IEEE 754 binary64 double");
 
 typedef struct { size_t line, column; } Span;
 typedef struct {
@@ -28,15 +33,32 @@ static bool fail(Error *e, NLispStatus status, Span span, const char *fmt, ...) 
     return false;
 }
 
-typedef struct Allocation { void *ptr; struct Allocation *next; } Allocation;
+typedef struct Allocation { void *ptr; void (*cleanup)(void *); struct Allocation *next; } Allocation;
 struct Type;
 struct Macro;
+struct MacroTrace;
+struct SExpr;
+struct IdentityKey;
+struct NameObservation;
 typedef struct {
     Allocation *head;
     struct Type **type_variables;
     size_t type_variable_count;
     struct Macro *macros;
     size_t fresh_scope;
+    size_t check_index;
+    bool checking_templates;
+    NLispLimits limits;
+    bool capture_trace;
+    struct SExpr **source_forms, **normalized_forms;
+    size_t source_count, normalized_count;
+    struct MacroTrace *trace_head, *trace_tail;
+    size_t trace_count;
+    struct IdentityKey *identity_keys[1024];
+    size_t type_identity_count;
+    struct NameObservation *name_head, *name_tail;
+    size_t name_nodes;
+    size_t expansions, generated_nodes, copy_depth, check_depth, check_steps;
 } Arena;
 
 static void *aalloc(Arena *a, size_t n) {
@@ -48,7 +70,7 @@ static void *aalloc(Arena *a, size_t n) {
     if (p == NULL || x == NULL) {
         free(p); free(x); fputs("nlisp: out of memory\n", stderr); abort();
     }
-    x->ptr = p; x->next = a->head; a->head = x;
+    x->ptr = p; x->cleanup = NULL; x->next = a->head; a->head = x;
     return p;
 }
 
@@ -59,10 +81,53 @@ static char *astr(Arena *a, const char *s, size_t n) {
     return r;
 }
 
+typedef struct IdentityKey {
+    const void *key;
+    size_t identity;
+    struct IdentityKey *next;
+} IdentityKey;
+
+static IdentityKey *identity_key(Arena *a, const void *key) {
+    IdentityKey *entry;
+    size_t bucket = ((uintptr_t)key >> 3U) % 1024U;
+    for (entry = a->identity_keys[bucket]; entry != NULL; entry = entry->next)
+        if (entry->key == key) return entry;
+    return NULL;
+}
+
+static void register_identity(Arena *a, const void *key, size_t identity) {
+    size_t bucket = ((uintptr_t)key >> 3U) % 1024U;
+    IdentityKey *entry;
+    if (identity_key(a, key) != NULL) return;
+    entry = (IdentityKey *)aalloc(a, sizeof(*entry));
+    entry->key = key; entry->identity = identity;
+    entry->next = a->identity_keys[bucket]; a->identity_keys[bucket] = entry;
+}
+
+static size_t name_identity(Arena *a, const char *name) {
+    IdentityKey *entry = identity_key(a, name);
+    size_t scope;
+    if (entry != NULL) return entry->identity;
+    if (strncmp(name, "#%nlisp", 7U) == 0 && sscanf(name + 7U, "%zu", &scope) == 1 &&
+        scope <= (SIZE_MAX - 2U) / 3U) {
+        size_t identity = scope * 3U + 2U;
+        register_identity(a, name, identity); return identity;
+    }
+    return SIZE_MAX;
+}
+
+static size_t type_identity(Arena *a, const void *type) {
+    IdentityKey *entry = identity_key(a, type);
+    if (entry != NULL) return entry->identity;
+    register_identity(a, type, a->type_identity_count++);
+    return identity_key(a, type)->identity;
+}
+
 static void adestroy(Arena *a) {
     Allocation *x = a->head;
     while (x != NULL) {
         Allocation *next = x->next;
+        if (x->cleanup != NULL) x->cleanup(x->ptr);
         free(x->ptr); free(x); x = next;
     }
     a->head = NULL;
@@ -72,13 +137,116 @@ typedef enum { TK_LEFT, TK_RIGHT, TK_ATOM, TK_END } TokenKind;
 typedef struct { TokenKind kind; Span span; char *text; } Token;
 typedef struct { Token *data; size_t count; } Tokens;
 
+typedef struct { char *data; size_t length; } Text;
+
+static bool scalar(uint32_t c) {
+    return c <= 0x10ffffU && !(c >= 0xd800U && c <= 0xdfffU);
+}
+
+static bool utf8_next(const char *s, size_t length, size_t *pos, uint32_t *out) {
+    unsigned char first;
+    uint32_t value, minimum;
+    size_t count, i;
+    if (*pos >= length) return false;
+    first = (unsigned char)s[(*pos)++];
+    if (first < 0x80U) { *out = first; return true; }
+    if (first >= 0xc2U && first <= 0xdfU) { count = 1U; value = first & 31U; minimum = 0x80U; }
+    else if (first >= 0xe0U && first <= 0xefU) { count = 2U; value = first & 15U; minimum = 0x800U; }
+    else if (first >= 0xf0U && first <= 0xf4U) { count = 3U; value = first & 7U; minimum = 0x10000U; }
+    else return false;
+    for (i = 0U; i < count; i++) {
+        unsigned char next;
+        if (*pos >= length) return false;
+        next = (unsigned char)s[(*pos)++];
+        if ((next & 0xc0U) != 0x80U) return false;
+        value = (value << 6) | (next & 63U);
+    }
+    if (value < minimum || !scalar(value)) return false;
+    *out = value; return true;
+}
+
+static void utf8_put(char *out, size_t *length, uint32_t c) {
+    if (c < 0x80U) out[(*length)++] = (char)c;
+    else if (c < 0x800U) {
+        out[(*length)++] = (char)(0xc0U | (c >> 6));
+        out[(*length)++] = (char)(0x80U | (c & 63U));
+    } else if (c < 0x10000U) {
+        out[(*length)++] = (char)(0xe0U | (c >> 12));
+        out[(*length)++] = (char)(0x80U | ((c >> 6) & 63U));
+        out[(*length)++] = (char)(0x80U | (c & 63U));
+    } else {
+        out[(*length)++] = (char)(0xf0U | (c >> 18));
+        out[(*length)++] = (char)(0x80U | ((c >> 12) & 63U));
+        out[(*length)++] = (char)(0x80U | ((c >> 6) & 63U));
+        out[(*length)++] = (char)(0x80U | (c & 63U));
+    }
+}
+
+static bool unicode_escape(const char *s, size_t *pos, uint32_t *out) {
+    size_t digits = 0U;
+    uint32_t c = 0U;
+    if (s[(*pos)++] != 'u' || s[(*pos)++] != '{') return false;
+    while (s[*pos] != '}' && s[*pos] != '\0') {
+        unsigned char h = (unsigned char)s[(*pos)++];
+        unsigned int v;
+        if (h >= '0' && h <= '9') v = h - '0';
+        else if (h >= 'a' && h <= 'f') v = h - 'a' + 10U;
+        else if (h >= 'A' && h <= 'F') v = h - 'A' + 10U;
+        else return false;
+        if (++digits > 6U) return false;
+        c = c * 16U + v;
+    }
+    if (digits == 0U || s[*pos] != '}' || !scalar(c)) return false;
+    (*pos)++; *out = c; return true;
+}
+
+static bool string_literal(Arena *a, const char *s, Text *out) {
+    size_t i = 1U, length = strlen(s), used = 0U;
+    char *decoded;
+    if (length < 2U || s[0] != '"' || s[length - 1U] != '"') return false;
+    decoded = (char *)aalloc(a, length + 1U);
+    while (i < length - 1U) {
+        uint32_t c;
+        if (s[i] == '\\') {
+            i++;
+            switch (s[i]) {
+                case 'n': c = '\n'; i++; break;
+                case 'r': c = '\r'; i++; break;
+                case 't': c = '\t'; i++; break;
+                case '"': c = '"'; i++; break;
+                case '\\': c = '\\'; i++; break;
+                case 'u': if (!unicode_escape(s, &i, &c)) return false; break;
+                default: return false;
+            }
+        } else if (!utf8_next(s, length - 1U, &i, &c) || c == '"') return false;
+        if (i > length - 1U) return false;
+        utf8_put(decoded, &used, c);
+    }
+    decoded[used] = '\0'; out->data = decoded; out->length = used; return true;
+}
+
+static bool character_literal(const char *s, uint32_t *out) {
+    size_t i = 2U, length = strlen(s);
+    if (length < 3U || s[0] != '#' || s[1] != '\\') return false;
+    if (strcmp(s + 2U, "newline") == 0) { *out = '\n'; return true; }
+    if (strcmp(s + 2U, "space") == 0) { *out = ' '; return true; }
+    if (strcmp(s + 2U, "tab") == 0) { *out = '\t'; return true; }
+    if (s[2] == 'u' && s[3] == '{') return unicode_escape(s, &i, out) && i == length;
+    return utf8_next(s, length, &i, out) && i == length;
+}
+
 static bool delimiter(char c) {
-    return c == '(' || c == ')' || c == ';' || isspace((unsigned char)c) != 0;
+    return c == '(' || c == ')' || c == ';' || c == '"' || isspace((unsigned char)c) != 0;
 }
 
 static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
     size_t i = 0U, line = 1U, col = 1U, count = 0U;
     Token *ts = (Token *)aalloc(a, (len + 1U) * sizeof(*ts));
+    {
+        size_t p = 0U; uint32_t c;
+        while (p < len) if (!utf8_next(src, len, &p, &c) || c == 0U)
+            return fail(e, NLISP_PARSE_ERROR, (Span){1U, p}, "invalid UTF-8 or NUL in source");
+    }
     while (i < len) {
         char c = src[i];
         if (c == '\r' || c == '\n') {
@@ -94,9 +262,33 @@ static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
             ts[count++] = (Token){c == '(' ? TK_LEFT : TK_RIGHT, {line, col}, NULL};
             i++; col++; continue;
         }
-        if (c == '"')
-            return fail(e, NLISP_PARSE_ERROR, (Span){line, col},
-                        "string literals are not implemented in NLisp-Core");
+        if (c == '"') {
+            size_t start = i, start_col = col, start_line = line;
+            bool closed = false;
+            Text ignored;
+            i++; col++;
+            while (i < len) {
+                char next = src[i++]; col++;
+                if (next == '"') { closed = true; break; }
+                if (next == '\\' && i < len) { i++; col++; }
+                else if (next == '\n') { line++; col = 1U; }
+            }
+            ts[count] = (Token){TK_ATOM, {start_line, start_col}, astr(a, src + start, i - start)};
+            if (!closed || !string_literal(a, ts[count].text, &ignored))
+                return fail(e, NLISP_PARSE_ERROR, ts[count].span, "invalid string literal or escape");
+            count++; continue;
+        }
+        if (c == '#' && i + 1U < len && src[i + 1U] == '\\') {
+            size_t start = i, start_col = col;
+            uint32_t ignored;
+            i += 2U; col += 2U;
+            if (i < len && (src[i] == '(' || src[i] == ')' || src[i] == ';' || src[i] == '"')) { i++; col++; }
+            else while (i < len && !delimiter(src[i])) { i++; col++; }
+            ts[count] = (Token){TK_ATOM, {line, start_col}, astr(a, src + start, i - start)};
+            if (!character_literal(ts[count].text, &ignored))
+                return fail(e, NLISP_PARSE_ERROR, ts[count].span, "invalid character literal");
+            count++; continue;
+        }
         {
             size_t start = i, start_col = col;
             while (i < len && !delimiter(src[i])) { i++; col++; }
@@ -106,6 +298,14 @@ static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
         }
     }
     ts[count++] = (Token){TK_END, {line, col}, NULL};
+    {
+        size_t token;
+        for (token = 0U; token < count; token++) if (ts[token].kind == TK_ATOM) {
+            if (token > (SIZE_MAX - 4U) / 3U)
+                return fail(e, NLISP_UNKNOWN, ts[token].span, "Unknown: binding identity range exhausted");
+            register_identity(a, ts[token].text, 3U * (token + 1U) + 1U);
+        }
+    }
     out->data = ts; out->count = count;
     return true;
 }
@@ -118,9 +318,13 @@ typedef struct SExpr {
     size_t checked_arity;
     struct SExpr *expanded;
     struct Macro *origin;
+    size_t token_identity, resolved_identity;
+    size_t logical_size;
+    size_t logical_height;
+    size_t raw_size, raw_height;
 } SExpr;
 typedef struct SNode { SExpr *value; struct SNode *next; } SNode;
-typedef struct { Arena *a; Tokens ts; size_t pos; Error *e; } Parser;
+typedef struct { Arena *a; Tokens ts; size_t pos; Error *e; size_t depth; } Parser;
 
 static SExpr *parse_expr(Parser *p);
 
@@ -149,7 +353,19 @@ static SExpr *parse_list(Parser *p, Span span) {
     return r;
 }
 
+static SExpr *parse_expr_inner(Parser *p);
+
 static SExpr *parse_expr(Parser *p) {
+    SExpr *result;
+    if (p->depth >= p->a->limits.max_expansion_depth) {
+        (void)fail(p->e, NLISP_UNKNOWN, p->ts.data[p->pos].span,
+                   "Unknown: source syntax depth limit (%zu) exceeded", p->a->limits.max_expansion_depth);
+        return NULL;
+    }
+    p->depth++; result = parse_expr_inner(p); p->depth--; return result;
+}
+
+static SExpr *parse_expr_inner(Parser *p) {
     Token t = p->ts.data[p->pos];
     SExpr *r;
     if (t.kind == TK_LEFT) return parse_list(p, t.span);
@@ -163,14 +379,65 @@ static SExpr *parse_expr(Parser *p) {
     }
     p->pos++;
     r = (SExpr *)aalloc(p->a, sizeof(*r));
-    r->kind = SX_ATOM; r->span = t.span; r->atom = t.text;
+    r->kind = SX_ATOM; r->span = t.span; r->atom = t.text; r->token_identity = name_identity(p->a, t.text);
     return r;
 }
 
 typedef struct { SExpr **data; size_t count; } Forms;
 
+static bool remember_forms(Arena *a, Forms forms, bool normalized) {
+    SExpr **saved;
+    if (!a->capture_trace) return true;
+    saved = (SExpr **)aalloc(a, forms.count * sizeof(*saved));
+    if (forms.count != 0U) memcpy(saved, forms.data, forms.count * sizeof(*saved));
+    if (normalized) { a->normalized_forms = saved; a->normalized_count = forms.count; }
+    else { a->source_forms = saved; a->source_count = forms.count; }
+    return true;
+}
+
+
+static bool is_atom(const SExpr *x, const char *s);
+
+/* Desugar a recursive group before assigning declaration indices. Every
+   later phase, including scoped JSON export, sees the same flat ordering. */
+static bool flatten_defrec(Arena *a, Forms *forms, Error *e) {
+    size_t i, j, count = 0U, used = 0U;
+    SExpr **data;
+    for (i = 0U; i < forms->count; i++) {
+        SExpr *form = forms->data[i];
+        if (form->kind == SX_LIST && form->count > 0U && is_atom(form->items[0], "defrec")) {
+            if (form->count != 2U || form->items[1]->kind != SX_LIST || form->items[1]->count == 0U)
+                return fail(e, NLISP_PARSE_ERROR, form->span, "defrec requires a nonempty function group");
+            count += form->items[1]->count;
+        } else count++;
+    }
+    data = (SExpr **)aalloc(a, count * sizeof(*data));
+    for (i = 0U; i < forms->count; i++) {
+        SExpr *form = forms->data[i];
+        if (form->kind != SX_LIST || form->count == 0U || !is_atom(form->items[0], "defrec")) {
+            data[used++] = form; continue;
+        }
+        for (j = 0U; j < form->items[1]->count; j++) {
+            SExpr *entry = form->items[1]->items[j], *decl, *keyword;
+            size_t k;
+            if (entry->kind != SX_LIST || (entry->count != 3U && entry->count != 4U) ||
+                entry->items[0]->kind != SX_ATOM)
+                return fail(e, NLISP_PARSE_ERROR, entry->span, "defrec member must be a function declaration without defun");
+            decl = (SExpr *)aalloc(a, sizeof(*decl));
+            keyword = (SExpr *)aalloc(a, sizeof(*keyword));
+            keyword->kind = SX_ATOM; keyword->span = entry->span; keyword->atom = astr(a, "defun", 5U);
+            decl->kind = SX_LIST; decl->span = entry->span; decl->count = entry->count + 1U;
+            decl->items = (SExpr **)aalloc(a, decl->count * sizeof(*decl->items));
+            decl->items[0] = keyword;
+            for (k = 0U; k < entry->count; k++) decl->items[k + 1U] = entry->items[k];
+            data[used++] = decl;
+        }
+    }
+    forms->data = data; forms->count = used; return true;
+}
+
 static bool parse_forms(Arena *a, Tokens ts, Forms *out, Error *e) {
-    Parser p = {a, ts, 0U, e};
+    Parser p = {a, ts, 0U, e, 0U};
     SNode *first = NULL, *last = NULL, *node;
     size_t n = 0U, i = 0U;
     while (p.ts.data[p.pos].kind != TK_END) {
@@ -189,7 +456,7 @@ static bool is_atom(const SExpr *x, const char *s) {
     return x->kind == SX_ATOM && strcmp(x->atom, s) == 0;
 }
 
-typedef enum { TY_BOOL, TY_INT, TY_UNIT, TY_FUN, TY_LIST, TY_OPTION, TY_VAR, TY_FORALL } TypeKind;
+typedef enum { TY_BOOL, TY_INT, TY_UNIT, TY_FLOAT, TY_STRING, TY_CHAR, TY_FUN, TY_LIST, TY_OPTION, TY_VAR, TY_FORALL } TypeKind;
 typedef struct Type {
     TypeKind kind;
     struct Type *elem;
@@ -215,6 +482,9 @@ static Type *parse_type(Arena *a, const SExpr *x, Error *e) {
         size_t i;
         if (strcmp(x->atom, "Boolean") == 0) return type_new(a, TY_BOOL);
         if (strcmp(x->atom, "Integer") == 0) return type_new(a, TY_INT);
+        if (strcmp(x->atom, "Float") == 0) return type_new(a, TY_FLOAT);
+        if (strcmp(x->atom, "String") == 0) return type_new(a, TY_STRING);
+        if (strcmp(x->atom, "Character") == 0) return type_new(a, TY_CHAR);
         if (strcmp(x->atom, "Unit") == 0) return type_new(a, TY_UNIT);
         for (i = 0U; i < a->type_variable_count; i++)
             if (strcmp(a->type_variables[i]->name, x->atom) == 0) return a->type_variables[i];
@@ -247,7 +517,7 @@ static bool type_eq(const Type *a, const Type *b) {
     switch (a->kind) {
         case TY_VAR: return a == b;
         case TY_FORALL: return a == b;
-        case TY_BOOL: case TY_INT: case TY_UNIT: return true;
+        case TY_BOOL: case TY_INT: case TY_UNIT: case TY_FLOAT: case TY_STRING: case TY_CHAR: return true;
         case TY_LIST: case TY_OPTION: return type_eq(a->elem, b->elem);
         case TY_FUN:
             if (a->arity != b->arity) return false;
@@ -270,6 +540,9 @@ static void type_text(const Type *t, char *buf, size_t size) {
             return;
         case TY_BOOL: name = "Boolean"; break;
         case TY_INT: name = "Integer"; break;
+        case TY_FLOAT: name = "Float"; break;
+        case TY_STRING: name = "String"; break;
+        case TY_CHAR: name = "Character"; break;
         case TY_UNIT: name = "Unit"; break;
         case TY_LIST: case TY_OPTION: {
             char sub[160];
@@ -352,7 +625,8 @@ static bool parse_program(Arena *a, Forms forms, Program *out, Error *e) {
                     size_t k;
                     const SExpr *q = quantifiers->items[j];
                     if (q->kind != SX_ATOM || is_atom(q, "Boolean") || is_atom(q, "Integer") ||
-                        is_atom(q, "Unit") || is_atom(q, "List") || is_atom(q, "Option") ||
+                        is_atom(q, "Unit") || is_atom(q, "Float") || is_atom(q, "String") ||
+                        is_atom(q, "Character") || is_atom(q, "List") || is_atom(q, "Option") ||
                         is_atom(q, "Function") || is_atom(q, "forall") || is_atom(q, "Syntax"))
                         return fail(e, NLISP_PARSE_ERROR, q->span, "invalid type variable");
                     for (k = 0U; k < j; k++)
@@ -392,29 +666,71 @@ static bool parse_program(Arena *a, Forms forms, Program *out, Error *e) {
     out->data = ds; out->count = forms.count; return true;
 }
 
-typedef struct TBind { const char *name; Type *type; struct TBind *next; } TBind;
-static Type *tlookup(TBind *env, const char *name) {
-    for (; env != NULL; env = env->next) if (strcmp(env->name, name) == 0) return env->type;
+typedef struct TBind { const char *name; Type *type; size_t value_index, identity, type_tag; struct TBind *next; } TBind;
+static TBind *tfind(TBind *env, const char *name) {
+    for (; env != NULL; env = env->next) if (strcmp(env->name, name) == 0) return env;
     return NULL;
 }
+static Type *tlookup(TBind *env, const char *name) {
+    TBind *binding = tfind(env, name); return binding == NULL ? NULL : binding->type;
+}
 static TBind *tbind(Arena *a, TBind *env, const char *name, Type *type) {
-    TBind *b = (TBind *)aalloc(a, sizeof(*b)); b->name = name; b->type = type; b->next = env; return b;
+    TBind *b = (TBind *)aalloc(a, sizeof(*b)); b->name = name; b->type = type; b->value_index = SIZE_MAX; b->identity = name_identity(a, name); b->type_tag = type_identity(a, type); b->next = env; return b;
+}
+
+typedef struct NameObservation {
+    const char *name;
+    TBind *environment, *selected;
+    size_t line, column, definition_index;
+    struct NameObservation *next;
+} NameObservation;
+
+static bool observe_name(Arena *a, const char *name, TBind *environment, TBind *selected,
+                         Span span, size_t definition_index, Error *e) {
+    TBind *binding;
+    size_t cost = 1U;
+    NameObservation *observation;
+    if (!a->capture_trace || a->checking_templates) return true;
+    for (binding = environment; binding != NULL; binding = binding->next) {
+        if (binding->identity == SIZE_MAX)
+            return fail(e, NLISP_TYPE_ERROR, span, "unregistered lexical binding identity");
+        if (cost >= a->limits.max_generated_nodes)
+            return fail(e, NLISP_UNKNOWN, span, "Unknown: name correspondence evidence node limit exceeded");
+        cost++;
+    }
+    if (cost > a->limits.max_generated_nodes - a->name_nodes)
+        return fail(e, NLISP_UNKNOWN, span, "Unknown: name correspondence evidence node limit exceeded");
+    a->name_nodes += cost;
+    observation = (NameObservation *)aalloc(a, sizeof(*observation));
+    observation->name = name; observation->environment = environment; observation->selected = selected;
+    observation->line = span.line; observation->column = span.column;
+    observation->definition_index = definition_index;
+    if (a->name_tail != NULL) a->name_tail->next = observation; else a->name_head = observation;
+    a->name_tail = observation; return true;
 }
 
 struct RBind;
 typedef struct Macro {
     const char *name;
-    SExpr *pattern, *contracts, *template_expr;
+    SExpr *pattern, *contracts, *template_expr, *rule;
     Type **inputs, *output;
     size_t arity, declaration_index;
     TBind *type_env;
     struct RBind *runtime_env;
-    struct Macro *next;
-    bool checking;
+    struct Macro *next, *group;
 } Macro;
 
-/* Fixed-arity rules, monomorphic contracts, and references only to earlier
-   macros make template expansion finite. */
+typedef struct MacroTrace {
+    Macro *definition;
+    const SExpr *input;
+    SExpr *substitution;
+    size_t call_id, fresh_start, fresh_end;
+    struct MacroTrace *next;
+} MacroTrace;
+
+
+/* Each record represents one arity rule; group identifies its declaration.
+   Recursive rules are checked symbolically and expanded under a budget. */
 static bool collect_macros(Arena *a, Forms *forms, Error *e) {
     size_t i, count = 0U;
     for (i = 0U; i < forms->count; i++) {
@@ -423,49 +739,57 @@ static bool collect_macros(Arena *a, Forms *forms, Error *e) {
             is_atom(form->items[0], "define-macro")) {
             SExpr *rules, *rule, *pattern, *contracts, *output;
             Macro *m, *previous;
-            size_t j, k;
+            size_t j, k, rule_index;
+            Macro *group = NULL;
             if (form->count != 3U || form->items[1]->kind != SX_ATOM ||
                 form->items[2]->kind != SX_LIST)
                 return fail(e, NLISP_PARSE_ERROR, form->span, "invalid define-macro");
             rules = form->items[2];
-            if (rules->count != 2U || !is_atom(rules->items[0], "syntax-rules/typed"))
+            if (rules->count < 2U || !is_atom(rules->items[0], "syntax-rules/typed"))
                 return fail(e, NLISP_PARSE_ERROR, rules->span,
-                            "initial macro implementation requires one syntax-rules/typed rule");
-            rule = rules->items[1];
-            if (rule->kind != SX_LIST || rule->count != 4U)
-                return fail(e, NLISP_PARSE_ERROR, rule->span, "invalid typed macro rule");
-            pattern = rule->items[0]; contracts = rule->items[1]; output = rule->items[2];
-            if (pattern->kind != SX_LIST || pattern->count == 0U ||
-                !is_atom(pattern->items[0], form->items[1]->atom) ||
-                contracts->kind != SX_LIST || contracts->count != pattern->count - 1U ||
-                output->kind != SX_LIST || output->count != 2U ||
-                !is_atom(output->items[0], "Syntax"))
-                return fail(e, NLISP_PARSE_ERROR, rule->span, "invalid macro pattern or Syntax contract");
+                            "syntax-rules/typed requires at least one rule");
             for (previous = a->macros; previous != NULL; previous = previous->next)
                 if (strcmp(previous->name, form->items[1]->atom) == 0)
                     return fail(e, NLISP_TYPE_ERROR, form->span, "duplicate macro name");
-            m = (Macro *)aalloc(a, sizeof(*m));
-            m->name = form->items[1]->atom; m->pattern = pattern; m->contracts = contracts;
-            m->template_expr = rule->items[3]; m->arity = contracts->count;
-            m->declaration_index = count;
-            m->inputs = (Type **)aalloc(a, m->arity * sizeof(*m->inputs));
-            for (j = 0U; j < m->arity; j++) {
-                SExpr *c = contracts->items[j];
-                if (pattern->items[j + 1U]->kind != SX_ATOM ||
-                    c->kind != SX_LIST || c->count != 2U ||
-                    !is_atom(c->items[0], pattern->items[j + 1U]->atom) ||
-                    c->items[1]->kind != SX_LIST || c->items[1]->count != 2U ||
-                    !is_atom(c->items[1]->items[0], "Syntax"))
-                    return fail(e, NLISP_PARSE_ERROR, c->span, "input contract must be (parameter (Syntax Type)) in pattern order");
-                for (k = 0U; k < j; k++)
-                    if (strcmp(pattern->items[k + 1U]->atom, pattern->items[j + 1U]->atom) == 0)
-                        return fail(e, NLISP_PARSE_ERROR, c->span, "duplicate macro parameter");
-                m->inputs[j] = parse_type(a, c->items[1]->items[1], e);
-                if (m->inputs[j] == NULL) return false;
+            for (rule_index = 1U; rule_index < rules->count; rule_index++) {
+                rule = rules->items[rule_index];
+                if (rule->kind != SX_LIST || rule->count != 4U)
+                    return fail(e, NLISP_PARSE_ERROR, rule->span, "invalid typed macro rule");
+                pattern = rule->items[0]; contracts = rule->items[1]; output = rule->items[2];
+                if (pattern->kind != SX_LIST || pattern->count == 0U ||
+                    !is_atom(pattern->items[0], form->items[1]->atom) ||
+                    contracts->kind != SX_LIST || contracts->count != pattern->count - 1U ||
+                    output->kind != SX_LIST || output->count != 2U ||
+                    !is_atom(output->items[0], "Syntax"))
+                    return fail(e, NLISP_PARSE_ERROR, rule->span, "invalid macro pattern or Syntax contract");
+                for (previous = a->macros; previous != NULL; previous = previous->next)
+                    if (previous->group == group && previous->arity == contracts->count)
+                        return fail(e, NLISP_TYPE_ERROR, rule->span, "duplicate macro rule arity");
+                m = (Macro *)aalloc(a, sizeof(*m));
+                m->name = form->items[1]->atom; m->pattern = pattern; m->contracts = contracts;
+                m->rule = rule; m->template_expr = rule->items[3]; m->arity = contracts->count;
+                m->declaration_index = count;
+                if (group == NULL) group = m;
+                m->group = group;
+                m->inputs = (Type **)aalloc(a, m->arity * sizeof(*m->inputs));
+                for (j = 0U; j < m->arity; j++) {
+                    SExpr *c = contracts->items[j];
+                    if (pattern->items[j + 1U]->kind != SX_ATOM ||
+                        c->kind != SX_LIST || c->count != 2U ||
+                        !is_atom(c->items[0], pattern->items[j + 1U]->atom) ||
+                        c->items[1]->kind != SX_LIST || c->items[1]->count != 2U ||
+                        !is_atom(c->items[1]->items[0], "Syntax"))
+                        return fail(e, NLISP_PARSE_ERROR, c->span, "input contract must be (parameter (Syntax Type)) in pattern order");
+                    for (k = 0U; k < j; k++)
+                        if (strcmp(pattern->items[k + 1U]->atom, pattern->items[j + 1U]->atom) == 0)
+                            return fail(e, NLISP_PARSE_ERROR, c->span, "duplicate macro parameter");
+                    m->inputs[j] = parse_type(a, c->items[1]->items[1], e);
+                    if (m->inputs[j] == NULL) return false;
+                }
+                m->output = parse_type(a, output->items[1], e);
+                if (m->output == NULL) return false;
+                m->next = a->macros; a->macros = m;
             }
-            m->output = parse_type(a, output->items[1], e);
-            if (m->output == NULL) return false;
-            m->next = a->macros; a->macros = m;
         } else forms->data[count++] = form;
     }
     forms->count = count;
@@ -486,6 +810,29 @@ static bool macro_parameter(Macro *m, const char *name, size_t *index) {
     return false;
 }
 
+static SExpr *macro_node(Arena *a, Span span, Error *e) {
+    if (a->generated_nodes >= a->limits.max_generated_nodes) {
+        (void)fail(e, NLISP_UNKNOWN, span, "Unknown: generated-node limit (%zu) exceeded", a->limits.max_generated_nodes);
+        return NULL;
+    }
+    a->generated_nodes++;
+    return (SExpr *)aalloc(a, sizeof(SExpr));
+}
+
+static SExpr *copy_template_inner(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e);
+
+static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e) {
+    SExpr *result;
+    if (a->copy_depth >= a->limits.max_expansion_depth) {
+        (void)fail(e, NLISP_UNKNOWN, x->span, "Unknown: template depth limit (%zu) exceeded", a->limits.max_expansion_depth);
+        return NULL;
+    }
+    a->copy_depth++;
+    result = copy_template_inner(a, m, x, args, renames, e);
+    a->copy_depth--;
+    return result;
+}
+
 static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e);
 
 static SExpr *copy_binder(Arena *a, Macro *m, SExpr *x, Rename **renames, Error *e) {
@@ -497,37 +844,38 @@ static SExpr *copy_binder(Arena *a, Macro *m, SExpr *x, Rename **renames, Error 
         (void)fail(e, NLISP_PARSE_ERROR, x->span, "macro holes cannot occur in binding positions");
         return NULL;
     }
-    r = (SExpr *)aalloc(a, sizeof(*r)); *r = *x;
+    r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x;
     (void)snprintf(buffer, sizeof(buffer), "#%%nlisp%zu", ++a->fresh_scope);
     r->atom = astr(a, buffer, strlen(buffer));
+    r->token_identity = name_identity(a, r->atom); r->resolved_identity = 0U;
     name = (Rename *)aalloc(a, sizeof(*name));
     name->from = x->atom; name->to = r->atom; name->next = *renames; *renames = name;
     return r;
 }
 
-static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e) {
+static SExpr *copy_template_inner(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e) {
     SExpr *r;
     size_t i, index;
     Rename *name;
     if (x->kind == SX_ATOM) {
         for (name = renames; name != NULL; name = name->next) if (strcmp(name->from, x->atom) == 0) {
-            r = (SExpr *)aalloc(a, sizeof(*r)); *r = *x; r->atom = name->to; return r;
+            r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x; r->atom = name->to; r->token_identity = name_identity(a, r->atom); r->resolved_identity = 0U; return r;
         }
         if (macro_parameter(m, x->atom, &index)) return args[index];
-        r = (SExpr *)aalloc(a, sizeof(*r)); *r = *x; r->origin = m; return r;
+        r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x; r->origin = m; return r;
     }
-    r = (SExpr *)aalloc(a, sizeof(*r)); *r = *x;
+    r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x;
     r->items = (SExpr **)aalloc(a, x->count * sizeof(*r->items));
     for (i = 0U; i < x->count; i++) r->items[i] = x->items[i];
     if (x->count == 4U && is_atom(x->items[0], "lambda") && x->items[1]->kind == SX_LIST) {
-        SExpr *ps = (SExpr *)aalloc(a, sizeof(*ps)); *ps = *x->items[1];
+        SExpr *ps = macro_node(a, x->span, e); if (ps == NULL) return NULL; *ps = *x->items[1];
         ps->items = (SExpr **)aalloc(a, ps->count * sizeof(*ps->items));
         for (i = 0U; i < ps->count; i++) {
             SExpr *p = x->items[1]->items[i], *q;
             if (p->kind != SX_LIST || p->count != 2U) {
                 (void)fail(e, NLISP_PARSE_ERROR, p->span, "invalid template lambda parameter"); return NULL;
             }
-            q = (SExpr *)aalloc(a, sizeof(*q)); *q = *p;
+            q = macro_node(a, x->span, e); if (q == NULL) return NULL; *q = *p;
             q->items = (SExpr **)aalloc(a, 2U * sizeof(*q->items));
             q->items[0] = copy_binder(a, m, p->items[0], &renames, e); q->items[1] = p->items[1];
             if (q->items[0] == NULL) return NULL;
@@ -538,16 +886,16 @@ static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *
         return r->items[3] == NULL ? NULL : r;
     }
     if (x->count == 3U && is_atom(x->items[0], "let") && x->items[1]->kind == SX_LIST) {
-        SExpr *bs = (SExpr *)aalloc(a, sizeof(*bs)); Rename *body_names = renames;
+        SExpr *bs = macro_node(a, x->span, e); if (bs == NULL) return NULL; Rename *body_names = renames;
         *bs = *x->items[1]; bs->items = (SExpr **)aalloc(a, bs->count * sizeof(*bs->items));
         for (i = 0U; i < bs->count; i++) {
             SExpr *b = x->items[1]->items[i], *q, *d;
             if (b->kind != SX_LIST || b->count != 2U || b->items[0]->kind != SX_LIST || b->items[0]->count != 2U) {
                 (void)fail(e, NLISP_PARSE_ERROR, b->span, "invalid template let binding"); return NULL;
             }
-            q = (SExpr *)aalloc(a, sizeof(*q)); *q = *b;
+            q = macro_node(a, x->span, e); if (q == NULL) return NULL; *q = *b;
             q->items = (SExpr **)aalloc(a, 2U * sizeof(*q->items));
-            d = (SExpr *)aalloc(a, sizeof(*d)); *d = *b->items[0];
+            d = macro_node(a, x->span, e); if (d == NULL) return NULL; *d = *b->items[0];
             d->items = (SExpr **)aalloc(a, 2U * sizeof(*d->items));
             d->items[0] = copy_binder(a, m, b->items[0]->items[0], &body_names, e);
             d->items[1] = b->items[0]->items[1];
@@ -567,9 +915,9 @@ static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *
             if (c->kind != SX_LIST || c->count != 2U || c->items[0]->kind != SX_LIST) {
                 (void)fail(e, NLISP_PARSE_ERROR, c->span, "invalid template match clause"); return NULL;
             }
-            q = (SExpr *)aalloc(a, sizeof(*q)); *q = *c;
+            q = macro_node(a, x->span, e); if (q == NULL) return NULL; *q = *c;
             q->items = (SExpr **)aalloc(a, 2U * sizeof(*q->items));
-            p = (SExpr *)aalloc(a, sizeof(*p)); *p = *c->items[0];
+            p = macro_node(a, x->span, e); if (p == NULL) return NULL; *p = *c->items[0];
             p->items = (SExpr **)aalloc(a, p->count * sizeof(*p->items));
             if (p->count > 0U) p->items[0] = c->items[0]->items[0];
             for (j = 1U; j < p->count; j++) {
@@ -589,12 +937,32 @@ static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *
     return r;
 }
 
-static bool integer_atom(const char *s, int64_t *out) {
-    char *end = NULL; long long v;
-    if (*s == '\0') return false;
-    errno = 0; v = strtoll(s, &end, 10);
-    if (errno == ERANGE || end == s || *end != '\0') return false;
-    *out = (int64_t)v; return true;
+static bool integer_atom(const char *s) {
+    const char *p = s;
+    if (*p == '-') p++;
+    if (*p == '0') return p[1] == '\0';
+    if (*p < '1' || *p > '9') return false;
+    do { p++; } while (*p >= '0' && *p <= '9');
+    return *p == '\0';
+}
+
+static bool float_atom(const char *s, double *out) {
+    const char *p = s;
+    char *end;
+    if (*p == '-') p++;
+    if (!isdigit((unsigned char)*p)) return false;
+    while (isdigit((unsigned char)*p)) p++;
+    if (*p++ != '.' || !isdigit((unsigned char)*p)) return false;
+    while (isdigit((unsigned char)*p)) p++;
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (!isdigit((unsigned char)*p)) return false;
+        while (isdigit((unsigned char)*p)) p++;
+    }
+    if (*p != '\0') return false;
+    *out = strtod(s, &end);
+    return *end == '\0';
 }
 
 static bool require(const Type *got, const Type *want, Span span, Error *e, const char *where) {
@@ -607,27 +975,40 @@ static bool require(const Type *got, const Type *want, Span span, Error *e, cons
 static Type *check_expr(Arena *a, const SExpr *x, TBind *env, Error *e);
 
 static Type *check_macro_call(Arena *a, const SExpr *x, Macro *m, TBind *env, Error *e) {
-    size_t i;
+    size_t i, call_id = 0U, fresh_start, fresh_end;
     Type *got;
     SExpr *expanded;
-    if (m->checking) {
-        (void)fail(e, NLISP_TYPE_ERROR, x->span, "recursive macro expansion is forbidden"); return NULL;
-    }
     if (x->count - 1U != m->arity) {
         (void)fail(e, NLISP_TYPE_ERROR, x->span, "macro '%s' expects %zu arguments", m->name, m->arity); return NULL;
+    }
+    if (!a->checking_templates) {
+        if (a->expansions >= a->limits.max_expansions) {
+            (void)fail(e, NLISP_UNKNOWN, x->span, "Unknown: macro expansion limit (%zu) exceeded at '%s'", a->limits.max_expansions, m->name);
+            return NULL;
+        }
+        a->expansions++; call_id = a->expansions;
     }
     for (i = 0U; i < m->arity; i++) {
         got = check_expr(a, x->items[i + 1U], env, e);
         if (got == NULL || !require(got, m->inputs[i], x->items[i + 1U]->span, e, "macro input contract"))
             return NULL;
     }
+    /* A definition is checked against referenced macros' declared contracts.
+       Actual calls must complete their expansion and are checked afterwards. */
+    if (a->checking_templates) return m->output;
+    fresh_start = a->fresh_scope;
     expanded = copy_template(a, m, m->template_expr, x->items + 1U, NULL, e);
+    fresh_end = a->fresh_scope;
     if (expanded == NULL) return NULL;
-    m->checking = true;
     got = check_expr(a, expanded, env, e);
-    m->checking = false;
     if (got == NULL || !require(got, m->output, x->span, e, "macro output contract")) return NULL;
     ((SExpr *)x)->expanded = expanded;
+    if (a->capture_trace) {
+        MacroTrace *trace = (MacroTrace *)aalloc(a, sizeof(*trace));
+        trace->definition = m; trace->input = x; trace->substitution = expanded; trace->call_id = call_id; trace->fresh_start = fresh_start; trace->fresh_end = fresh_end;
+        if (a->trace_tail != NULL) a->trace_tail->next = trace; else a->trace_head = trace;
+        a->trace_tail = trace; a->trace_count++;
+    }
     return got;
 }
 
@@ -637,7 +1018,6 @@ static bool prepare_macros(Arena *a, Macro *m, size_t index, TBind *env, Error *
     Type *got;
     size_t i;
     if (m == NULL) return true;
-    if (!prepare_macros(a, m->next, index, env, e)) return false;
     if (m->declaration_index != index) return true;
     if (tlookup(env, m->name) != NULL)
         return fail(e, NLISP_TYPE_ERROR, m->pattern->span, "macro name conflicts with value '%s'", m->name);
@@ -649,9 +1029,7 @@ static bool prepare_macros(Arena *a, Macro *m, size_t index, TBind *env, Error *
     m->type_env = env;
     template_expr = copy_template(a, m, m->template_expr, holes, NULL, e);
     if (template_expr == NULL) return false;
-    m->checking = true;
     got = check_expr(a, template_expr, local, e);
-    m->checking = false;
     return got != NULL && require(got, m->output, m->template_expr->span, e, "macro definition output");
 }
 
@@ -840,29 +1218,64 @@ static Type *check_call(Arena *a, const SExpr *x, TBind *env, Error *e) {
     return f->result;
 }
 
+static Type *check_expr_inner(Arena *a, const SExpr *x, TBind *env, Error *e);
+
 static Type *check_expr(Arena *a, const SExpr *x, TBind *env, Error *e) {
-    int64_t ignored;
+    Type *result;
+    if (a->check_depth >= a->limits.max_expansion_depth || a->check_steps >= a->limits.max_check_steps) {
+        (void)fail(e, NLISP_UNKNOWN, x->span, "Unknown: %s limit (%zu) exceeded",
+                   a->check_depth >= a->limits.max_expansion_depth ? "expanded expression depth" : "type-check work",
+                   a->check_depth >= a->limits.max_expansion_depth ? a->limits.max_expansion_depth : a->limits.max_check_steps);
+        return NULL;
+    }
+    a->check_steps++; a->check_depth++;
+    result = check_expr_inner(a, x, env, e);
+    a->check_depth--;
+    return result;
+}
+
+static Type *check_expr_inner(Arena *a, const SExpr *x, TBind *env, Error *e) {
+    double ignored_float;
     if (x->expanded != NULL) return check_expr(a, x->expanded, env, e);
     if (x->kind == SX_ATOM) {
         Type *t;
+        if (x->atom[0] == '"') return type_new(a, TY_STRING);
+        if (x->atom[0] == '#' && x->atom[1] == '\\') return type_new(a, TY_CHAR);
         if (strcmp(x->atom, "true") == 0 || strcmp(x->atom, "false") == 0) return type_new(a, TY_BOOL);
         if (strcmp(x->atom, "unit") == 0) return type_new(a, TY_UNIT);
-        if (integer_atom(x->atom, &ignored)) return type_new(a, TY_INT);
-        t = tlookup(x->origin == NULL ? env : x->origin->type_env, x->atom);
+        if (integer_atom(x->atom)) return type_new(a, TY_INT);
+        if (float_atom(x->atom, &ignored_float)) return type_new(a, TY_FLOAT);
+        if (x->origin != NULL && !a->checking_templates) {
+            TBind *binding = tfind(x->origin->type_env, x->atom);
+            if (binding != NULL && binding->value_index != SIZE_MAX && binding->value_index >= a->check_index) {
+                (void)fail(e, NLISP_TYPE_ERROR, x->span, "macro requires value '%s' before its initialization", x->atom);
+                return NULL;
+            }
+        }
+        {
+            TBind *environment = x->origin == NULL ? env : x->origin->type_env;
+            TBind *selected = tfind(environment, x->atom);
+            t = selected == NULL ? NULL : selected->type;
+            ((SExpr *)x)->resolved_identity = selected == NULL ? 0U : selected->identity;
+            if (selected != NULL && !observe_name(a, x->atom, environment, selected, x->span,
+                    x->origin == NULL ? SIZE_MAX : x->origin->declaration_index, e)) return NULL;
+        }
         if (t == NULL) (void)fail(e, NLISP_TYPE_ERROR, x->span, "unbound identifier '%s'", x->atom);
         return t;
     }
     if (x->count == 0U) { (void)fail(e, NLISP_PARSE_ERROR, x->span, "empty list is not an expression"); return NULL; }
     if (x->items[0]->kind == SX_ATOM) {
         Macro *m;
+        bool found = false;
         for (m = a->macros; m != NULL; m = m->next)
             if (strcmp(m->name, x->items[0]->atom) == 0) {
-                if (m->type_env == NULL ||
-                    (x->items[0]->origin != NULL &&
-                     m == x->items[0]->origin))
-                    break;
-                return check_macro_call(a, x, m, env, e);
+                found = true;
+                if (m->arity == x->count - 1U) return check_macro_call(a, x, m, env, e);
             }
+        if (found) {
+            (void)fail(e, NLISP_TYPE_ERROR, x->span, "no macro rule for '%s' with %zu arguments", x->items[0]->atom, x->count - 1U);
+            return NULL;
+        }
     }
     if (is_atom(x->items[0], "type-app")) return check_type_app(a, x, env, e);
     if (is_atom(x->items[0], "if")) return check_if(a, x, env, e);
@@ -901,19 +1314,64 @@ static Type *check_expr(Arena *a, const SExpr *x, TBind *env, Error *e) {
     return check_call(a, x, env, e);
 }
 
-static TBind *add_builtin_type(Arena *a, TBind *env, const char *name, TypeKind result) {
-    Type **ps = (Type **)aalloc(a, 2U * sizeof(*ps));
-    ps[0] = type_new(a, TY_INT); ps[1] = type_new(a, TY_INT);
-    return tbind(a, env, name, type_fun(a, ps, 2U, type_new(a, result)));
-}
+typedef enum {
+    BI_ADD, BI_SUB, BI_MUL, BI_LT, BI_LE, BI_GT, BI_GE, BI_EQ,
+    BI_QUOTIENT, BI_REMAINDER, BI_BOOL_EQ, BI_NOT,
+    BI_FADD, BI_FSUB, BI_FMUL, BI_FDIV, BI_FLT, BI_FLE, BI_FGT, BI_FGE, BI_FEQ,
+    BI_TO_FLOAT, BI_TRUNCATE, BI_STRING_EQ, BI_STRING_APPEND, BI_CHAR_EQ
+} Builtin;
+
+typedef struct {
+    const char *name;
+    Builtin operation;
+    TypeKind input, output;
+    size_t arity;
+    bool optional;
+} BuiltinSpec;
+
+static const BuiltinSpec builtin_specs[] = {
+    {"+", BI_ADD, TY_INT, TY_INT, 2U, false},
+    {"-", BI_SUB, TY_INT, TY_INT, 2U, false},
+    {"*", BI_MUL, TY_INT, TY_INT, 2U, false},
+    {"<", BI_LT, TY_INT, TY_BOOL, 2U, false},
+    {"<=", BI_LE, TY_INT, TY_BOOL, 2U, false},
+    {">", BI_GT, TY_INT, TY_BOOL, 2U, false},
+    {">=", BI_GE, TY_INT, TY_BOOL, 2U, false},
+    {"integer=", BI_EQ, TY_INT, TY_BOOL, 2U, false},
+    {"quotient", BI_QUOTIENT, TY_INT, TY_INT, 2U, true},
+    {"remainder", BI_REMAINDER, TY_INT, TY_INT, 2U, true},
+    {"boolean=", BI_BOOL_EQ, TY_BOOL, TY_BOOL, 2U, false},
+    {"not", BI_NOT, TY_BOOL, TY_BOOL, 1U, false},
+    {"float+", BI_FADD, TY_FLOAT, TY_FLOAT, 2U, false},
+    {"float-", BI_FSUB, TY_FLOAT, TY_FLOAT, 2U, false},
+    {"float*", BI_FMUL, TY_FLOAT, TY_FLOAT, 2U, false},
+    {"float/", BI_FDIV, TY_FLOAT, TY_FLOAT, 2U, false},
+    {"float<", BI_FLT, TY_FLOAT, TY_BOOL, 2U, false},
+    {"float<=", BI_FLE, TY_FLOAT, TY_BOOL, 2U, false},
+    {"float>", BI_FGT, TY_FLOAT, TY_BOOL, 2U, false},
+    {"float>=", BI_FGE, TY_FLOAT, TY_BOOL, 2U, false},
+    {"float=", BI_FEQ, TY_FLOAT, TY_BOOL, 2U, false},
+    {"to-float", BI_TO_FLOAT, TY_INT, TY_FLOAT, 1U, false},
+    {"float-truncate", BI_TRUNCATE, TY_FLOAT, TY_INT, 1U, true},
+    {"string=", BI_STRING_EQ, TY_STRING, TY_BOOL, 2U, false},
+    {"string-append", BI_STRING_APPEND, TY_STRING, TY_STRING, 2U, false},
+    {"character=", BI_CHAR_EQ, TY_CHAR, TY_BOOL, 2U, false}
+};
 
 static TBind *type_builtins(Arena *a) {
     TBind *env = NULL;
-    env = add_builtin_type(a, env, "+", TY_INT);
-    env = add_builtin_type(a, env, "-", TY_INT);
-    env = add_builtin_type(a, env, "*", TY_INT);
-    env = add_builtin_type(a, env, "<=", TY_BOOL);
-    env = add_builtin_type(a, env, "integer=", TY_BOOL);
+    size_t i, j;
+    for (i = 0U; i < sizeof(builtin_specs) / sizeof(builtin_specs[0]); i++) {
+        const BuiltinSpec *spec = &builtin_specs[i];
+        Type **ps = (Type **)aalloc(a, spec->arity * sizeof(*ps));
+        Type *result = type_new(a, spec->output);
+        for (j = 0U; j < spec->arity; j++) ps[j] = type_new(a, spec->input);
+        if (spec->optional) {
+            Type *option = type_new(a, TY_OPTION); option->elem = result; result = option;
+        }
+        register_identity(a, spec->name, 3U * (i + 1U));
+        env = tbind(a, env, spec->name, type_fun(a, ps, spec->arity, result));
+    }
     return env;
 }
 
@@ -933,8 +1391,28 @@ static bool check_program(Arena *a, Program *p, Error *e) {
         if (tlookup(env, f->name) != NULL) return fail(e, NLISP_TYPE_ERROR, f->span, "duplicate name '%s'", f->name);
         env = tbind(a, env, f->name, f->type);
     }
+    {
+        TBind *scope = env;
+        for (i = 0U; i <= p->count; i++) {
+            Macro *m;
+            for (m = a->macros; m != NULL; m = m->next)
+                if (m->declaration_index == i) m->type_env = scope;
+            if (i < p->count && p->data[i].kind == D_VAL) {
+                scope = tbind(a, scope, p->data[i].as.val.name, p->data[i].as.val.type);
+                scope->value_index = i;
+            }
+        }
+        a->checking_templates = true;
+        for (i = 0U; i <= p->count; i++) {
+            for (Macro *m = a->macros; m != NULL; m = m->next) {
+                if (m->declaration_index == i &&
+                    !prepare_macros(a, m, i, m->type_env, e)) return false;
+            }
+        }
+        a->checking_templates = false;
+    }
     for (i = 0U; i < p->count; i++) {
-        if (!prepare_macros(a, a->macros, i, env, e)) return false;
+        a->check_index = i;
         if (p->data[i].kind == D_FUN) {
             FunDef *f = &p->data[i].as.fun; TBind *local = env; Type *got;
             a->type_variables = f->type->kind == TY_FORALL ? f->type->variables : NULL;
@@ -951,7 +1429,6 @@ static bool check_program(Arena *a, Program *p, Error *e) {
             env = tbind(a, env, v->name, v->type);
         }
     }
-    if (!prepare_macros(a, a->macros, p->count, env, e)) return false;
     {
         Type *main_t = tlookup(env, "main");
         if (main_t == NULL || main_t->kind != TY_FUN || main_t->arity != 0U || !type_eq(main_t->result, &integer))
@@ -963,20 +1440,26 @@ static bool check_program(Arena *a, Program *p, Error *e) {
 
 typedef struct Value Value;
 typedef struct RBind RBind;
-typedef enum { BI_ADD, BI_SUB, BI_MUL, BI_LE, BI_EQ } Builtin;
-typedef enum { V_BOOL, V_INT, V_UNIT, V_CLOSURE, V_BUILTIN, V_NIL, V_CONS, V_NONE, V_SOME } VKind;
+typedef enum { V_BOOL, V_INT, V_UNIT, V_FLOAT, V_STRING, V_CHAR, V_CLOSURE, V_BUILTIN, V_NIL, V_CONS, V_NONE, V_SOME } VKind;
 typedef struct { Param *params; size_t arity; SExpr *body; RBind *env; } Closure;
 struct Value {
     VKind kind;
     union {
-        bool boolean; int64_t integer; Closure closure; Builtin builtin;
+        bool boolean; mpz_t integer; double floating; Text text; uint32_t character; Closure closure; Builtin builtin;
         struct { Value *head, *tail; } cons; Value *some;
     } as;
 };
 struct RBind { const char *name; Value *value; RBind *next; };
 typedef struct { Arena *a; Error *e; } Runtime;
 
-static Value *vnew(Runtime *r, VKind k) { Value *v = (Value *)aalloc(r->a, sizeof(*v)); v->kind = k; return v; }
+static void clear_integer(void *ptr) { mpz_clear(((Value *)ptr)->as.integer); }
+static Value *vnew(Runtime *r, VKind k) {
+    Value *v = (Value *)aalloc(r->a, sizeof(*v));
+    v->kind = k;
+    if (k == V_INT) { mpz_init(v->as.integer); r->a->head->cleanup = clear_integer; }
+    return v;
+}
+
 static RBind *rbind(Runtime *r, RBind *env, const char *name, Value *v) {
     RBind *b = (RBind *)aalloc(r->a, sizeof(*b)); b->name = name; b->value = v; b->next = env; return b;
 }
@@ -985,45 +1468,132 @@ static Value *rlookup(RBind *env, const char *name) {
     return NULL;
 }
 
-static bool add_ok(int64_t a, int64_t b, int64_t *r) {
-    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return false;
-    *r = a + b; return true;
-}
-static bool sub_ok(int64_t a, int64_t b, int64_t *r) {
-    if ((b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b)) return false;
-    *r = a - b; return true;
-}
-static bool mul_ok(int64_t a, int64_t b, int64_t *r) {
-    if (a == 0 || b == 0) { *r = 0; return true; }
-    if ((a == -1 && b == INT64_MIN) || (b == -1 && a == INT64_MIN)) return false;
-    if (a > 0) {
-        if ((b > 0 && a > INT64_MAX / b) || (b < 0 && b < INT64_MIN / a)) return false;
-    } else {
-        if ((b > 0 && a < INT64_MIN / b) || (b < 0 && a < INT64_MAX / b)) return false;
-    }
-    *r = a * b; return true;
+/* GMP's mpz_get_d truncates. Round the discarded magnitude bits explicitly
+   to nearest, ties to even before converting the exact 53-bit significand. */
+static double integer_to_float(const mpz_t value) {
+    mpz_t magnitude, significand;
+    size_t bits, shift;
+    double result;
+    int sign = mpz_sgn(value);
+    if (sign == 0) return 0.0;
+    mpz_init(magnitude); mpz_abs(magnitude, value);
+    bits = mpz_sizeinbase(magnitude, 2);
+    if (bits <= 53U) { result = mpz_get_d(value); mpz_clear(magnitude); return result; }
+    if (bits > 1024U) { mpz_clear(magnitude); return sign < 0 ? -INFINITY : INFINITY; }
+    shift = bits - 53U;
+    mpz_init(significand); mpz_fdiv_q_2exp(significand, magnitude, (mp_bitcnt_t)shift);
+    if (mpz_tstbit(magnitude, (mp_bitcnt_t)(shift - 1U)) &&
+        (mpz_scan1(magnitude, 0U) < shift - 1U || mpz_odd_p(significand)))
+        mpz_add_ui(significand, significand, 1U);
+    result = ldexp(mpz_get_d(significand), (int)shift);
+    mpz_clear(significand); mpz_clear(magnitude);
+    return sign < 0 ? -result : result;
 }
 
 static Value *eval(Runtime *r, const SExpr *x, RBind *env);
 
 static Value *apply(Runtime *r, Value *f, Value **args, size_t n, Span span) {
-    size_t i; RBind *local; Value *v; int64_t result = 0;
+    size_t i; RBind *local; Value *v;
     if (f->kind == V_BUILTIN) {
+        if (f->as.builtin == BI_STRING_EQ || f->as.builtin == BI_STRING_APPEND || f->as.builtin == BI_CHAR_EQ) {
+            VKind expected = f->as.builtin == BI_CHAR_EQ ? V_CHAR : V_STRING;
+            if (n != 2U || args[0]->kind != expected || args[1]->kind != expected) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal text builtin type error"); return NULL;
+            }
+            if (f->as.builtin == BI_STRING_APPEND) {
+                Text left = args[0]->as.text, right = args[1]->as.text;
+                if (left.length > SIZE_MAX - right.length - 1U) {
+                    (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "String size overflow"); return NULL;
+                }
+                v = vnew(r, V_STRING); v->as.text.length = left.length + right.length;
+                v->as.text.data = (char *)aalloc(r->a, v->as.text.length + 1U);
+                memcpy(v->as.text.data, left.data, left.length);
+                memcpy(v->as.text.data + left.length, right.data, right.length); return v;
+            }
+            v = vnew(r, V_BOOL);
+            v->as.boolean = expected == V_CHAR ? args[0]->as.character == args[1]->as.character :
+                args[0]->as.text.length == args[1]->as.text.length &&
+                memcmp(args[0]->as.text.data, args[1]->as.text.data, args[0]->as.text.length) == 0;
+            return v;
+        }
+        if (f->as.builtin == BI_TO_FLOAT) {
+            if (n != 1U || args[0]->kind != V_INT) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal conversion type error"); return NULL;
+            }
+            v = vnew(r, V_FLOAT); v->as.floating = integer_to_float(args[0]->as.integer); return v;
+        }
+        if (f->as.builtin == BI_TRUNCATE) {
+            double input;
+            if (n != 1U || args[0]->kind != V_FLOAT) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal conversion type error"); return NULL;
+            }
+            input = args[0]->as.floating;
+            if (!isfinite(input)) return vnew(r, V_NONE);
+            v = vnew(r, V_SOME); v->as.some = vnew(r, V_INT);
+            mpz_set_d(v->as.some->as.integer, input); return v;
+        }
+        if (f->as.builtin >= BI_FADD && f->as.builtin <= BI_FEQ) {
+            double left, right;
+            if (n != 2U || args[0]->kind != V_FLOAT || args[1]->kind != V_FLOAT) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal Float builtin type error"); return NULL;
+            }
+            left = args[0]->as.floating; right = args[1]->as.floating;
+            v = vnew(r, f->as.builtin <= BI_FDIV ? V_FLOAT : V_BOOL);
+            switch (f->as.builtin) {
+                case BI_FADD: v->as.floating = left + right; break;
+                case BI_FSUB: v->as.floating = left - right; break;
+                case BI_FMUL: v->as.floating = left * right; break;
+                case BI_FDIV: v->as.floating = left / right; break;
+                case BI_FLT: v->as.boolean = left < right; break;
+                case BI_FLE: v->as.boolean = left <= right; break;
+                case BI_FGT: v->as.boolean = left > right; break;
+                case BI_FGE: v->as.boolean = left >= right; break;
+                default: v->as.boolean = left == right; break;
+            }
+            return v;
+        }
+        if (f->as.builtin == BI_NOT || f->as.builtin == BI_BOOL_EQ) {
+            size_t arity = f->as.builtin == BI_NOT ? 1U : 2U;
+            if (n != arity || args[0]->kind != V_BOOL ||
+                (arity == 2U && args[1]->kind != V_BOOL)) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal Boolean builtin type error"); return NULL;
+            }
+            v = vnew(r, V_BOOL);
+            v->as.boolean = arity == 1U ? !args[0]->as.boolean :
+                args[0]->as.boolean == args[1]->as.boolean;
+            return v;
+        }
         if (n != 2U || args[0]->kind != V_INT || args[1]->kind != V_INT) {
             (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal builtin type error"); return NULL;
         }
-        if (f->as.builtin == BI_LE || f->as.builtin == BI_EQ) {
-            v = vnew(r, V_BOOL);
-            v->as.boolean = f->as.builtin == BI_LE ? args[0]->as.integer <= args[1]->as.integer
-                                                   : args[0]->as.integer == args[1]->as.integer;
+        if (f->as.builtin == BI_QUOTIENT || f->as.builtin == BI_REMAINDER) {
+            if (mpz_sgn(args[1]->as.integer) == 0) return vnew(r, V_NONE);
+            v = vnew(r, V_SOME); v->as.some = vnew(r, V_INT);
+            if (f->as.builtin == BI_QUOTIENT)
+                mpz_tdiv_q(v->as.some->as.integer, args[0]->as.integer, args[1]->as.integer);
+            else mpz_tdiv_r(v->as.some->as.integer, args[0]->as.integer, args[1]->as.integer);
             return v;
         }
-        if ((f->as.builtin == BI_ADD && !add_ok(args[0]->as.integer, args[1]->as.integer, &result)) ||
-            (f->as.builtin == BI_SUB && !sub_ok(args[0]->as.integer, args[1]->as.integer, &result)) ||
-            (f->as.builtin == BI_MUL && !mul_ok(args[0]->as.integer, args[1]->as.integer, &result))) {
-            (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "Integer overflow"); return NULL;
+        if (f->as.builtin >= BI_LT && f->as.builtin <= BI_EQ) {
+            int comparison = mpz_cmp(args[0]->as.integer, args[1]->as.integer);
+            v = vnew(r, V_BOOL);
+            switch (f->as.builtin) {
+                case BI_LT: v->as.boolean = comparison < 0; break;
+                case BI_LE: v->as.boolean = comparison <= 0; break;
+                case BI_GT: v->as.boolean = comparison > 0; break;
+                case BI_GE: v->as.boolean = comparison >= 0; break;
+                default: v->as.boolean = comparison == 0; break;
+            }
+            return v;
         }
-        v = vnew(r, V_INT); v->as.integer = result; return v;
+        v = vnew(r, V_INT);
+        switch (f->as.builtin) {
+            case BI_ADD: mpz_add(v->as.integer, args[0]->as.integer, args[1]->as.integer); break;
+            case BI_SUB: mpz_sub(v->as.integer, args[0]->as.integer, args[1]->as.integer); break;
+            case BI_MUL: mpz_mul(v->as.integer, args[0]->as.integer, args[1]->as.integer); break;
+            default: (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "unknown builtin"); return NULL;
+        }
+        return v;
     }
     if (f->kind != V_CLOSURE || n != f->as.closure.arity) {
         (void)fail(r->e, NLISP_RUNTIME_ERROR, span, "internal call error"); return NULL;
@@ -1054,15 +1624,30 @@ static Value *eval_match(Runtime *r, const SExpr *x, RBind *env) {
 }
 
 static Value *eval(Runtime *r, const SExpr *x, RBind *env) {
-    int64_t number;
+    double floating;
     if (x->expanded != NULL) return eval(r, x->expanded, env);
     if (x->kind == SX_ATOM) {
         Value *v;
+        if (x->atom[0] == '"') {
+            v = vnew(r, V_STRING);
+            if (!string_literal(r->a, x->atom, &v->as.text)) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, x->span, "invalid string literal"); return NULL;
+            }
+            return v;
+        }
+        if (x->atom[0] == '#' && x->atom[1] == '\\') {
+            v = vnew(r, V_CHAR);
+            if (!character_literal(x->atom, &v->as.character)) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, x->span, "invalid character literal"); return NULL;
+            }
+            return v;
+        }
         if (strcmp(x->atom, "true") == 0 || strcmp(x->atom, "false") == 0) {
             v = vnew(r, V_BOOL); v->as.boolean = strcmp(x->atom, "true") == 0; return v;
         }
         if (strcmp(x->atom, "unit") == 0) return vnew(r, V_UNIT);
-        if (integer_atom(x->atom, &number)) { v = vnew(r, V_INT); v->as.integer = number; return v; }
+        if (integer_atom(x->atom)) { v = vnew(r, V_INT); (void)mpz_set_str(v->as.integer, x->atom, 10); return v; }
+        if (float_atom(x->atom, &floating)) { v = vnew(r, V_FLOAT); v->as.floating = floating; return v; }
         v = rlookup(x->origin == NULL ? env : x->origin->runtime_env, x->atom);
         if (v == NULL) (void)fail(r->e, NLISP_RUNTIME_ERROR, x->span, "internal unbound name");
         return v;
@@ -1115,9 +1700,10 @@ static RBind *bind_builtin(Runtime *r, RBind *env, const char *name, Builtin bi)
 
 static RBind *runtime_builtins(Runtime *r) {
     RBind *env = NULL;
-    env = bind_builtin(r, env, "+", BI_ADD); env = bind_builtin(r, env, "-", BI_SUB);
-    env = bind_builtin(r, env, "*", BI_MUL); env = bind_builtin(r, env, "<=", BI_LE);
-    env = bind_builtin(r, env, "integer=", BI_EQ); return env;
+    size_t i;
+    for (i = 0U; i < sizeof(builtin_specs) / sizeof(builtin_specs[0]); i++)
+        env = bind_builtin(r, env, builtin_specs[i].name, builtin_specs[i].operation);
+    return env;
 }
 
 static Value *run_program(Arena *a, Program *p, Error *e) {
@@ -1152,7 +1738,20 @@ static Value *run_program(Arena *a, Program *p, Error *e) {
 static void print_value(FILE *out, const Value *v) {
     switch (v->kind) {
         case V_BOOL: fputs(v->as.boolean ? "true" : "false", out); break;
-        case V_INT: (void)fprintf(out, "%lld", (long long)v->as.integer); break;
+        case V_INT: (void)mpz_out_str(out, 10, v->as.integer); break;
+        case V_FLOAT: (void)fprintf(out, "%.17g", v->as.floating); break;
+        case V_STRING: {
+            size_t i;
+            fputc('"', out);
+            for (i = 0U; i < v->as.text.length; i++) {
+                unsigned char c = (unsigned char)v->as.text.data[i];
+                if (c == '"' || c == '\\') { fputc('\\', out); fputc(c, out); }
+                else if (c < 32U) (void)fprintf(out, "\\u{%x}", (unsigned int)c);
+                else fputc(c, out);
+            }
+            fputc('"', out); break;
+        }
+        case V_CHAR: (void)fprintf(out, "#\\u{%x}", (unsigned int)v->as.character); break;
         case V_UNIT: fputs("unit", out); break;
         case V_CLOSURE: case V_BUILTIN: fputs("<function>", out); break;
         case V_NIL: fputs("(Nil)", out); break;
@@ -1196,19 +1795,238 @@ static void print_expansion(FILE *out, const SExpr *x) {
     fputc(')', out);
 }
 
-static NLispStatus process(const char *path, int mode, FILE *out, FILE *err) {
+/* Unlike the human-readable expansion, this interchange retains the
+   definition-site origin of each atom. Consumers must not discard it. */
+static void print_json_string(FILE *out, const char *s) {
+    fputc('"', out);
+    for (; *s != '\0'; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { fputc('\\', out); fputc(c, out); }
+        else if (c < 32U) (void)fprintf(out, "\\u%04x", (unsigned int)c);
+        else fputc(c, out);
+    }
+    fputc('"', out);
+}
+
+static void print_core_json_mode(FILE *out, const SExpr *x, bool expanded) {
+    size_t i;
+    if (expanded && x->expanded != NULL) { print_core_json_mode(out, x->expanded, true); return; }
+    if (x->kind == SX_ATOM) {
+        fputs("{\"atom\":", out); print_json_string(out, x->atom);
+        fputs(",\"origin\":", out);
+        if (x->origin == NULL) fputs("null", out);
+        else (void)fprintf(out, "%zu", x->origin->declaration_index);
+        (void)fprintf(out, ",\"token_identity\":%zu,\"resolved_identity\":", x->token_identity);
+        if (x->resolved_identity == 0U) fputs("null", out);
+        else (void)fprintf(out, "%zu", x->resolved_identity);
+        fputc('}', out); return;
+    }
+    fputc('[', out);
+    for (i = 0U; i < x->count; i++) {
+        if (i != 0U) fputc(',', out);
+        print_core_json_mode(out, x->items[i], expanded);
+    }
+    fputc(']', out);
+}
+
+static void print_core_json(FILE *out, const SExpr *x) { print_core_json_mode(out, x, true); }
+
+static void print_raw_forms(FILE *out, SExpr **forms, size_t count) {
+    size_t i;
+    fputc('[', out);
+    for (i = 0U; i < count; i++) {
+        if (i != 0U) fputc(',', out);
+        print_core_json_mode(out, forms[i], false);
+    }
+    fputc(']', out);
+}
+
+static void print_name_entry(FILE *out, const TBind *binding) {
+    fputs("{\"name\":", out); print_json_string(out, binding->name);
+    (void)fprintf(out, ",\"identity\":%zu,\"type_tag\":%zu}", binding->identity, binding->type_tag);
+}
+
+static void print_name_observations(FILE *out, Arena *a) {
+    NameObservation *observation;
+    size_t index = 0U;
+    fputs(",\"name_resolution\":[", out);
+    for (observation = a->name_head; observation != NULL; observation = observation->next) {
+        TBind *binding;
+        bool first = true;
+        if (index++ != 0U) fputc(',', out);
+        fputs("{\"name\":", out); print_json_string(out, observation->name);
+        (void)fprintf(out, ",\"line\":%zu,\"column\":%zu,\"definition_origin\":", observation->line, observation->column);
+        if (observation->definition_index == SIZE_MAX) fputs("null", out);
+        else (void)fprintf(out, "%zu", observation->definition_index);
+        fputs(",\"environment\":[", out);
+        for (binding = observation->environment; binding != NULL; binding = binding->next) {
+            if (!first) fputc(',', out);
+            first = false; print_name_entry(out, binding);
+        }
+        fputs("],\"selected\":", out); print_name_entry(out, observation->selected);
+        fputc('}', out);
+    }
+    fputc(']', out);
+}
+
+static void print_export_limits(FILE *out, Arena *a) {
+    fputs("\"limits\":{", out);
+    (void)fprintf(out, "\"max_expansions\":%zu,\"max_generated_nodes\":%zu,\"max_expansion_depth\":%zu,\"max_check_steps\":%zu}",
+                  a->limits.max_expansions, a->limits.max_generated_nodes, a->limits.max_expansion_depth, a->limits.max_check_steps);
+}
+
+static void print_process_evidence(FILE *out, Arena *a) {
+    MacroTrace *trace;
+    size_t sequence = 0U;
+    fputc(',', out); print_export_limits(out, a);
+    fputs(",\"source_ast\":", out); print_raw_forms(out, a->source_forms, a->source_count);
+    fputs(",\"normalized_ast\":", out); print_raw_forms(out, a->normalized_forms, a->normalized_count);
+    fputs(",\"macro_trace\":[", out);
+    for (trace = a->trace_head; trace != NULL; trace = trace->next) {
+        Macro *m = trace->definition;
+        if (sequence != 0U) fputc(',', out);
+        (void)fprintf(out, "{\"sequence\":%zu,\"call_id\":%zu,\"macro\":", sequence++, trace->call_id);
+        print_json_string(out, m->name);
+        (void)fprintf(out, ",\"definition_index\":%zu,\"arity\":%zu,\"line\":%zu,\"column\":%zu,\"rule\":",
+                      m->declaration_index, m->arity, trace->input->span.line, trace->input->span.column);
+        print_core_json_mode(out, m->rule, false);
+        (void)fprintf(out, ",\"fresh_start\":%zu,\"fresh_end\":%zu", trace->fresh_start, trace->fresh_end);
+        fputs(",\"input\":", out); print_core_json_mode(out, trace->input, false);
+        fputs(",\"substitution\":", out); print_core_json_mode(out, trace->substitution, false);
+        fputs(",\"result\":", out); print_core_json(out, trace->substitution);
+        fputc('}', out);
+    }
+    fputc(']', out);
+}
+
+static bool expanded_size(Arena *a, SExpr *x, size_t depth, size_t *result, Error *e) {
+    size_t size = 1U, height = 1U, i;
+    if (depth >= a->limits.max_expansion_depth)
+        return fail(e, NLISP_UNKNOWN, x->span, "Unknown: expanded tree depth limit (%zu) exceeded", a->limits.max_expansion_depth);
+    if (x->logical_size != 0U) {
+        if (x->logical_height > a->limits.max_expansion_depth - depth)
+            return fail(e, NLISP_UNKNOWN, x->span, "Unknown: expanded tree depth limit (%zu) exceeded", a->limits.max_expansion_depth);
+        *result = x->logical_size; return true;
+    }
+    if (x->expanded != NULL) {
+        if (!expanded_size(a, x->expanded, depth + 1U, &size, e)) return false;
+        height = x->expanded->logical_height + 1U;
+    } else if (x->kind == SX_LIST) {
+        for (i = 0U; i < x->count; i++) {
+            size_t child;
+            if (!expanded_size(a, x->items[i], depth + 1U, &child, e)) return false;
+            if (x->items[i]->logical_height + 1U > height) height = x->items[i]->logical_height + 1U;
+            if (child > a->limits.max_generated_nodes || size > a->limits.max_generated_nodes - child)
+                return fail(e, NLISP_UNKNOWN, x->span, "Unknown: expanded tree node limit (%zu) exceeded", a->limits.max_generated_nodes);
+            size += child;
+        }
+    }
+    if (size > a->limits.max_generated_nodes)
+        return fail(e, NLISP_UNKNOWN, x->span, "Unknown: expanded tree node limit (%zu) exceeded", a->limits.max_generated_nodes);
+    x->logical_size = size; x->logical_height = height; *result = size; return true;
+}
+
+static bool expanded_program_size(Arena *a, Forms forms, Error *e) {
+    size_t total = 0U, i;
+    for (i = 0U; i < forms.count; i++) {
+        size_t size;
+        if (!expanded_size(a, forms.data[i], 0U, &size, e)) return false;
+        if (size > a->limits.max_generated_nodes - total)
+            return fail(e, NLISP_UNKNOWN, forms.data[i]->span, "Unknown: expanded program node limit (%zu) exceeded", a->limits.max_generated_nodes);
+        total += size;
+    }
+    return true;
+}
+
+static bool raw_tree_size(Arena *a, SExpr *x, size_t depth, size_t *result, Error *e) {
+    size_t size = 1U, height = 1U, i;
+    if (depth >= a->limits.max_expansion_depth)
+        return fail(e, NLISP_UNKNOWN, x->span, "Unknown: process evidence depth limit (%zu) exceeded", a->limits.max_expansion_depth);
+    if (x->raw_size != 0U) {
+        if (x->raw_height > a->limits.max_expansion_depth - depth)
+            return fail(e, NLISP_UNKNOWN, x->span, "Unknown: process evidence depth limit (%zu) exceeded", a->limits.max_expansion_depth);
+        *result = x->raw_size; return true;
+    }
+    if (x->kind == SX_LIST) for (i = 0U; i < x->count; i++) {
+        size_t child;
+        if (!raw_tree_size(a, x->items[i], depth + 1U, &child, e)) return false;
+        if (child > a->limits.max_generated_nodes || size > a->limits.max_generated_nodes - child)
+            return fail(e, NLISP_UNKNOWN, x->span, "Unknown: process evidence node limit (%zu) exceeded", a->limits.max_generated_nodes);
+        size += child;
+        if (x->items[i]->raw_height + 1U > height) height = x->items[i]->raw_height + 1U;
+    }
+    x->raw_size = size; x->raw_height = height; *result = size; return true;
+}
+
+static bool process_evidence_size(Arena *a, Error *e) {
+    size_t total = 0U, i;
+    MacroTrace *trace;
+    if (!a->capture_trace) return true;
+    for (i = 0U; i < a->source_count + a->normalized_count; i++) {
+        SExpr *x = i < a->source_count ? a->source_forms[i] : a->normalized_forms[i - a->source_count];
+        size_t size;
+        if (!raw_tree_size(a, x, 0U, &size, e)) return false;
+        if (size > a->limits.max_generated_nodes - total)
+            return fail(e, NLISP_UNKNOWN, x->span, "Unknown: process evidence node limit (%zu) exceeded", a->limits.max_generated_nodes);
+        total += size;
+    }
+    for (trace = a->trace_head; trace != NULL; trace = trace->next) {
+        SExpr *trees[3] = {(SExpr *)trace->input, trace->substitution, trace->definition->rule};
+        size_t j, size;
+        for (j = 0U; j < 4U; j++) {
+            if (j == 3U) {
+                if (!expanded_size(a, trace->substitution, 0U, &size, e)) return false;
+            } else if (!raw_tree_size(a, trees[j], 0U, &size, e)) return false;
+            if (size > a->limits.max_generated_nodes - total)
+                return fail(e, NLISP_UNKNOWN, trace->input->span, "Unknown: process evidence node limit (%zu) exceeded", a->limits.max_generated_nodes);
+            total += size;
+        }
+    }
+    return true;
+}
+
+NLispLimits nlisp_default_limits(void) {
+    NLispLimits limits = {10000U, 100000U, 128U, 1000000U}; return limits;
+}
+
+NLispStatus nlisp_process_file(const char *path, NLispCommand mode, const NLispLimits *limits, FILE *out, FILE *err) {
     Arena a = {0}; Error e = {false, NLISP_OK, {0U, 0U}, {0}};
     char *source; size_t len = 0U; Tokens ts = {NULL, 0U}; Forms forms = {NULL, 0U};
     Program p = {NULL, 0U}; Value *result = NULL;
+    if (mode != NLISP_CHECK && mode != NLISP_RUN && mode != NLISP_EXPAND && mode != NLISP_EXPORT && mode != NLISP_SYNTAX) {
+        fputs("invalid NLisp command\n", err); return NLISP_USAGE_ERROR;
+    }
+    a.capture_trace = mode == NLISP_EXPORT || mode == NLISP_SYNTAX;
+    a.limits = limits == NULL ? nlisp_default_limits() : *limits;
+    if (a.limits.max_expansion_depth > 512U) {
+        fputs("max-expansion-depth must not exceed the native stack safety ceiling of 512\n", err);
+        return NLISP_USAGE_ERROR;
+    }
     source = read_source(path, &len, &e);
-    if (source != NULL && lex(&a, source, len, &ts, &e) && parse_forms(&a, ts, &forms, &e) &&
-        collect_macros(&a, &forms, &e) &&
-        parse_program(&a, forms, &p, &e) && check_program(&a, &p, &e) &&
-        check_program(&a, &p, &e)) {
-        if (mode == 1) {
+    if (source != NULL && lex(&a, source, len, &ts, &e) && parse_forms(&a, ts, &forms, &e) && remember_forms(&a, forms, false) &&
+        flatten_defrec(&a, &forms, &e) && remember_forms(&a, forms, true) && collect_macros(&a, &forms, &e) &&
+        parse_program(&a, forms, &p, &e) &&
+        (mode == NLISP_SYNTAX || (check_program(&a, &p, &e) && check_program(&a, &p, &e))) && expanded_program_size(&a, forms, &e) && process_evidence_size(&a, &e)) {
+        if (mode == NLISP_SYNTAX) {
+            fputs("{\"format\":\"nlisp-syntax-v1\",\"source_text\":", out);
+            print_json_string(out, source); fputs(",\"source_ast\":", out);
+            print_raw_forms(out, a.source_forms, a.source_count);
+            fputs(",\"normalized_ast\":", out);
+            print_raw_forms(out, a.normalized_forms, a.normalized_count);
+            fputc(',', out); print_export_limits(out, &a); fputs("}\n", out);
+        } else if (mode == NLISP_RUN) {
             result = run_program(&a, &p, &e);
             if (result != NULL) { print_value(out, result); fputc('\n', out); }
-        } else if (mode == 2) {
+        } else if (mode == NLISP_EXPORT) {
+            size_t i;
+            fputs("{\"format\":\"nlisp-scoped-expansion-v2\",\"source_text\":", out);
+            print_json_string(out, source); fputs(",\"declarations\":[", out);
+            for (i = 0U; i < forms.count; i++) {
+                if (i != 0U) fputc(',', out);
+                print_core_json(out, forms.data[i]);
+            }
+            fputc(']', out); print_process_evidence(out, &a); print_name_observations(out, &a); fputs("}\n", out);
+        } else if (mode == NLISP_EXPAND) {
             size_t i;
             for (i = 0U; i < forms.count; i++) {
                 print_expansion(out, forms.data[i]); fputc('\n', out);
@@ -1221,12 +2039,16 @@ static NLispStatus process(const char *path, int mode, FILE *out, FILE *err) {
 }
 
 NLispStatus nlisp_check_file(const char *path, FILE *out, FILE *err) {
-    return process(path, 0, out, err);
+    return nlisp_process_file(path, NLISP_CHECK, NULL, out, err);
 }
 NLispStatus nlisp_run_file(const char *path, FILE *out, FILE *err) {
-    return process(path, 1, out, err);
+    return nlisp_process_file(path, NLISP_RUN, NULL, out, err);
 }
 
 NLispStatus nlisp_expand_file(const char *path, FILE *out, FILE *err) {
-    return process(path, 2, out, err);
+    return nlisp_process_file(path, NLISP_EXPAND, NULL, out, err);
+}
+
+NLispStatus nlisp_export_file(const char *path, FILE *out, FILE *err) {
+    return nlisp_process_file(path, NLISP_EXPORT, NULL, out, err);
 }

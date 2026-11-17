@@ -1,0 +1,14 @@
+; A dependency cycle can still have a finite expansion.
+(define-macro answer
+  (syntax-rules/typed
+    ((answer)
+     ()
+     (Syntax Integer)
+     42)
+    ((answer offset)
+     ((offset (Syntax Integer)))
+     (Syntax Integer)
+     (+ offset (answer)))))
+
+(defun main () Integer
+  (answer 0))

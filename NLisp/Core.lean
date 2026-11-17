@@ -31,6 +31,9 @@ inductive Expr : List Ty → Ty → Type where
   | app : Expr Γ (.fn a b) → Expr Γ a → Expr Γ b
   | ite : Expr Γ .boolean → Expr Γ t → Expr Γ t → Expr Γ t
   | add : Expr Γ .integer → Expr Γ .integer → Expr Γ .integer
+  | sub : Expr Γ .integer → Expr Γ .integer → Expr Γ .integer
+  | mul : Expr Γ .integer → Expr Γ .integer → Expr Γ .integer
+  | eqInt : Expr Γ .integer → Expr Γ .integer → Expr Γ .boolean
   | leq : Expr Γ .integer → Expr Γ .integer → Expr Γ .boolean
   | nil : Expr Γ (.list a)
   | cons : Expr Γ a → Expr Γ (.list a) → Expr Γ (.list a)
@@ -66,6 +69,9 @@ def Expr.rename (ρ : Ren Γ Δ) : Expr Γ t → Expr Δ t
   | .app f x => .app (f.rename ρ) (x.rename ρ)
   | .ite c yes no => .ite (c.rename ρ) (yes.rename ρ) (no.rename ρ)
   | .add left right => .add (left.rename ρ) (right.rename ρ)
+  | .sub left right => .sub (left.rename ρ) (right.rename ρ)
+  | .mul left right => .mul (left.rename ρ) (right.rename ρ)
+  | .eqInt left right => .eqInt (left.rename ρ) (right.rename ρ)
   | .leq left right => .leq (left.rename ρ) (right.rename ρ)
   | .nil => .nil
   | .cons head tail => .cons (head.rename ρ) (tail.rename ρ)
@@ -89,6 +95,13 @@ def liftSub (σ : Sub Γ Δ) : Sub (a :: Γ) (a :: Δ) :=
     | .zero => .var .zero
     | .succ v => (σ v).rename (fun w => .succ w)
 
+theorem liftSub_keeps_bound (σ : Sub Γ Δ) :
+    liftSub (a := a) σ .zero = (.var .zero : Expr (a :: Δ) a) := rfl
+
+theorem liftSub_shifts_hole (σ : Sub Γ Δ) (v : Var Γ t) :
+    liftSub (a := a) σ (.succ v) =
+      (σ v).rename (fun w => .succ w) := rfl
+
 def Expr.subst (σ : Sub Γ Δ) : Expr Γ t → Expr Δ t
   | .var v => σ v
   | .bool b => .bool b
@@ -98,6 +111,9 @@ def Expr.subst (σ : Sub Γ Δ) : Expr Γ t → Expr Δ t
   | .app f x => .app (f.subst σ) (x.subst σ)
   | .ite c yes no => .ite (c.subst σ) (yes.subst σ) (no.subst σ)
   | .add left right => .add (left.subst σ) (right.subst σ)
+  | .sub left right => .sub (left.subst σ) (right.subst σ)
+  | .mul left right => .mul (left.subst σ) (right.subst σ)
+  | .eqInt left right => .eqInt (left.subst σ) (right.subst σ)
   | .leq left right => .leq (left.subst σ) (right.subst σ)
   | .nil => .nil
   | .cons head tail => .cons (head.subst σ) (tail.subst σ)
@@ -114,6 +130,9 @@ def Expr.subst (σ : Sub Γ Δ) : Expr Γ t → Expr Δ t
         (noneCase.subst σ)
         (someCase.subst (liftSub σ))
   | .fix body => .fix (body.subst (liftSub σ))
+
+theorem subst_under_lambda (σ : Sub Γ Δ) (body : Expr (a :: Γ) t) :
+    Expr.subst σ (.lam body) = .lam (body.subst (liftSub σ)) := rfl
 
 def oneSub (value : Expr Γ a) : Sub (a :: Γ) Γ :=
   fun v =>
@@ -138,6 +157,75 @@ def Expr.instantiateCons
     (tail : Expr Γ (.list a)) : Expr Γ t :=
   body.subst (twoSub head tail)
 
+/-! ## Typed macro expansion
+
+   A macro template is represented by a core expression whose context lists
+   its typed holes. Expansion substitutes call-site expressions for those
+   holes. Since substitution renames under binders, holes remain hygienic in
+   this nameless core representation. This models expansion after parsing and
+   type checking; it does not formalize the surface syntax-rules parser. -/
+
+def expandTemplate (template : Expr Γ t) (arguments : Sub Γ Δ) : Expr Δ t :=
+  template.subst arguments
+
+def singleHoleSub (value : Expr Γ a) : Sub [a] Γ :=
+  fun
+  | .zero => value
+
+structure TypedMacro (holes : List Ty) (output : Ty) where
+  template : Expr holes output
+
+def TypedMacro.expand (definition : TypedMacro holes output)
+    (arguments : Sub holes Γ) : Expr Γ output :=
+  expandTemplate definition.template arguments
+
+theorem TypedMacro.expand_preserves_type
+    (definition : TypedMacro holes output) (arguments : Sub holes Γ) :
+    ∃ expanded : Expr Γ output, expanded = definition.expand arguments :=
+  ⟨definition.expand arguments, rfl⟩
+
+theorem expandTemplate_preserves_type
+    (template : Expr Γ t) (arguments : Sub Γ Δ) :
+    ∃ expanded : Expr Δ t, expanded = expandTemplate template arguments :=
+  ⟨expandTemplate template arguments, rfl⟩
+
+def twiceTemplate : Expr [.integer] .integer :=
+  .add (.var .zero) (.var .zero)
+
+def twiceMacro : TypedMacro [.integer] .integer :=
+  ⟨twiceTemplate⟩
+
+def expandTwice (argument : Expr Γ .integer) : Expr Γ .integer :=
+  twiceMacro.expand (singleHoleSub argument)
+
+theorem expandTwice_eq (argument : Expr Γ .integer) :
+    expandTwice argument = .add argument argument := rfl
+
+/- The template introduces a lambda binder and refers to its argument hole
+   from beneath that binder. Expansion must keep the hole distinct from the
+   lambda's locally bound variable. -/
+def lambdaHoleTemplate : Expr [.integer] (.fn .integer .integer) :=
+  .lam (.add (.var (.succ .zero)) (.var .zero))
+
+def lambdaHoleMacro : TypedMacro [.integer] (.fn .integer .integer) :=
+  ⟨lambdaHoleTemplate⟩
+
+def expandLambdaHole (argument : Expr Γ .integer) :
+    Expr Γ (.fn .integer .integer) :=
+  lambdaHoleMacro.expand (singleHoleSub argument)
+
+theorem expandLambdaHole_hygienic (argument : Expr Γ .integer) :
+    expandLambdaHole argument =
+      .lam (.add (argument.rename (fun v => .succ v)) (.var .zero)) := rfl
+
+theorem expandLambdaHole_open :
+    expandLambdaHole (Γ := [.integer]) (.var .zero) =
+      .lam (.add (.var (.succ .zero)) (.var .zero)) := rfl
+
+theorem expandLambdaHole_closed :
+    expandLambdaHole (Γ := []) (.int 41) =
+      (.lam (.add (.int 41) (.var .zero)) : Expr [] (.fn .integer .integer)) := rfl
+
 inductive Value : {t : Ty} → Expr [] t → Prop where
   | bool : Value (.bool b)
   | int : Value (.int n)
@@ -158,6 +246,15 @@ inductive Step : {t : Ty} → Expr [] t → Expr [] t → Prop where
   | addLeft : Step left left' → Step (.add left right) (.add left' right)
   | addRight : Value left → Step right right' → Step (.add left right) (.add left right')
   | addInt : Step (.add (.int left) (.int right)) (.int (left + right))
+  | subLeft : Step left left' → Step (.sub left right) (.sub left' right)
+  | subRight : Value left → Step right right' → Step (.sub left right) (.sub left right')
+  | subInt : Step (.sub (.int left) (.int right)) (.int (left - right))
+  | mulLeft : Step left left' → Step (.mul left right) (.mul left' right)
+  | mulRight : Value left → Step right right' → Step (.mul left right) (.mul left right')
+  | mulInt : Step (.mul (.int left) (.int right)) (.int (left * right))
+  | eqIntLeft : Step left left' → Step (.eqInt left right) (.eqInt left' right)
+  | eqIntRight : Value left → Step right right' → Step (.eqInt left right) (.eqInt left right')
+  | eqIntValue : Step (.eqInt (.int left) (.int right)) (.bool (decide (left = right)))
   | leqLeft : Step left left' → Step (.leq left right) (.leq left' right)
   | leqRight : Value left → Step right right' → Step (.leq left right) (.leq left right')
   | leqInt : Step (.leq (.int left) (.int right)) (.bool (decide (left ≤ right)))
@@ -213,6 +310,30 @@ theorem progress : (term : Expr [] t) → Value term ∨ ∃ next, Step term nex
           exact Or.inr ⟨_, .addInt⟩
         · exact Or.inr ⟨_, .addRight hl hr⟩
       · exact Or.inr ⟨_, .addLeft hl⟩
+  | .sub left right => by
+      rcases progress left with hl | ⟨left', hl⟩
+      · rcases progress right with hr | ⟨right', hr⟩
+        · cases hl
+          cases hr
+          exact Or.inr ⟨_, .subInt⟩
+        · exact Or.inr ⟨_, .subRight hl hr⟩
+      · exact Or.inr ⟨_, .subLeft hl⟩
+  | .mul left right => by
+      rcases progress left with hl | ⟨left', hl⟩
+      · rcases progress right with hr | ⟨right', hr⟩
+        · cases hl
+          cases hr
+          exact Or.inr ⟨_, .mulInt⟩
+        · exact Or.inr ⟨_, .mulRight hl hr⟩
+      · exact Or.inr ⟨_, .mulLeft hl⟩
+  | .eqInt left right => by
+      rcases progress left with hl | ⟨left', hl⟩
+      · rcases progress right with hr | ⟨right', hr⟩
+        · cases hl
+          cases hr
+          exact Or.inr ⟨_, .eqIntValue⟩
+        · exact Or.inr ⟨_, .eqIntRight hl hr⟩
+      · exact Or.inr ⟨_, .eqIntLeft hl⟩
   | .leq left right => by
       rcases progress left with hl | ⟨left', hl⟩
       · rcases progress right with hr | ⟨right', hr⟩
