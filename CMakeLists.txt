@@ -18,9 +18,27 @@ endif()
 add_executable(nlisp src/main.c)
 target_link_libraries(nlisp PRIVATE nlisp_core)
 find_path(GMP_INCLUDE_DIR gmp.h REQUIRED)
-find_library(GMP_LIBRARY NAMES gmp REQUIRED)
+# MinGW distributions normally prefer libgmp.dll.a, which leaves the CLI
+# dependent on a DLL in the compiler's bin directory. Ship a standalone CLI.
+option(NLISP_STATIC_GMP "Link the static GMP library" ${MINGW})
+if(NLISP_STATIC_GMP)
+  set(_nlisp_library_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+  if(MSVC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .lib)
+  else()
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+  endif()
+  find_library(GMP_STATIC_LIBRARY NAMES gmp REQUIRED)
+  set(CMAKE_FIND_LIBRARY_SUFFIXES ${_nlisp_library_suffixes})
+  set(GMP_LIBRARY ${GMP_STATIC_LIBRARY})
+else()
+  find_library(GMP_LIBRARY NAMES gmp REQUIRED)
+endif()
 target_include_directories(nlisp_core PRIVATE ${GMP_INCLUDE_DIR})
 target_link_libraries(nlisp_core PUBLIC ${GMP_LIBRARY})
+if(MINGW AND NLISP_STATIC_GMP)
+  target_link_options(nlisp PRIVATE -static-libgcc)
+endif()
 if(NOT MSVC)
   target_link_libraries(nlisp_core PUBLIC m)
 endif()
@@ -33,7 +51,10 @@ if(BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/builtins.py $<TARGET_FILE:nlisp>)
     add_test(NAME syntax_run COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/syntax.py $<TARGET_FILE:nlisp>)
-    find_program(NLISP_LAKE lake HINTS ${CMAKE_CURRENT_SOURCE_DIR}/.tools/lean-4.8.0/bin)
+    add_test(NAME independent_certificate COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/independent_certificate.py)
+    find_program(NLISP_LAKE lake HINTS ${CMAKE_CURRENT_SOURCE_DIR}/.tools/lean-4.8.0/bin
+      ${CMAKE_CURRENT_SOURCE_DIR}/.tools/elan-home/bin)
     if(NLISP_LAKE)
       add_test(NAME lean_build COMMAND ${NLISP_LAKE} build)
       set_tests_properties(lean_build PROPERTIES
@@ -44,8 +65,15 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_termination.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
       add_test(NAME source_reader COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/source_reader.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
-      set_tests_properties(lean_bridge macro_termination source_reader PROPERTIES
+      add_test(NAME poly_bridge COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_bridge.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
+      set_tests_properties(lean_bridge macro_termination source_reader poly_bridge PROPERTIES
         FIXTURES_REQUIRED lean_library)
+      foreach(model SurfaceIR Erasure EvaluatorCorrectness ErasureExecution SurfaceChecker)
+        add_test(NAME lean_${model} COMMAND ${NLISP_LAKE} env lean tests/${model}.lean)
+        set_tests_properties(lean_${model} PROPERTIES
+          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} FIXTURES_REQUIRED lean_library)
+      endforeach()
     endif()
   endif()
   add_test(NAME factorial_check COMMAND nlisp check ${CMAKE_CURRENT_SOURCE_DIR}/examples/factorial.nlisp)

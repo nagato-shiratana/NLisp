@@ -1,5 +1,74 @@
 # nagato-Lisp Lean 形式仕様書
 
+## 2026-11-18 追補: 表層意味論・多相型付き中間表現
+
+### 現在の保証範囲
+
+本節の現在状態は以下のとおり。後掲の段階別記録よりこの表を優先する。
+
+| 対象 | カーネル検査済みの内容 |
+| --- | --- |
+| `SurfaceChecker` | 明示的型適用を持つ全Surface構文の型検査。成功値は型導出を保持し、`elaborateProgram` は各汎用本体を一度だけ検査して `PolyIR.Program` を構築する |
+| `Erasure.evaluation_preserved` | 表層の有限評価から型消去先の有限評価への保存 |
+| `EvaluatorCorrectness` / `EvaluatorCompleteness` | 実行用評価器の成功と独立した大ステップ導出の同値。十分なfuel以後の結果の安定性 |
+| `SurfaceEvaluatorCorrectness` / `SurfaceEvaluatorCompleteness` | 型注釈を残した表層評価器について同じ健全性・完全性 |
+| `ErasureExecution.execution_commutes` | 同じfuelにおける値・エラーを含む型消去前後の完全な結果一致。引数列・begin列を含む |
+| `finite_evaluation_iff` | 終了の保存・反映と値の消去対応 |
+| `execution_error_iff` | wrongShape/wrongArity/unbound/outOfFuelの同じfuelでの対応 |
+| `fuel_divergence_iff` | すべての有限fuelでoutOfFuelとなる性質の保存・反映 |
+| `SemanticDeterminism` / `SurfaceEvaluatorCompleteness` | 型消去後・表層双方の大ステップ評価の決定性 |
+
+`SurfaceChecker` は型引数推論後の構文を受け取る。`verify_lean.py --mode poly` はCの展開結果からこの構文へ変換し、全汎用本体とエントリーポイントの型検査をカーネルで照合する。`program_erasure` は検査済みProgramの消去が同じ本体列の消去と一致することを入力ごとに検査する。Python変換とC展開構文の一般的な意味対応は未証明であり、この同一視を暗黙の仮定として追加しない。
+
+型引数が再帰ごとに増える多相再帰も本体を複製せず検査する。checkerのnoneは不適合または深さ予算超過であり、不適合の証明ではない。完全性や最悪計算量は未証明。新モデルの型はBoolean/Integer/Unit/関数/List/Optionで、Float/String/Characterと残りの組み込み関数を一般化する作業は残る。
+
+fuelは導出深さの上限である。`fuel_divergence_iff` の全称条件と、1回の予算切れによるUnknownは区別する。型安全性（型保存・Progress）、C構文から新Surfaceへの変換・一方向型引数推論・トップレベル初期化、C実行器との一般的な意味対応は未証明。既存の単相コアについての型安全性定理を新多相モデルの証明として流用しない。
+
+証書の `--independent` 再検査はCマクロ展開器を起動しない。証書内のUTF-8ソース・局所展開導出・束縛IDからLean本文を再構成し、既存のSourceReader/CExpansion/CBindingWalkの定理をカーネルで検査する。変換手続き全体の形式的正しさや多項式時間は保証しない。Leanモデルのハッシュが一致することも要求する。
+
+### 追補の更新: 有限評価の型消去意味保存
+
+#### fuel付き評価器の健全性
+
+`EvaluatorCorrectness.lean` の `evaluator_sound` は燃料に関する帰納法で、`evaluate`、`evaluateArgs`、`evaluateSequence` の成功結果が、それぞれ独立した `Evaluates`、`ArgumentsEvaluate`、`SequenceEvaluates` の導出を持つことを同時に証明する。`evaluate_sound` は式評価についての利用者向けの系である。
+
+```text
+evaluate program fuel environment term = ok value
+  ⇒ Evaluates program environment term value
+```
+
+引数個数、参照先、分岐の形状を含む全実行用構文を対象とする。成功結果についての健全性であり、資源超過時の非停止や、型エラーが起こらないことの一般証明とは異なる。ソース型検査の成功を前提にせず成立する。
+
+`tests/EvaluatorCorrectness.lean` は0引数クロージャ、並列let、再帰的な整数和の実行結果にこの定理を適用する。公理依存はLean標準の3公理のみ。十分なfuelでの成功は後続の `EvaluatorCompleteness.evaluation_eventually` で証明済みである。
+
+`RuntimeSemantics.lean` に型消去先の独立した大ステップ評価関係を追加し、`Erasure.lean` でソース値・環境・定義表の消去を定義した。`evaluation_preserved` は次を全表層構文の有限評価導出について証明する。
+
+```text
+Surface.Evaluates sourceProgram environment expression value
+  ⇒ PolyIR.Evaluates (eraseDefinitions sourceProgram)
+       (eraseValues environment) (erase expression) (eraseValue value)
+```
+
+証明は相互帰納的な評価関係の帰納原理を使い、引数列・beginの残りの列の導出も同時に移す。グローバル参照の表引き、クロージャの捕捉環境、引数個数、並列letの環境追加の対応を補題として使う。自己再帰・相互再帰も有限導出を持つ任意の実行について対象となる。型注釈を無視して定義した独立した両意味論の間の証明であり、型保存定理やC実装の正しさの代用にはしない。
+
+`closed_integer_result` は閉じたプログラムの整数結果がそのまま保存される系である。`tests/Erasure.lean` では並列letと多相identityの表層導出へ定理を適用する。両定理の公理依存はLean標準のpropext、Classical.choice、Quot.soundだけであり、独自公理・sorryAxはない。
+
+最初の型消去定理は有限の大ステップ関係同士の前向き保存である。後続の完全性・終了反映・実行結果一致は冒頭の表を参照する。C/JSONから新IRへの一般的な意味対応は引き続き未証明。
+
+新しい仕様上の基準方式は、検査済み多相中間表現を保持して実行時に型消去する方式である。既存の証明書生成器にある呼び出しごとの単相化は移行前の経路として残り、以下の既存説明はその実装状態を記録する。
+
+`Surface.Ty` はde Bruijn型変数と複数引数関数型を持ち、`Signature` は型引数個数・仮引数型列・戻り値型を保持する。`Ty.wellFormed`、`Signature.wellFormed`、`Ty.instantiate` を定義した。型適用規則は型引数個数・呼び出し側での整形式性・定義シグネチャの整形式性を要求する。型変数の実行時検査は行わない。
+
+`Surface.HasType`、`ArgsHaveTypes`、`SequenceHasType` は表層構文の外在的な型付け判断である。`Surface.Evaluates`、`ArgumentsEvaluate`、`SequenceEvaluates` は、型注釈を残したソースレベル値についての独立した有限評価関係である。マクロ展開・名前解決済みの入力を前提とし、グローバル参照の索引を定義表に対応させる。
+
+`PolyIR.CheckedExpr` は表層項とその型導出を保持し、`Definition` と `Program` は汎用本体の型検査を要求する。`SurfaceChecker` による自動構成とpolyモードでのC出力変換は実装済み。変換全体の一般的な意味対応は残る。
+
+`PolyIR.erase` は型引数・型注釈を消去し、複数引数・0引数・並列let・beginを直接残す。`PolyIR.evaluate` はタグ付き値を用い、グローバル関数表を共有して実行する。型消去関数・型代入関数・評価器はLeanの終了検査を通る全域関数である。評価器はfuel付きであり、NLisp関数自体の停止性は主張しない。
+
+`erase_type_arguments` はglobal参照の型引数が実行用項に影響しないこと、`checked_expression_has_type` は保持した型導出を取り出せることを示す。これらとは別に、冒頭の表の意味対応・評価決定性定理を証明した。型の一意性は未証明。
+
+検査例は `tests/SurfaceIR.lean` に置く。並列letの外側環境、非選択分岐の非評価、beginで破棄される式の評価、0引数呼び出し、多相identityの共有本体を確認する。既存のSourceReader/ProcessCertificate経路との接続とトップレベル値の初期化・捕捉変換は後続課題である。
+
 **文書番号:** NLISP-LEAN-SPEC-0.2  
 **対応仕様:** NLISP-SPEC-0.2  
 **検証器:** Lean 4.8.0  

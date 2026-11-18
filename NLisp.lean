@@ -9,3 +9,16 @@ import NLisp.CExpansion
 import NLisp.MacroTermination
 import NLisp.SourceReader
 import NLisp.ProcessCertificate
+import NLisp.Surface
+import NLisp.SurfaceSemantics
+import NLisp.PolyIR
+import NLisp.RuntimeSemantics
+import NLisp.Erasure
+import NLisp.EvaluatorCorrectness
+import NLisp.EvaluatorCompleteness
+import NLisp.SurfaceEvaluator
+import NLisp.SurfaceEvaluatorCorrectness
+import NLisp.ErasureExecution
+import NLisp.SemanticDeterminism
+import NLisp.SurfaceChecker
+import NLisp.SurfaceEvaluatorCompleteness

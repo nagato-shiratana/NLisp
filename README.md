@@ -1,5 +1,27 @@
 # nagato-Lisp
 
+表層意味論、多相型付きIR、証明を保持する型検査器、型消去を実装した。汎用関数本体は型引数ごとに複製せず、共有する。Cの展開結果からこのIRを構成する経路は `--mode poly` で利用できる。変換器全体の意味保存は後続課題。
+
+Leanで型消去の意味保存、有限評価と実行用評価器の健全性・完全性、終了の保存・反映、同じfuelでの値・エラーの一致、評価の決定性を検査済み。「すべてのfuelで予算切れ」の対応も証明したが、単発の予算切れから非停止を判定しない。C変換器・C実行器の意味保存と新多相モデルの型安全性は未証明。
+
+`SurfaceChecker.elaborateProgram` は明示的な型引数を持つ汎用本体から証明付きIRを構築する。多相再帰を含む本体も一度検査する。現在の新モデルの対象はBoolean/Integer/Unit/関数/List/Option。旧モデルとC実装はFloat/String/Characterおよび全組み込み関数も扱う。
+
+```powershell
+python tools/verify_lean.py examples/polymorphism.nlisp --mode poly --nlisp build-ucrt/nlisp.exe --output build-ucrt/Poly.lean
+python tools/verify_lean.py --verify-certificate build-ucrt/Poly.lean --independent
+```
+
+`poly`モードは共有された関数表を使い、型引数が再帰ごとに増える `examples/polymorphic_recursion.nlisp` も具体化せず検査する。トップレベルdefineの捕捉と対象外の型・組み込み関数は明示的に拒否する。`--independent` はCマクロ展開器を実行せず、証書とLeanだけで再検査する。
+
+```text
+lake build
+lake env lean tests/SurfaceIR.lean
+lake env lean tests/Erasure.lean
+lake env lean tests/EvaluatorCorrectness.lean
+lake env lean tests/ErasureExecution.lean
+lake env lean tests/SurfaceChecker.lean
+```
+
 nagato-Lisp（NLisp）は、明示的な静的型付けと検証可能なLispを目標とする研究用言語である。
 
 現在のリポジトリには次が含まれる。
@@ -29,6 +51,17 @@ ctest --test-dir build --output-on-failure
 ```
 
 Windowsの構成例は次のとおり（GMPのパス設定が必要）。
+
+MSYS2 UCRT64を使う場合は、同じ環境のGCCとGMPを指定する。MinGWではGMPを既定で静的リンクするため、完成した`nlisp.exe`の起動に`libgmp-10.dll`は不要。現在の作業用ビルドは`build-ucrt/nlisp.exe`にある。
+
+```powershell
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+cmake -S . -B build-ucrt -G Ninja -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe -DCMAKE_PREFIX_PATH=C:/msys64/ucrt64 -DNLISP_STATIC_GMP=ON
+cmake --build build-ucrt
+.\build-ucrt\nlisp.exe run examples/math_macros.nlisp
+```
+
+NinjaがPATHにない場合は、インストール済みNinjaの絶対パスを`-DCMAKE_MAKE_PROGRAM=...`で指定する。MSVCを使う場合はMSVC用GMPを指定し、次の構成を使う。
 
 ```text
 cmake -S . -B build -A x64

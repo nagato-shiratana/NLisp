@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export scoped C expansion into the intrinsically typed Lean core.
+"""Export scoped C expansion into a Lean-checked core or polymorphic IR.
 
 The bridge is untrusted: Lean independently checks the emitted closed term.
 Unsupported features fail explicitly; no expression is evaluated away.
@@ -606,6 +606,195 @@ class TypeExporter(Exporter):
                 '  expandedProgram.hasType\n')
 
 
+class PolyExporter(Exporter):
+    """Lower generic functions once; Lean checks the resulting polymorphic IR.
+
+    This path deliberately rejects top-level values and types outside Surface.
+    It does not assert a proved correspondence between this Python lowering and
+    the independently checked scoped syntax. That connection is a separate duty.
+    """
+    def __init__(self, document, **options):
+        super().__init__(document, **options)
+        if any(data[3] is None for data in self.globals.values()):
+            raise ValueError('poly mode requires explicit function parameters for top-level captures')
+        self.indices = {name: index for index, name in enumerate(self.globals)}
+        self.variable_indices = {}
+        self.global_ids = {atom(d[1]): d[1]['token_identity'] for d in document['declarations']}
+        self.parameter_nodes = {atom(d[1]): d[2] if len(d) == 5 else d[2][2]
+                                for d in document['declarations']}
+
+    @staticmethod
+    def binding(node, ty):
+        return ('binding', natural(node['token_identity'], 'binder identity'), atom(node)), ty
+
+    def is_scheme(self, node, ctx):
+        name = atom(node)
+        return name in self.schemes and node['resolved_identity'] == self.global_ids[name]
+
+    def ty(self, ty):
+        if isinstance(ty, str):
+            if ty not in ('Integer', 'Boolean', 'Unit'):
+                raise ValueError('type outside polymorphic operational model: ' + ty)
+            return {'Integer': 'Ty.integer', 'Boolean': 'Ty.boolean', 'Unit': 'Ty.unit'}[ty]
+        if ty[0] == 'Variable':
+            return f'(Ty.var {self.variable_indices[ty[1]]})'
+        if ty[0] in ('List', 'Option'):
+            return f'(Ty.{ty[0].lower()} {self.ty(ty[1])})'
+        return f'(Ty.fn [{", ".join(self.ty(t) for t in ty[1])}] {self.ty(ty[2])})'
+
+    def resolve(self, node, ctx, substitutions=None):
+        name = atom(node)
+        selected = node['resolved_identity']
+        for index, (local, ty) in enumerate(ctx):
+            if local[1] == selected:
+                return f'(Expr.var {index})', ty
+        if name in self.globals and selected == self.global_ids[name]:
+            _, ty, _, _ = self.globals[name]
+            variables = self.schemes.get(name, [])
+            if variables and substitutions is None:
+                raise ValueError('polymorphic value needs explicit or inferred type arguments')
+            arguments = [substitutions[v] for v in variables]
+            actual = substitute_type(ty, substitutions) if variables else ty
+            return f'(Expr.global {self.indices[name]} [{", ".join(self.ty(t) for t in arguments)}])', actual
+        operations = {'+': 'add', '-': 'sub', '*': 'mul', '<=': 'le', 'integer=': 'intEq'}
+        builtin_ids = {'+': 3, '-': 6, '*': 9, '<=': 15, 'integer=': 24}
+        if name in operations and selected == builtin_ids[name]:
+            result = 'Integer' if name in ('+', '-', '*') else 'Boolean'
+            body = f'(Expr.{operations[name]} (Expr.var 0) (Expr.var 1))'
+            return (f'(Expr.lam [Ty.integer, Ty.integer] {self.ty(result)} {body})',
+                    ('Function', ('Integer', 'Integer'), result))
+        raise ValueError('identifier outside polymorphic operational model: ' + str(name))
+
+    def expr_inner(self, node, ctx):
+        token = atom(node)
+        if token is not None:
+            if token in ('true', 'false'):
+                return f'(Expr.bool {token})', 'Boolean'
+            if token == 'unit':
+                return 'Expr.unit', 'Unit'
+            if re.fullmatch(r'-?(0|[1-9][0-9]*)', token):
+                return f'(Expr.int ({token}))', 'Integer'
+            return self.resolve(node, ctx)
+        tag = atom(node[0])
+        if tag == 'type-app':
+            name = atom(node[1])
+            if not self.is_scheme(node[1], ctx):
+                raise ValueError('type-app requires a global polymorphic function')
+            arguments = [self.parse_type(t) for t in node[2:]]
+            if len(arguments) != len(self.schemes[name]):
+                raise ValueError('explicit type arity mismatch')
+            return self.resolve(node[1], ctx, dict(zip(self.schemes[name], arguments)))
+        if tag == 'lambda':
+            parameters = [self.binding(p[0], self.parse_type(p[1])) for p in node[1]]
+            result = self.parse_type(node[2])
+            body, actual = self.expr(node[3], parameters + ctx)
+            if actual != result:
+                raise ValueError('lambda result mismatch')
+            return (f'(Expr.lam [{", ".join(self.ty(t) for _, t in parameters)}] {self.ty(result)} {body})',
+                    ('Function', tuple(t for _, t in parameters), result))
+        if tag == 'if':
+            c, ct = self.expr(node[1], ctx)
+            y, yt = self.expr(node[2], ctx)
+            n, nt = self.expr(node[3], ctx)
+            if ct != 'Boolean' or yt != nt:
+                raise ValueError('conditional type mismatch')
+            return f'(Expr.ite {c} {y} {n})', yt
+        if tag == 'let':
+            parameters = [self.binding(b[0][0], self.parse_type(b[0][1])) for b in node[1]]
+            values = [self.expr(b[1], ctx) for b in node[1]]
+            if [t for _, t in values] != [t for _, t in parameters]:
+                raise ValueError('parallel let type mismatch')
+            body, result = self.expr(node[2], parameters + ctx)
+            return (f'(Expr.letMany [{", ".join(self.ty(t) for _, t in parameters)}] '
+                    f'[{", ".join(v for v, _ in values)}] {body})', result)
+        if tag == 'begin':
+            if len(node) < 2:
+                raise ValueError('begin must be nonempty')
+            expressions = [self.expr(e, ctx) for e in node[1:]]
+            return f'(Expr.begin {expressions[0][0]} [{", ".join(e for e, _ in expressions[1:])}])', expressions[-1][1]
+        if tag in ('Nil', 'None'):
+            ty = self.parse_type(node[1])
+            return f'(Expr.{tag.lower()} {self.ty(ty)})', ('List' if tag == 'Nil' else 'Option', ty)
+        if tag in ('Cons', 'Some'):
+            ty = self.parse_type(node[1])
+            head, ht = self.expr(node[2], ctx)
+            if ht != ty:
+                raise ValueError('constructor type mismatch')
+            if tag == 'Some':
+                return f'(Expr.some {self.ty(ty)} {head})', ('Option', ty)
+            tail, tt = self.expr(node[3], ctx)
+            if tt != ('List', ty):
+                raise ValueError('Cons tail type mismatch')
+            return f'(Expr.cons {self.ty(ty)} {head} {tail})', tt
+        if tag == 'match':
+            target, tt = self.expr(node[1], ctx)
+            if not isinstance(tt, tuple) or tt[0] not in ('List', 'Option'):
+                raise ValueError('invalid match target')
+            clauses = {atom(c[0][0]): c for c in node[2:]}
+            if tt[0] == 'List':
+                empty, full = clauses['Nil'], clauses['Cons']
+                local = [self.binding(full[0][1], tt[1]), self.binding(full[0][2], tt)]
+                operation = 'matchList'
+            else:
+                empty, full = clauses['None'], clauses['Some']
+                local = [self.binding(full[0][1], tt[1])]
+                operation = 'matchOption'
+            e, et = self.expr(empty[1], ctx)
+            f, ft = self.expr(full[1], local + ctx)
+            if et != ft:
+                raise ValueError('match result mismatch')
+            return f'(Expr.{operation} {target} {e} {f})', et
+        arguments = [self.expr(a, ctx) for a in node[1:]]
+        if self.is_scheme(node[0], ctx):
+            name = atom(node[0])
+            pattern = self.globals[name][1]
+            substitutions = {}
+            if len(pattern[1]) != len(arguments):
+                raise ValueError('polymorphic call arity mismatch')
+            for expected, (_, actual) in zip(pattern[1], arguments):
+                match_type(expected, actual, substitutions)
+            if set(substitutions) != set(self.schemes[name]):
+                raise ValueError('type arguments cannot be inferred from call arguments')
+            function, ft = self.resolve(node[0], ctx, substitutions)
+        else:
+            function, ft = self.expr(node[0], ctx)
+        if not isinstance(ft, tuple) or ft[0] != 'Function' or ft[1] != tuple(t for _, t in arguments):
+            raise ValueError('function argument mismatch')
+        return f'(Expr.app {function} [{", ".join(e for e, _ in arguments)}])', ft[2]
+
+    def export(self):
+        if 'main' not in self.globals or self.globals['main'][1] != ('Function', (), 'Integer'):
+            raise ValueError('expected main : () -> Integer')
+        signatures, bodies = [], []
+        for name, (_, ty, body, parameters) in self.globals.items():
+            variables = self.schemes.get(name, [])
+            self.type_variables = {v: ('Variable', v) for v in variables}
+            self.variable_indices = {v: i for i, v in enumerate(variables)}
+            signatures.append(f'⟨{len(variables)}, [{", ".join(self.ty(t) for t in ty[1])}], {self.ty(ty[2])}⟩')
+            context = [self.binding(p[0], ty) for p, (_, ty) in zip(self.parameter_nodes[name], parameters)]
+            term, actual = self.expr(body, context)
+            if actual != ty[2]:
+                raise ValueError('function result mismatch: ' + name)
+            bodies.append(term)
+        self.record_event({'stage': 'generic_program', 'signatures': signatures, 'bodies': bodies})
+        return ('import NLisp\nopen NLisp.Surface\nnamespace VerifiedPolyProgram\n'
+                f'def signatures : List Signature := [{", ".join(signatures)}]\n'
+                f'def bodies : List Expr := [{", ".join(bodies)}]\n'
+                'def checked := elaborateProgram 512 signatures bodies\n'
+                'theorem all_bodies_check : checked.isSome = true := by decide\n'
+                'def program : NLisp.PolyIR.Program := checked.get all_bodies_check\n'
+                'def source : Definitions := signatures.zip bodies\n'
+                'theorem program_erasure : program.erase = NLisp.PolyIR.eraseDefinitions source := by rfl\n'
+                f'def entry : Expr := .app (.global {self.indices["main"]} []) []\n'
+                'theorem entry_checks : (infer 512 signatures 0 [] entry).isSome = true := by decide\n'
+                'theorem execution_erases (fuel : Nat) :\n'
+                '    NLisp.PolyIR.eraseResult (evaluate source fuel [] entry) =\n'
+                '      NLisp.PolyIR.evaluate program.erase fuel [] (NLisp.PolyIR.erase entry) := by\n'
+                '  rw [program_erasure]\n'
+                '  exact (NLisp.PolyIR.execution_commutes source fuel).1 [] entry\n'
+                'end VerifiedPolyProgram\n')
+
+
 BUNDLE_HEADER = '-- NLisp process certificate v1; cryptographic signature: none\n'
 BUNDLE_HASH = '-- NLISP-PAYLOAD-SHA256 '
 BUNDLE_BEGIN = '-- BEGIN NLISP-CERTIFICATE-PAYLOAD\n'
@@ -993,7 +1182,7 @@ def render_proof(document, mode, budget):
         if len(proof.encode('utf-8')) > budget['max_certificate_bytes']:
             raise UnknownResult('termination proof size limit exceeded')
         return proof, [{'stage': 'macro_termination', **plan}]
-    cls = TypeExporter if mode == 'types' else Exporter
+    cls = {'types': TypeExporter, 'poly': PolyExporter}.get(mode, Exporter)
     exporter = cls(document, record_process=True, **budget)
     plan = termination_plan(document)
     proof = (exporter.export().replace('import NLisp\n',
@@ -1057,7 +1246,7 @@ def unpack_bundle(text):
     if set(manifest) != {'format', 'source', 'expansion', 'conversion', 'lean', 'environment', 'assurance'}:
         raise ValueError('invalid certificate manifest fields')
     mode = manifest['conversion']['mode']
-    if mode not in ('core', 'types', 'termination'):
+    if mode not in ('core', 'types', 'poly', 'termination'):
         raise ValueError('invalid proof mode')
     if manifest['format'] != 'nlisp-process-certificate-v1' or manifest['assurance'] != assurance_for(mode):
         raise ValueError('unsupported certificate format or assurance claim')
@@ -1077,6 +1266,8 @@ def replay_bundle(path, args):
     if digest(source) != manifest['source']['sha256']:
         raise ValueError('embedded source digest mismatch')
     document = manifest['expansion']['document']
+    if document.get('source_text', '').encode('utf-8') != source:
+        raise ValueError('embedded source bytes differ from the proof document source')
     mode = manifest['conversion']['mode']
     expected_format = 'nlisp-syntax-v1' if mode == 'termination' else 'nlisp-scoped-expansion-v2'
     if document.get('format') != expected_format:
@@ -1103,21 +1294,27 @@ def replay_bundle(path, args):
         if value > getattr(args, name):
             raise UnknownResult('certificate conversion budget exceeds verifier policy: ' + name)
     mode = manifest['conversion']['mode']
-    if mode not in ('core', 'types', 'termination'):
+    if mode not in ('core', 'types', 'poly', 'termination'):
         raise ValueError('invalid proof mode')
-    with tempfile.TemporaryDirectory(prefix='nlisp-replay-') as directory:
-        input_path = pathlib.Path(directory) / 'source.nlisp'
-        input_path.write_bytes(source)
-        command = [args.nlisp, 'export-syntax' if mode == 'termination' else 'export-core', str(input_path)]
-        for name, value in limits.items():
-            command.extend(['--' + name.replace('_', '-'), str(value)])
-        result = run_export(command, args.max_certificate_bytes)
-        if result.returncode == 7:
-            raise UnknownResult(result.stderr.strip())
-        result.check_returncode()
-        replayed = json.loads(result.stdout)
-    if canonical_json(replayed) != canonical_json(document):
-        raise ValueError('source parsing, normalization, or macro expansion trace does not replay')
+    if getattr(args, 'independent', False):
+        # No C executable, macro expander, or source evaluator is invoked.
+        # The recorded local rule applications generate proof obligations;
+        # SourceReader, CExpansion and CBindingWalk independently check them.
+        replayed = document
+    else:
+        with tempfile.TemporaryDirectory(prefix='nlisp-replay-') as directory:
+            input_path = pathlib.Path(directory) / 'source.nlisp'
+            input_path.write_bytes(source)
+            command = [args.nlisp, 'export-syntax' if mode == 'termination' else 'export-core', str(input_path)]
+            for name, value in limits.items():
+                command.extend(['--' + name.replace('_', '-'), str(value)])
+            result = run_export(command, args.max_certificate_bytes)
+            if result.returncode == 7:
+                raise UnknownResult(result.stderr.strip())
+            result.check_returncode()
+            replayed = json.loads(result.stdout)
+        if canonical_json(replayed) != canonical_json(document):
+            raise ValueError('source parsing, normalization, or macro expansion trace does not replay')
     expected, process = render_proof(replayed, mode, budget)
     if expected != proof or canonical_json(process) != canonical_json(manifest['conversion']['events']):
         raise ValueError('conversion trace or Lean body does not match the expanded program')
@@ -1131,14 +1328,18 @@ def main():
     parser.add_argument('--nlisp', default='build/nlisp')
     parser.add_argument('--output', type=pathlib.Path)
     parser.add_argument('--verify-certificate', type=pathlib.Path)
+    parser.add_argument('--independent', action='store_true',
+                        help='verify a certificate using recorded local derivations and Lean, without running the C expander')
     parser.add_argument('--lake', default='lake')
-    parser.add_argument('--mode', choices=('auto', 'core', 'types', 'termination'), default='auto',
-                        help='auto/core/types check finite expansions; termination proves the static macro call graph well-founded without expanding')
+    parser.add_argument('--mode', choices=('auto', 'core', 'types', 'poly', 'termination'), default='auto',
+                        help='auto/core/types use legacy cores; poly checks shared generic bodies; termination proves a static call graph well-founded without expanding')
     for option in ('max-expansions', 'max-generated-nodes', 'max-expansion-depth', 'max-check-steps'):
         parser.add_argument('--' + option, type=int)
     parser.add_argument('--max-certificate-bytes', type=int, default=4194304)
     parser.add_argument('--max-conversion-steps', type=int, default=100000)
     args = parser.parse_args()
+    if args.independent and args.verify_certificate is None:
+        parser.error('--independent requires --verify-certificate')
     if args.verify_certificate is not None:
         if args.source is not None or args.output is not None:
             parser.error('--verify-certificate takes no source or output path')
@@ -1151,7 +1352,8 @@ def main():
                 raise ValueError('resource limits must be nonnegative')
         if args.verify_certificate is not None:
             mode = replay_bundle(args.verify_certificate, args)
-            print(f'Process replay and Lean {mode} check passed: {args.verify_certificate}')
+            method = 'Independent certificate' if args.independent else 'Process replay'
+            print(f'{method} and Lean {mode} check passed: {args.verify_certificate}')
             return 0
         source_bytes = read_bounded_file(args.source, args.max_certificate_bytes)
         command = [args.nlisp, 'export-syntax' if args.mode == 'termination' else 'export-core', str(args.source)]
@@ -1175,7 +1377,7 @@ def main():
         budget = dict(max_certificate_bytes=args.max_certificate_bytes,
                       max_conversion_steps=args.max_conversion_steps)
         mode = args.mode
-        if mode in ('types', 'termination'):
+        if mode in ('types', 'poly', 'termination'):
             certificate, process = render_proof(document, mode, budget)
         else:
             try:

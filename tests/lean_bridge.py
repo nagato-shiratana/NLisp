@@ -71,7 +71,7 @@ class LeanBridge(unittest.TestCase):
             path = pathlib.Path(directory) / 'Tampered.lean'
             for index, (src, doc, events, body) in enumerate(variants):
                 with self.subTest(variant=index):
-                    path.write_text(bridge.pack_bundle(src, doc, events, body, 'core', budget))
+                    path.write_bytes(bridge.pack_bundle(src, doc, events, body, 'core', budget).encode('utf-8'))
                     result = self.run_bundle_verifier(path)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
@@ -83,7 +83,7 @@ class LeanBridge(unittest.TestCase):
         document['limits']['max_expansions'] += 1
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / 'LargerBudget.lean'
-            path.write_text(bridge.pack_bundle(source.read_bytes(), document, process, proof, 'core', budget))
+            path.write_bytes(bridge.pack_bundle(source.read_bytes(), document, process, proof, 'core', budget).encode('utf-8'))
             result = self.run_bundle_verifier(path)
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             self.assertIn('policy limit', result.stderr)
@@ -177,7 +177,7 @@ class LeanBridge(unittest.TestCase):
 """
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / 'Scopes.nlisp'
-            path.write_text(text)
+            path.write_text(text, encoding='utf-8')
             document = self.document(path)
         proof, _ = bridge.render_proof(document, 'core',
             dict(max_certificate_bytes=4194304, max_conversion_steps=100000))
@@ -223,7 +223,7 @@ class LeanBridge(unittest.TestCase):
     def lean(self, text):
         with tempfile.TemporaryDirectory(dir=ROOT / 'build') as directory:
             source = pathlib.Path(directory) / 'Certificate.lean'
-            source.write_text(text)
+            source.write_text(text, encoding='utf-8')
             return subprocess.run([LAKE, 'env', 'lean', str(source)], cwd=ROOT,
                                   env=ENV, capture_output=True, text=True)
 
@@ -245,7 +245,7 @@ class LeanBridge(unittest.TestCase):
         self.assertNotIn('expandedProgram_notStuck', certificate)
         result = self.lean(certificate)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        source = (ROOT / 'src/nlisp.c').read_text().split('static const BuiltinSpec builtin_specs[] = {')[1].split('};')[0]
+        source = (ROOT / 'src/nlisp.c').read_text(encoding='utf-8').split('static const BuiltinSpec builtin_specs[] = {')[1].split('};')[0]
         import re
         expected = set(re.findall(r'\{"([^"]+)"', source))
         self.assertEqual({entry[0] for entry in bridge.PRIMITIVES}, expected)
@@ -258,7 +258,17 @@ class LeanBridge(unittest.TestCase):
     def test_full_type_certificates_for_existing_examples(self):
         for path in sorted((ROOT / 'examples').glob('*.nlisp')):
             with self.subTest(source=path.name):
-                certificate = bridge.TypeExporter(self.document(path)).export()
+                document = self.document(path)
+                if path.name == 'polymorphic_recursion.nlisp':
+                    # The legacy specializer cannot enumerate infinitely growing
+                    # type arguments; the shared-body path handles this program.
+                    with self.assertRaises((bridge.UnknownResult, RecursionError)):
+                        bridge.TypeExporter(document).export()
+                    certificate = bridge.PolyExporter(document).export().replace(
+                        'import NLisp\n', 'import NLisp\nset_option maxRecDepth 4096\n'
+                        'set_option maxHeartbeats 2000000\n', 1)
+                else:
+                    certificate = bridge.TypeExporter(document).export()
                 result = self.lean(certificate)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -277,7 +287,7 @@ class LeanBridge(unittest.TestCase):
 '''
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / 'Literals.nlisp'
-            source.write_text(source_text)
+            source.write_text(source_text, encoding='utf-8')
             certificate = bridge.TypeExporter(self.document(source)).export()
             self.assertIn('Expr.floatBits', certificate)
             self.assertIn('Char.ofNat 0', certificate)
@@ -333,7 +343,7 @@ def wrong : Embedding Examples.definitionScope Examples.callScope where
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / 'Forever.nlisp'
             output = pathlib.Path(directory) / 'Certificate.lean'
-            source.write_text(source_text)
+            source.write_text(source_text, encoding='utf-8')
             result = subprocess.run(
                 [sys.executable, str(ROOT / 'tools/verify_lean.py'), str(source),
                  '--nlisp', NLISP, '--output', str(output), '--lake', LAKE,
@@ -426,7 +436,7 @@ def wrong : Embedding Examples.definitionScope Examples.callScope where
 '''
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / 'Unused.nlisp'
-            source.write_text(source_text)
+            source.write_text(source_text, encoding='utf-8')
             certificate = bridge.Exporter(self.document(source)).export()
             self.assertIn('Expr.fix', certificate)
             result = self.lean(certificate)
@@ -442,7 +452,7 @@ def wrong : Embedding Examples.definitionScope Examples.callScope where
 '''
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / 'Shadow.nlisp'
-            source.write_text(source_text)
+            source.write_text(source_text, encoding='utf-8')
             result = self.lean(bridge.Exporter(self.document(source)).export())
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -455,7 +465,7 @@ def wrong : Embedding Examples.definitionScope Examples.callScope where
 '''
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / 'RecursiveGroup.nlisp'
-            source.write_text(source_text)
+            source.write_text(source_text, encoding='utf-8')
             document = self.document(source)
             self.assertTrue(all(bridge.atom(d[0]) != 'defrec' for d in document['declarations']))
             for exporter in (bridge.Exporter, bridge.TypeExporter):

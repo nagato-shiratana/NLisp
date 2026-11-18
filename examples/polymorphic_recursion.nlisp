@@ -1,0 +1,8 @@
+; The recursive call changes T to (List T). The generic body is checked once.
+; Calling grow would diverge; the selected branch in main returns 42.
+(defun grow
+  (forall (T) ((value T)) Integer)
+  (grow (Cons T value (Nil T))))
+
+(defun main () Integer
+  (if true 42 (grow 0)))

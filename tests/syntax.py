@@ -235,7 +235,7 @@ class Syntax(unittest.TestCase):
                              4, 'duplicate')
 
     def test_value_and_macro_namespaces_survive_hygienic_copy(self):
-        source = (pathlib.Path(__file__).resolve().parents[1] / 'examples/macro_namespaces.nlisp').read_text()
+        source = (pathlib.Path(__file__).resolve().parents[1] / 'examples/macro_namespaces.nlisp').read_text(encoding='utf-8')
         self.expect_run(source, 42)
 
 

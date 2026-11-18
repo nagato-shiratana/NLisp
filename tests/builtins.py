@@ -13,12 +13,12 @@ EXECUTABLE = str(pathlib.Path(sys.argv.pop(1)).resolve())
 class Builtins(unittest.TestCase):
     def test_specification_registration_and_coverage(self):
         root = pathlib.Path(__file__).resolve().parents[1]
-        specification = (root / 'SPECIFICATION.md').read_text().split('### 8.2')[1].split('### 8.3')[0]
+        specification = (root / 'SPECIFICATION.md').read_text(encoding='utf-8').split('### 8.2')[1].split('### 8.3')[0]
         expected = set()
         for line in specification.splitlines():
             if line.startswith('| `'):
                 expected.update(re.findall(r'`([^`]+)`', line.split('|')[1]))
-        source = (root / 'src/nlisp.c').read_text().split('static const BuiltinSpec builtin_specs[] = {')[1].split('};')[0]
+        source = (root / 'src/nlisp.c').read_text(encoding='utf-8').split('static const BuiltinSpec builtin_specs[] = {')[1].split('};')[0]
         actual = re.findall(r'\{"([^"]+)"', source)
         self.assertEqual(set(actual), expected)
         self.assertEqual(len(actual), len(set(actual)))

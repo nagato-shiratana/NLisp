@@ -4,6 +4,26 @@
 
 ## 対応機能
 
+### 2026-11-18 追補: 表層意味論・多相IR・型消去
+
+`EvaluatorCorrectness.lean` と `EvaluatorCompleteness.lean` は、実行用評価器の成功と有限の大ステップ導出の同値、および十分なfuel以後の結果の安定性を証明する。表層の注釈付き評価器についても `SurfaceEvaluatorCorrectness.lean` と `SurfaceEvaluatorCompleteness.lean` で同じ健全性・完全性を証明した。双方の評価関係の決定性も検査済み。
+
+`Erasure.lean` の `evaluation_preserved` は表層の有限評価導出から型消去先の有限評価導出を構成する。`ErasureExecution.lean` の `execution_commutes` は同じfuelでの実行結果が値・エラーの両方について一致すること、`finite_evaluation_iff` は終了の保存と反映、`execution_error_iff` はエラーの対応を示す。`fuel_divergence_iff` は「すべての有限fuelでoutOfFuel」の同値であり、1回の予算切れを非停止と判定するものではない。公理監査はLean標準3公理のみで、独自公理・sorryAxはない。
+
+新しいLeanモデルとして `NLisp/Surface.lean`、`NLisp/SurfaceSemantics.lean`、`NLisp/PolyIR.lean` を追加した。旧単相コアとは別の意味論であり、C/JSONからの変換はpolyモードで構成する。旧経路との一般的な対応定理はまだない。
+
+- Surface: 型変数付き単相型、rank-1関数シグネチャ、明示的グローバル型適用、複数引数・0引数lambda/app、並列let、非空begin、List/Option照合、外在的型付け判断。
+- SurfaceSemantics: 型注釈と型引数を保持したクロージャによる、独立した有限の大ステップ評価関係。共有されたグローバル関数表で自己再帰と相互再帰を表す。
+- PolyIR: 型導出を保持するCheckedExprとDefinition、全本体の型導出を要求するProgram。実行用Termへの全域的な型消去、タグ付きValue、予算付き評価器。
+
+関数本体は型引数ごとに複製しない。型抽象はDefinitionのtypeArityに対応するシグネチャ束縛、型適用はglobalの明示的な型引数列として保持する。実行用表現だけからこれらを除く。新モデルは既存TypedExpansion.Tyとは別の型であり、両者の一般的な対応は未接続。
+
+`SurfaceChecker.lean` は全Surface構文の実行可能な型検査と証明付きIR構築を行う。`elaborateProgram` は共有された全シグネチャの下で各汎用本体を一度検査し、再帰・相互再帰・多相再帰を具体化なしに受理する。成功値自体に `HasType` の証明を保持する。明示的型引数を持つ展開後構文が入力であり、Cの一方向型引数推論の正しさはまだ接続していない。checkerの深さ予算超過と型不適合はともにnoneとなるため、noneは不適合の証明として使わない。一般的な完全性・型保存・Progressは未証明。
+
+局所環境は先頭パラメーターが添字0。並列letの全右辺は元の環境で評価し、結果列を同時に追加する。グローバル本体の局所環境は引数だけ。`verify_lean.py --mode poly` はC展開結果から明示的型引数を持つSurfaceへ変換し、全汎用本体・mainの型検査と検査済みProgramの型消去対応をLeanで照合する。旧経路と異なり再帰本体のインライン化・型ごとの具体化は行わない。Python変換とC構文の一般的な対応定理、トップレベル初期化・捕捉の明示化、C型表現との対応は未接続。トップレベルdefineはpolyモードで明示的に拒否する。fuelは導出深さを制限し、総実行ステップ数や多項式時間保証ではない。新SurfaceモデルはBoolean/Integer/Unit/関数/List/Optionの範囲で、Float/String/Characterと残りの組み込み関数は旧TypedExpansionモデル・C実装の範囲に残る。
+
+Lean 4.8.0で全モジュールとSurfaceIR/Erasure/EvaluatorCorrectness/ErasureExecution/SurfaceCheckerの検査を実施する。auto/core/typesには移行前の具体化経路を残し、polyを明示指定して新経路を利用する。以下の対応機能一覧はC処理系の範囲を表す。
+
 - S式と行コメント
 - `Boolean`、任意精度`Integer`、binary64 `Float`、UTF-8 `String`、Unicode scalar `Character`、`Unit`
 - 関数、クロージャ、一般再帰、相互再帰
@@ -128,7 +148,9 @@ Lean連携ツールにも同じ4つのオプションを指定できる。C処�
 
 `--verify-certificate` は埋め込まれた元ソースを一時ディレクトリに復元して `export-core` を再実行し、全過程を照合する。記録した方式の変換も再実行し、変換記録とLean本文を照合してからLean検査する。検証前にファイルサイズ・宣言された予算を検証者の上限と比較する。予算の引き上げを証明書の自己申告だけで許可しない。本文は再生成結果と一致した場合だけLeanへ渡す。再検証は元ファイルを変更しない。
 
-JSON内の重複キー、不正なBase64、ダイジェスト不一致、別のLean環境、再現できない入力・規則適用・変換・本文はエラーとする。暗号署名はなく、保証範囲のフィールドにもその旨を明記する。過程再実行の正しさをLeanカーネルで証明する独立した検査器は今後の課題である。
+`--verify-certificate ... --independent` はC処理系を起動しない。元ソースと展開導出の証拠、変換記録から本文を再構成し、読み取り・正規化・局所展開・束縛対応をLeanカーネルで検査する。存在しない `--nlisp` を指定して数学マクロの実証書を検査する統合確認に成功した。通常の再実行方式も残す。
+
+JSON内の重複キー、不正なBase64、ダイジェスト不一致、別のLean環境、再現できない入力・規則適用・変換・本文はエラーとする。暗号署名はなく、保証範囲のフィールドにもその旨を明記する。検査器全体の正しさと多項式時間上界の一般証明は残る。証書のassurance内のprocess欄は生成時の記録方式であり、再検査にCを起動したかは選択した検査モードによる。
 
 元ソース・証明書の読み込みとC過程出力の取り込みにも証明書のバイト上限を適用し、上限を超えた出力をメモリへ無制限に取り込まない。上限超過時は自分が起動したC子プロセスを終了して回収し、Unknownを返す。証明書自体の改行はLFに固定し、同梱する元ソースの改行・UTF-8バイト列はそのまま保持する。
 
