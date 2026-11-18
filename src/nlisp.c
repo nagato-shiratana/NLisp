@@ -1,6 +1,7 @@
 #include "nlisp.h"
 
 #include <ctype.h>
+#include <fenv.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -1054,23 +1055,195 @@ static bool integer_atom(const char *s) {
     return *p == '\0';
 }
 
+static bool ascii_digit(char c) { return c >= '0' && c <= '9'; }
+
+static uint64_t mpz_u64(const mpz_t value) {
+    uint64_t result = 0U;
+    size_t words = 0U;
+    mpz_export(&result, &words, -1, sizeof(result), 0, 0U, value);
+    return result;
+}
+
+static uint64_t round_ratio_scaled(const mpz_t numerator, const mpz_t denominator, int scale) {
+    mpz_t scaled_numerator, scaled_denominator, quotient, remainder, twice_remainder;
+    uint64_t result;
+    mpz_inits(scaled_numerator, scaled_denominator, quotient, remainder, twice_remainder, NULL);
+    mpz_set(scaled_numerator, numerator);
+    mpz_set(scaled_denominator, denominator);
+    if (scale < 0) mpz_mul_2exp(scaled_numerator, scaled_numerator, (mp_bitcnt_t)(-scale));
+    else if (scale > 0) mpz_mul_2exp(scaled_denominator, scaled_denominator, (mp_bitcnt_t)scale);
+    mpz_tdiv_qr(quotient, remainder, scaled_numerator, scaled_denominator);
+    mpz_mul_2exp(twice_remainder, remainder, 1U);
+    if (mpz_cmp(twice_remainder, scaled_denominator) > 0 ||
+        (mpz_cmp(twice_remainder, scaled_denominator) == 0 && mpz_odd_p(quotient)))
+        mpz_add_ui(quotient, quotient, 1U);
+    result = mpz_u64(quotient);
+    mpz_clears(scaled_numerator, scaled_denominator, quotient, remainder, twice_remainder, NULL);
+    return result;
+}
+
+static double decimal_to_binary64(const char *digits, size_t digit_count, size_t first_nonzero,
+                                  size_t fractional_digits, int64_t explicit_exponent, bool negative) {
+    mpz_t significand, numerator, denominator, power;
+    size_t i;
+    int64_t decimal_exponent, decimal_order;
+    int binary_exponent;
+    uint64_t bits, rounded;
+    double result;
+    if (first_nonzero == digit_count) {
+        bits = negative ? UINT64_C(0x8000000000000000) : 0U;
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+    /* Outside this decimal range the result is certainly infinity or signed zero.
+       These guards also keep exponent arithmetic bounded before constructing powers. */
+    if (fractional_digits > (size_t)INT64_MAX) {
+        bits = negative ? UINT64_C(0x8000000000000000) : 0U;
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+    if (explicit_exponent < 0 && explicit_exponent < INT64_MIN + (int64_t)fractional_digits)
+        decimal_exponent = INT64_MIN;
+    else decimal_exponent = explicit_exponent - (int64_t)fractional_digits;
+    if (digit_count - first_nonzero - 1U > (size_t)INT64_MAX) {
+        bits = UINT64_C(0x7ff0000000000000);
+        if (negative) bits |= UINT64_C(0x8000000000000000);
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+    if (decimal_exponent > INT64_MAX - (int64_t)(digit_count - first_nonzero - 1U))
+        decimal_order = INT64_MAX;
+    else decimal_order = (int64_t)(digit_count - first_nonzero - 1U) + decimal_exponent;
+    if (decimal_order > 400) {
+        bits = UINT64_C(0x7ff0000000000000) | (negative ? UINT64_C(0x8000000000000000) : 0U);
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+    if (decimal_order < -400) {
+        bits = negative ? UINT64_C(0x8000000000000000) : 0U;
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+    mpz_inits(significand, numerator, denominator, power, NULL);
+    mpz_set_ui(significand, 0U);
+    for (i = first_nonzero; i < digit_count; i++) {
+        mpz_mul_ui(significand, significand, 10U);
+        mpz_add_ui(significand, significand, (unsigned long)(digits[i] - '0'));
+    }
+    mpz_set(numerator, significand);
+    mpz_set_ui(denominator, 1U);
+    if (decimal_exponent >= 0) {
+        if ((uint64_t)decimal_exponent > (uint64_t)ULONG_MAX) {
+            bits = UINT64_C(0x7ff0000000000000);
+            if (negative) bits |= UINT64_C(0x8000000000000000);
+            memcpy(&result, &bits, sizeof(result));
+            mpz_clears(significand, numerator, denominator, power, NULL);
+            return result;
+        }
+        mpz_ui_pow_ui(power, 10U, (unsigned long)decimal_exponent);
+        mpz_mul(numerator, numerator, power);
+    } else {
+        uint64_t magnitude = (uint64_t)(-(decimal_exponent + 1)) + 1U;
+        if (magnitude > (uint64_t)ULONG_MAX) {
+            bits = negative ? UINT64_C(0x8000000000000000) : 0U;
+            memcpy(&result, &bits, sizeof(result));
+            mpz_clears(significand, numerator, denominator, power, NULL);
+            return result;
+        }
+        mpz_ui_pow_ui(denominator, 10U, (unsigned long)magnitude);
+    }
+
+    {
+        size_t numerator_bits = mpz_sizeinbase(numerator, 2U);
+        size_t denominator_bits = mpz_sizeinbase(denominator, 2U);
+        int64_t difference;
+        if (numerator_bits > (size_t)INT64_MAX || denominator_bits > (size_t)INT64_MAX) {
+            bits = numerator_bits > denominator_bits ? UINT64_C(0x7ff0000000000000) : 0U;
+            if (negative) bits |= UINT64_C(0x8000000000000000);
+            memcpy(&result, &bits, sizeof(result));
+            mpz_clears(significand, numerator, denominator, power, NULL);
+            return result;
+        }
+        difference = (int64_t)numerator_bits - (int64_t)denominator_bits;
+        if (difference > INT_MAX || difference < INT_MIN) {
+            bits = difference > 0 ? UINT64_C(0x7ff0000000000000) : 0U;
+            if (negative) bits |= UINT64_C(0x8000000000000000);
+            memcpy(&result, &bits, sizeof(result));
+            mpz_clears(significand, numerator, denominator, power, NULL);
+            return result;
+        }
+        binary_exponent = (int)difference;
+    }
+    if (binary_exponent >= 0) {
+        mpz_mul_2exp(power, denominator, (mp_bitcnt_t)binary_exponent);
+        if (mpz_cmp(numerator, power) < 0) binary_exponent--;
+    } else {
+        mpz_mul_2exp(power, numerator, (mp_bitcnt_t)(-binary_exponent));
+        if (mpz_cmp(power, denominator) < 0) binary_exponent--;
+    }
+    if (binary_exponent > 1023) {
+        bits = UINT64_C(0x7ff0000000000000);
+        rounded = 0U;
+    } else if (binary_exponent < -1022) {
+        rounded = round_ratio_scaled(numerator, denominator, -1074);
+        bits = rounded >= (UINT64_C(1) << 52U) ? (UINT64_C(1) << 52U) : rounded;
+    } else {
+        rounded = round_ratio_scaled(numerator, denominator, binary_exponent - 52);
+        if (rounded == (UINT64_C(1) << 53U)) {
+            rounded >>= 1U;
+            binary_exponent++;
+        }
+        if (binary_exponent > 1023) bits = UINT64_C(0x7ff0000000000000);
+        else bits = ((uint64_t)(binary_exponent + 1023) << 52U) |
+                    (rounded - (UINT64_C(1) << 52U));
+    }
+    if (negative) bits |= UINT64_C(0x8000000000000000);
+    memcpy(&result, &bits, sizeof(result));
+    mpz_clears(significand, numerator, denominator, power, NULL);
+    return result;
+}
+
 static bool float_atom(const char *s, double *out) {
     const char *p = s;
-    char *end;
+    const char *digits_start;
+    char *digits;
+    size_t digit_count = 0U, fractional_digits = 0U, first_nonzero;
+    int64_t exponent = 0;
+    bool negative = false;
     if (*p == '-') p++;
-    if (!isdigit((unsigned char)*p)) return false;
-    while (isdigit((unsigned char)*p)) p++;
-    if (*p++ != '.' || !isdigit((unsigned char)*p)) return false;
-    while (isdigit((unsigned char)*p)) p++;
+    negative = s[0] == '-';
+    if (!ascii_digit(*p)) return false;
+    digits_start = p;
+    while (ascii_digit(*p)) { p++; digit_count++; }
+    if (*p++ != '.' || !ascii_digit(*p)) return false;
+    while (ascii_digit(*p)) { p++; digit_count++; fractional_digits++; }
     if (*p == 'e' || *p == 'E') {
+        bool exponent_negative = false;
         p++;
-        if (*p == '+' || *p == '-') p++;
-        if (!isdigit((unsigned char)*p)) return false;
-        while (isdigit((unsigned char)*p)) p++;
+        if (*p == '+' || *p == '-') { exponent_negative = *p == '-'; p++; }
+        if (!ascii_digit(*p)) return false;
+        while (ascii_digit(*p)) {
+            int digit = *p++ - '0';
+            if (exponent > (INT64_MAX - digit) / 10) exponent = INT64_MAX;
+            else exponent = exponent * 10 + digit;
+        }
+        if (exponent_negative) exponent = -exponent;
     }
     if (*p != '\0') return false;
-    *out = strtod(s, &end);
-    return *end == '\0';
+    digits = (char *)malloc(digit_count + 1U);
+    if (digits == NULL) { fputs("nlisp: out of memory\n", stderr); abort(); }
+    memcpy(digits, digits_start, (size_t)(strchr(s, '.') - digits_start));
+    {
+        size_t whole = (size_t)(strchr(s, '.') - digits_start);
+        size_t fraction = digit_count - whole;
+        memcpy(digits + whole, strchr(s, '.') + 1, fraction);
+        digits[digit_count] = '\0';
+    }
+    first_nonzero = 0U;
+    while (first_nonzero < digit_count && digits[first_nonzero] == '0') first_nonzero++;
+    *out = decimal_to_binary64(digits, digit_count, first_nonzero, fractional_digits, exponent, negative);
+    free(digits);
+    return true;
 }
 
 static bool require(const Type *got, const Type *want, Span span, Error *e, const char *where) {
@@ -2117,7 +2290,8 @@ NLispLimits nlisp_default_limits(void) {
     NLispLimits limits = {10000U, 100000U, 128U, 1000000U}; return limits;
 }
 
-NLispStatus nlisp_process_file(const char *path, NLispCommand mode, const NLispLimits *limits, FILE *out, FILE *err) {
+static NLispStatus nlisp_process_file_inner(const char *path, NLispCommand mode, const NLispLimits *limits,
+                                            FILE *out, FILE *err) {
     Arena a = {0}; Error e = {false, NLISP_OK, {0U, 0U}, {0}};
     char *source; size_t len = 0U; Tokens ts = {NULL, 0U}; Forms forms = {NULL, 0U};
     Program p = {NULL, 0U}; Value *result = NULL;
@@ -2164,6 +2338,27 @@ NLispStatus nlisp_process_file(const char *path, NLispCommand mode, const NLispL
     free(source);
     if (e.set) { report(err, path, &e); adestroy(&a); return e.status; }
     adestroy(&a); return NLISP_OK;
+}
+
+NLispStatus nlisp_process_file(const char *path, NLispCommand mode, const NLispLimits *limits,
+                               FILE *out, FILE *err) {
+    fenv_t caller_environment;
+    NLispStatus status;
+    if (feholdexcept(&caller_environment) != 0) {
+        fputs("unable to isolate floating-point environment\n", err);
+        return NLISP_RUNTIME_ERROR;
+    }
+    if (fesetround(FE_TONEAREST) != 0) {
+        (void)fesetenv(&caller_environment);
+        fputs("unable to select IEEE roundTiesToEven mode\n", err);
+        return NLISP_RUNTIME_ERROR;
+    }
+    status = nlisp_process_file_inner(path, mode, limits, out, err);
+    if (fesetenv(&caller_environment) != 0) {
+        fputs("unable to restore caller floating-point environment\n", err);
+        if (status == NLISP_OK) status = NLISP_RUNTIME_ERROR;
+    }
+    return status;
 }
 
 NLispStatus nlisp_check_file(const char *path, FILE *out, FILE *err) {
