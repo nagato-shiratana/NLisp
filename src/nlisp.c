@@ -235,8 +235,27 @@ static bool character_literal(const char *s, uint32_t *out) {
     return utf8_next(s, length, &i, out) && i == length;
 }
 
-static bool delimiter(char c) {
-    return c == '(' || c == ')' || c == ';' || c == '"' || isspace((unsigned char)c) != 0;
+/* Unicode 18.0 White_Space (PropList.txt), as required by SPECIFICATION 4.1. */
+static bool unicode_space(uint32_t c) {
+    return (c >= 0x9U && c <= 0xdU) || c == 0x20U || c == 0x85U || c == 0xa0U ||
+           c == 0x1680U || (c >= 0x2000U && c <= 0x200aU) || c == 0x2028U ||
+           c == 0x2029U || c == 0x202fU || c == 0x205fU || c == 0x3000U;
+}
+
+static bool line_end(uint32_t c) {
+    return c == '\r' || c == '\n' || c == 0x85U || c == 0x2028U || c == 0x2029U;
+}
+
+static bool delimiter_at(const char *source, size_t length, size_t position) {
+    uint32_t c;
+    if (!utf8_next(source, length, &position, &c)) return true;
+    return c == '(' || c == ')' || c == ';' || c == '"' || unicode_space(c);
+}
+
+static void advance_scalar(const char *source, size_t length, size_t *position, size_t *column) {
+    uint32_t ignored;
+    (void)utf8_next(source, length, position, &ignored);
+    (*column)++;
 }
 
 static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
@@ -249,13 +268,26 @@ static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
     }
     while (i < len) {
         char c = src[i];
+        size_t next_position = i;
+        uint32_t codepoint;
+        (void)utf8_next(src, len, &next_position, &codepoint);
         if (c == '\r' || c == '\n') {
             if (c == '\r' && i + 1U < len && src[i + 1U] == '\n') i++;
             i++; line++; col = 1U; continue;
         }
-        if (isspace((unsigned char)c) != 0) { i++; col++; continue; }
+        if (unicode_space(codepoint)) {
+            i = next_position;
+            if (line_end(codepoint)) { line++; col = 1U; } else col++;
+            continue;
+        }
         if (c == ';') {
-            while (i < len && src[i] != '\r' && src[i] != '\n') { i++; col++; }
+            while (i < len) {
+                size_t after = i;
+                uint32_t comment;
+                (void)utf8_next(src, len, &after, &comment);
+                if (line_end(comment)) break;
+                i = after; col++;
+            }
             continue;
         }
         if (c == '(' || c == ')') {
@@ -283,7 +315,7 @@ static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
             uint32_t ignored;
             i += 2U; col += 2U;
             if (i < len && (src[i] == '(' || src[i] == ')' || src[i] == ';' || src[i] == '"')) { i++; col++; }
-            else while (i < len && !delimiter(src[i])) { i++; col++; }
+            else while (i < len && !delimiter_at(src, len, i)) advance_scalar(src, len, &i, &col);
             ts[count] = (Token){TK_ATOM, {line, start_col}, astr(a, src + start, i - start)};
             if (!character_literal(ts[count].text, &ignored))
                 return fail(e, NLISP_PARSE_ERROR, ts[count].span, "invalid character literal");
@@ -291,7 +323,7 @@ static bool lex(Arena *a, const char *src, size_t len, Tokens *out, Error *e) {
         }
         {
             size_t start = i, start_col = col;
-            while (i < len && !delimiter(src[i])) { i++; col++; }
+            while (i < len && !delimiter_at(src, len, i)) advance_scalar(src, len, &i, &col);
             if (i - start >= 7U && strncmp(src + start, "#%nlisp", 7U) == 0)
                 return fail(e, NLISP_PARSE_ERROR, (Span){line, start_col}, "reserved generated identifier prefix");
             ts[count++] = (Token){TK_ATOM, {line, start_col}, astr(a, src + start, i - start)};
@@ -456,6 +488,26 @@ static bool is_atom(const SExpr *x, const char *s) {
     return x->kind == SX_ATOM && strcmp(x->atom, s) == 0;
 }
 
+static bool integer_atom(const char *s);
+static bool float_atom(const char *s, double *out);
+
+static bool identifier(const SExpr *x) {
+    static const char *const reserved[] = {
+        "true", "false", "unit", "define", "defun", "defrec", "lambda", "if", "let", "begin",
+        "forall", "type-app", "match", "define-macro", "syntax-rules/typed",
+        "Boolean", "Integer", "Float", "String", "Character", "Unit", "List", "Option", "Function", "Syntax",
+        "Nil", "Cons", "None", "Some"
+    };
+    size_t i;
+    double ignored;
+    if (x->kind != SX_ATOM || x->atom[0] == '\0' || x->atom[0] == '"' ||
+        (x->atom[0] == '#' && x->atom[1] == '\\') || integer_atom(x->atom) || float_atom(x->atom, &ignored))
+        return false;
+    for (i = 0U; i < sizeof(reserved) / sizeof(reserved[0]); i++)
+        if (strcmp(x->atom, reserved[i]) == 0) return false;
+    return true;
+}
+
 typedef enum { TY_BOOL, TY_INT, TY_UNIT, TY_FLOAT, TY_STRING, TY_CHAR, TY_FUN, TY_LIST, TY_OPTION, TY_VAR, TY_FORALL } TypeKind;
 typedef struct Type {
     TypeKind kind;
@@ -585,6 +637,8 @@ static bool parse_params(Arena *a, const SExpr *x, Param **out, size_t *count, E
         const SExpr *p = x->items[i];
         if (p->kind != SX_LIST || p->count != 2U || p->items[0]->kind != SX_ATOM)
             return fail(e, NLISP_PARSE_ERROR, p->span, "parameter must have form (name Type)");
+        if (!identifier(p->items[0]))
+            return fail(e, NLISP_PARSE_ERROR, p->items[0]->span, "invalid parameter identifier");
         for (j = 0U; j < i; j++)
             if (strcmp(ps[j].name, p->items[0]->atom) == 0)
                 return fail(e, NLISP_PARSE_ERROR, p->span, "duplicate parameter '%s'", p->items[0]->atom);
@@ -610,6 +664,8 @@ static bool parse_program(Arena *a, Forms forms, Program *out, Error *e) {
             if ((f->count != 5U && f->count != 4U) || f->items[1]->kind != SX_ATOM)
                 return fail(e, NLISP_PARSE_ERROR, f->span,
                             "defun form is (defun name ((arg Type) ...) ReturnType body)");
+            if (!identifier(f->items[1]))
+                return fail(e, NLISP_PARSE_ERROR, f->items[1]->span, "invalid function identifier");
             ds[i].kind = D_FUN; d = &ds[i].as.fun;
             d->name = f->items[1]->atom; d->span = f->items[1]->span;
             if (f->count == 4U) {
@@ -624,10 +680,7 @@ static bool parse_program(Arena *a, Forms forms, Program *out, Error *e) {
                 for (j = 0U; j < variable_count; j++) {
                     size_t k;
                     const SExpr *q = quantifiers->items[j];
-                    if (q->kind != SX_ATOM || is_atom(q, "Boolean") || is_atom(q, "Integer") ||
-                        is_atom(q, "Unit") || is_atom(q, "Float") || is_atom(q, "String") ||
-                        is_atom(q, "Character") || is_atom(q, "List") || is_atom(q, "Option") ||
-                        is_atom(q, "Function") || is_atom(q, "forall") || is_atom(q, "Syntax"))
+                    if (!identifier(q))
                         return fail(e, NLISP_PARSE_ERROR, q->span, "invalid type variable");
                     for (k = 0U; k < j; k++)
                         if (strcmp(variables[k]->name, q->atom) == 0)
@@ -656,6 +709,8 @@ static bool parse_program(Arena *a, Forms forms, Program *out, Error *e) {
                 f->items[1]->items[0]->kind != SX_ATOM)
                 return fail(e, NLISP_PARSE_ERROR, f->span,
                             "define form is (define (name Type) expression)");
+            if (!identifier(f->items[1]->items[0]))
+                return fail(e, NLISP_PARSE_ERROR, f->items[1]->items[0]->span, "invalid value identifier");
             ds[i].kind = D_VAL; d = &ds[i].as.val; b = f->items[1];
             d->name = b->items[0]->atom; d->span = b->items[0]->span;
             d->type = parse_type(a, b->items[1], e); if (d->type == NULL) return false;
@@ -744,6 +799,8 @@ static bool collect_macros(Arena *a, Forms *forms, Error *e) {
             if (form->count != 3U || form->items[1]->kind != SX_ATOM ||
                 form->items[2]->kind != SX_LIST)
                 return fail(e, NLISP_PARSE_ERROR, form->span, "invalid define-macro");
+            if (!identifier(form->items[1]))
+                return fail(e, NLISP_PARSE_ERROR, form->items[1]->span, "invalid macro identifier");
             rules = form->items[2];
             if (rules->count < 2U || !is_atom(rules->items[0], "syntax-rules/typed"))
                 return fail(e, NLISP_PARSE_ERROR, rules->span,
@@ -780,6 +837,8 @@ static bool collect_macros(Arena *a, Forms *forms, Error *e) {
                         c->items[1]->kind != SX_LIST || c->items[1]->count != 2U ||
                         !is_atom(c->items[1]->items[0], "Syntax"))
                         return fail(e, NLISP_PARSE_ERROR, c->span, "input contract must be (parameter (Syntax Type)) in pattern order");
+                    if (!identifier(pattern->items[j + 1U]))
+                        return fail(e, NLISP_PARSE_ERROR, pattern->items[j + 1U]->span, "invalid macro parameter identifier");
                     for (k = 0U; k < j; k++)
                         if (strcmp(pattern->items[k + 1U]->atom, pattern->items[j + 1U]->atom) == 0)
                             return fail(e, NLISP_PARSE_ERROR, c->span, "duplicate macro parameter");
@@ -835,13 +894,24 @@ static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *
 
 static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e);
 
+static SExpr *fresh_value_atom(Arena *a, const SExpr *source, Error *e) {
+    char buffer[80];
+    SExpr *result = macro_node(a, source->span, e);
+    if (result == NULL) return NULL;
+    *result = *source;
+    (void)snprintf(buffer, sizeof(buffer), "#%%nlisp%zu", ++a->fresh_scope);
+    result->atom = astr(a, buffer, strlen(buffer)); result->origin = NULL; result->expanded = NULL;
+    result->token_identity = name_identity(a, result->atom); result->resolved_identity = 0U;
+    return result;
+}
+
 static SExpr *copy_binder(Arena *a, Macro *m, SExpr *x, Rename **renames, Error *e) {
     SExpr *r;
     Rename *name;
     size_t ignored;
     char buffer[80];
-    if (x->kind != SX_ATOM || macro_parameter(m, x->atom, &ignored)) {
-        (void)fail(e, NLISP_PARSE_ERROR, x->span, "macro holes cannot occur in binding positions");
+    if (!identifier(x) || macro_parameter(m, x->atom, &ignored)) {
+        (void)fail(e, NLISP_PARSE_ERROR, x->span, "invalid template binding identifier; macro holes cannot occur in binding positions");
         return NULL;
     }
     r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x;
@@ -867,6 +937,22 @@ static SExpr *copy_template_inner(Arena *a, Macro *m, SExpr *x, SExpr **args, Re
     r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x;
     r->items = (SExpr **)aalloc(a, x->count * sizeof(*r->items));
     for (i = 0U; i < x->count; i++) r->items[i] = x->items[i];
+    if (x->count > 0U && x->items[0]->kind == SX_ATOM &&
+        !macro_parameter(m, x->items[0]->atom, &index)) {
+        Macro *known;
+        for (known = a->macros; known != NULL; known = known->next) if (strcmp(known->name, x->items[0]->atom) == 0) break;
+        if (known != NULL) {
+            SExpr *head = macro_node(a, x->items[0]->span, e);
+            if (head == NULL) return NULL;
+            *head = *x->items[0]; head->origin = m; head->resolved_identity = 0U;
+            r->items[0] = head;
+            for (i = 1U; i < x->count; i++) {
+                r->items[i] = copy_template(a, m, x->items[i], args, renames, e);
+                if (r->items[i] == NULL) return NULL;
+            }
+            return r;
+        }
+    }
     if (x->count == 4U && is_atom(x->items[0], "lambda") && x->items[1]->kind == SX_LIST) {
         SExpr *ps = macro_node(a, x->span, e); if (ps == NULL) return NULL; *ps = *x->items[1];
         ps->items = (SExpr **)aalloc(a, ps->count * sizeof(*ps->items));
@@ -874,6 +960,14 @@ static SExpr *copy_template_inner(Arena *a, Macro *m, SExpr *x, SExpr **args, Re
             SExpr *p = x->items[1]->items[i], *q;
             if (p->kind != SX_LIST || p->count != 2U) {
                 (void)fail(e, NLISP_PARSE_ERROR, p->span, "invalid template lambda parameter"); return NULL;
+            }
+            {
+                size_t j;
+                for (j = 0U; j < i; j++) if (p->items[0]->kind == SX_ATOM &&
+                    x->items[1]->items[j]->items[0]->kind == SX_ATOM &&
+                    strcmp(x->items[1]->items[j]->items[0]->atom, p->items[0]->atom) == 0) {
+                    (void)fail(e, NLISP_PARSE_ERROR, p->span, "duplicate template parameter identifier"); return NULL;
+                }
             }
             q = macro_node(a, x->span, e); if (q == NULL) return NULL; *q = *p;
             q->items = (SExpr **)aalloc(a, 2U * sizeof(*q->items));
@@ -892,6 +986,14 @@ static SExpr *copy_template_inner(Arena *a, Macro *m, SExpr *x, SExpr **args, Re
             SExpr *b = x->items[1]->items[i], *q, *d;
             if (b->kind != SX_LIST || b->count != 2U || b->items[0]->kind != SX_LIST || b->items[0]->count != 2U) {
                 (void)fail(e, NLISP_PARSE_ERROR, b->span, "invalid template let binding"); return NULL;
+            }
+            {
+                size_t j;
+                for (j = 0U; j < i; j++) if (b->items[0]->items[0]->kind == SX_ATOM &&
+                    x->items[1]->items[j]->items[0]->items[0]->kind == SX_ATOM &&
+                    strcmp(x->items[1]->items[j]->items[0]->items[0]->atom, b->items[0]->items[0]->atom) == 0) {
+                    (void)fail(e, NLISP_PARSE_ERROR, b->span, "duplicate template let identifier"); return NULL;
+                }
             }
             q = macro_node(a, x->span, e); if (q == NULL) return NULL; *q = *b;
             q->items = (SExpr **)aalloc(a, 2U * sizeof(*q->items));
@@ -921,6 +1023,12 @@ static SExpr *copy_template_inner(Arena *a, Macro *m, SExpr *x, SExpr **args, Re
             p->items = (SExpr **)aalloc(a, p->count * sizeof(*p->items));
             if (p->count > 0U) p->items[0] = c->items[0]->items[0];
             for (j = 1U; j < p->count; j++) {
+                size_t k;
+                for (k = 1U; k < j; k++) if (c->items[0]->items[j]->kind == SX_ATOM &&
+                    c->items[0]->items[k]->kind == SX_ATOM &&
+                    strcmp(c->items[0]->items[j]->atom, c->items[0]->items[k]->atom) == 0) {
+                    (void)fail(e, NLISP_PARSE_ERROR, c->span, "duplicate template pattern identifier"); return NULL;
+                }
                 p->items[j] = copy_binder(a, m, c->items[0]->items[j], &local, e);
                 if (p->items[j] == NULL) return NULL;
             }
@@ -1023,7 +1131,8 @@ static bool prepare_macros(Arena *a, Macro *m, size_t index, TBind *env, Error *
         return fail(e, NLISP_TYPE_ERROR, m->pattern->span, "macro name conflicts with value '%s'", m->name);
     holes = (SExpr **)aalloc(a, m->arity * sizeof(*holes));
     for (i = 0U; i < m->arity; i++) {
-        holes[i] = m->pattern->items[i + 1U];
+        holes[i] = fresh_value_atom(a, m->pattern->items[i + 1U], e);
+        if (holes[i] == NULL) return false;
         local = tbind(a, local, holes[i]->atom, m->inputs[i]);
     }
     m->type_env = env;
@@ -1139,6 +1248,15 @@ static Type *check_let(Arena *a, const SExpr *x, TBind *env, Error *e) {
             b->items[0]->count != 2U || b->items[0]->items[0]->kind != SX_ATOM) {
             (void)fail(e, NLISP_PARSE_ERROR, b->span, "let binding is ((name Type) value)"); return NULL;
         }
+        {
+            size_t j;
+            if (!identifier(b->items[0]->items[0])) {
+                (void)fail(e, NLISP_PARSE_ERROR, b->span, "invalid let binding identifier"); return NULL;
+            }
+            for (j = 0U; j < i; j++) if (strcmp(names[j], b->items[0]->items[0]->atom) == 0) {
+                (void)fail(e, NLISP_PARSE_ERROR, b->span, "duplicate let binding identifier"); return NULL;
+            }
+        }
         names[i] = b->items[0]->items[0]->atom;
         types[i] = parse_type(a, b->items[0]->items[1], e);
         got = check_expr(a, b->items[1], env, e);
@@ -1168,6 +1286,16 @@ static Type *check_match(Arena *a, const SExpr *x, TBind *env, Error *e) {
     }
     if (empty == NULL || full == NULL) {
         (void)fail(e, NLISP_TYPE_ERROR, x->span, "match must be exhaustive without duplicate clauses"); return NULL;
+    }
+    {
+        const SExpr *pattern = full->items[0];
+        size_t j;
+        for (j = 1U; j < pattern->count; j++) if (!identifier(pattern->items[j])) {
+            (void)fail(e, NLISP_PARSE_ERROR, pattern->items[j]->span, "invalid pattern binding identifier"); return NULL;
+        }
+        if (pattern->count == 3U && strcmp(pattern->items[1]->atom, pattern->items[2]->atom) == 0) {
+            (void)fail(e, NLISP_PARSE_ERROR, pattern->span, "duplicate pattern binding identifier"); return NULL;
+        }
     }
     t1 = check_expr(a, empty->items[1], env, e);
     if (scrut->kind == TY_LIST) {
@@ -1264,7 +1392,7 @@ static Type *check_expr_inner(Arena *a, const SExpr *x, TBind *env, Error *e) {
         return t;
     }
     if (x->count == 0U) { (void)fail(e, NLISP_PARSE_ERROR, x->span, "empty list is not an expression"); return NULL; }
-    if (x->items[0]->kind == SX_ATOM) {
+    if (x->items[0]->kind == SX_ATOM && x->items[0]->resolved_identity == 0U) {
         Macro *m;
         bool found = false;
         for (m = a->macros; m != NULL; m = m->next)

@@ -1,0 +1,22 @@
+; Value bindings and macro bindings have separate namespaces.
+(define-macro pick (syntax-rules/typed
+ ((pick x) ((x (Syntax Integer))) (Syntax Integer) 42)))
+(define-macro string-id (syntax-rules/typed
+ ((string-id x) ((x (Syntax String))) (Syntax String) x)))
+(define-macro keep-macro (syntax-rules/typed
+ ((keep-macro f) ((f (Syntax (Function (Integer) Integer)))) (Syntax Integer)
+  ((lambda ((pick (Function (Integer) Integer))) Integer (pick 1)) f))))
+(define-macro apply-value (syntax-rules/typed
+ ((apply-value f x) ((f (Syntax (Function (Integer) Integer))) (x (Syntax Integer)))
+  (Syntax Integer) (f x))))
+(define-macro apply-same (syntax-rules/typed
+ ((apply-same string-id x)
+  ((string-id (Syntax (Function (Integer) Integer))) (x (Syntax Integer)))
+  (Syntax Integer) (string-id x))))
+(defun main () Integer
+ (let (((pick (Function (Integer) Integer)) (lambda ((n Integer)) Integer (+ n 1))))
+  (if (integer= (keep-macro (lambda ((n Integer)) Integer 99)) 42)
+   (if (integer= (apply-value pick 41) 42)
+    (if (integer= (apply-same (lambda ((n Integer)) Integer (+ n 1)) 41) 42) 42 0)
+    0)
+   0)))

@@ -9,11 +9,9 @@ inductive Token where
   | atom : String → Nat → Token
   deriving DecidableEq, Repr
 
-def whitespace (c : Char) : Bool :=
-  c == ' ' || c == '\t' || c == '\r' || c == '\n' || c.toNat == 11 || c.toNat == 12
+def whitespace := Lexical.whitespace
 
-def delimiter (c : Char) : Bool :=
-  c == '(' || c == ')' || c == ';' || c == '"' || whitespace c
+def delimiter := Lexical.delimiter
 
 def atomCharacters : List Char → List Char × List Char
   | [] => ([], [])
@@ -85,7 +83,7 @@ def lexLoop : Nat → List Char → Nat → List Token → Option (List Token) :
     | [] => some reversed.reverse
     | c :: tail => do
         if whitespace c then previous tail index reversed
-        else if c == ';' then previous (tail.dropWhile (fun char => char != '\r' && char != '\n')) index reversed
+        else if c == ';' then previous (tail.dropWhile (fun char => !Lexical.lineEnding char)) index reversed
         else if c == '(' then previous tail (index + 1) (.left :: reversed)
         else if c == ')' then previous tail (index + 1) (.right :: reversed)
         else if c == '"' then

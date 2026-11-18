@@ -45,7 +45,7 @@ inductive Expands (rules : List (Nat × Tree)) : Tree → Tree → Prop where
   | macroStep (origin fuel fresh final : Nat) (rule input template output : Tree) (holes : Holes) :
       (origin, rule) ∈ rules →
       matchRule rule input = some (holes, template) →
-      copy fuel origin holes [] fresh template = some (output, final) →
+      copyWithMacros (macroNames rules) fuel origin holes [] fresh template = some (output, final) →
       Expands rules input output
   | trans : Expands rules first second → Expands rules second third → Expands rules first third
 

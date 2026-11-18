@@ -1,3 +1,4 @@
+import NLisp.Lexical
 import NLisp.Core
 import NLisp.TypedExpansion
 import NLisp.ScopedSyntax

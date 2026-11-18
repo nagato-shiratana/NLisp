@@ -1,4 +1,5 @@
 import NLisp.CNameResolution
+import NLisp.Lexical
 
 namespace NLisp.CMacroCopy
 
@@ -57,10 +58,30 @@ def binder (holes : Holes) (renames : Renames) (fresh : Nat) (tree : Tree) :
     Option (Tree × Renames × Nat) :=
   match tree with
   | .atom a =>
-      if (lookup a.name holes).isSome then none else
+      if !Lexical.identifier a.name || (lookup a.name holes).isSome then none else
       let next := fresh + 1
       let b : Atom := ⟨"#%nlisp" ++ toString next, a.origin, 3 * next + 2⟩
       some (.atom b, (a.name, b) :: renames, next)
+  | _ => none
+
+def macroNames (rules : List (Nat × Tree)) : List String :=
+  rules.filterMap (fun (_, rule) => match rule with
+    | .list [.list (.atom head :: _), _, _, _] => some head.name
+    | _ => none)
+
+def parameterNames : List Tree → Option (List String)
+  | [] => some []
+  | .list [.atom a, _] :: tail => do return a.name :: (← parameterNames tail)
+  | _ => none
+
+def bindingNames : List Tree → Option (List String)
+  | [] => some []
+  | .list [.list [.atom a, _], _] :: tail => do return a.name :: (← bindingNames tail)
+  | _ => none
+
+def patternNames : List Tree → Option (List String)
+  | [] => some []
+  | .atom a :: tail => do return a.name :: (← patternNames tail)
   | _ => none
 
 /- A bounded functional specification of C's copy_template. It checks the
@@ -77,12 +98,12 @@ structure Operations where
 
 /- One structural recursion on fuel, shared by all six operations. This avoids
 reducing well-founded recursion proofs while checking a closed certificate. -/
-def operations : Nat → Operations
+def operations (macros : List String) : Nat → Operations
   | 0 => ⟨fun _ _ _ _ _ => none, fun _ _ _ _ _ => none,
       fun _ _ _ _ => none, fun _ _ _ _ _ _ => none,
       fun _ _ _ _ => none, fun _ _ _ _ _ => none⟩
   | fuel + 1 =>
-      let previous := operations fuel
+      let previous := operations macros fuel
       { copy := fun origin holes renames fresh tree =>
           match tree with
           | .atom a =>
@@ -92,42 +113,54 @@ def operations : Nat → Operations
                 | some argument => some (argument, fresh)
                 | none => some (.atom {a with origin := some origin}, fresh)
           | .list items => do
+              let ordinary := do
+                match items with
+                | [head, .list parameters, result, body] =>
+                    if named head "lambda" then
+                      let originals ← parameterNames parameters
+                      if !Lexical.distinctNames originals then none else
+                      let (parameters', names, next) ← previous.copyParameters holes renames fresh parameters
+                      let (body', final) ← previous.copy origin holes names next body
+                      return (.list [head, .list parameters', result, body'], final)
+                    else if named head "match" then
+                      let (scrutinee', next) ← previous.copy origin holes renames fresh (.list parameters)
+                      let (cases, final) ← previous.copyCases origin holes renames next [result, body]
+                      return (.list (head :: scrutinee' :: cases), final)
+                    else
+                      let (items', next) ← previous.copyMany origin holes renames fresh items
+                      return (.list items', next)
+                | [head, .list bindings, body] =>
+                    if named head "let" then
+                      let originals ← bindingNames bindings
+                      if !Lexical.distinctNames originals then none else
+                      let (bindings', names, next) ← previous.copyBindings origin holes renames renames fresh bindings
+                      let (body', final) ← previous.copy origin holes names next body
+                      return (.list [head, .list bindings', body'], final)
+                    else if named head "match" then
+                      let (scrutinee', next) ← previous.copy origin holes renames fresh (.list bindings)
+                      let (cases, final) ← previous.copyCases origin holes renames next [body]
+                      return (.list (head :: scrutinee' :: cases), final)
+                    else
+                      let (items', next) ← previous.copyMany origin holes renames fresh items
+                      return (.list items', next)
+                | head :: scrutinee :: firstCase :: tail =>
+                    if named head "match" then
+                      let (scrutinee', next) ← previous.copy origin holes renames fresh scrutinee
+                      let (cases, final) ← previous.copyCases origin holes renames next (firstCase :: tail)
+                      return (.list (head :: scrutinee' :: cases), final)
+                    else
+                      let (items', next) ← previous.copyMany origin holes renames fresh items
+                      return (.list items', next)
+                | _ =>
+                    let (items', next) ← previous.copyMany origin holes renames fresh items
+                    return (.list items', next)
               match items with
-              | [head, .list parameters, result, body] =>
-                  if named head "lambda" then
-                    let (parameters', names, next) ← previous.copyParameters holes renames fresh parameters
-                    let (body', final) ← previous.copy origin holes names next body
-                    return (.list [head, .list parameters', result, body'], final)
-                  else if named head "match" then
-                    let (scrutinee', next) ← previous.copy origin holes renames fresh (.list parameters)
-                    let (cases, final) ← previous.copyCases origin holes renames next [result, body]
-                    return (.list (head :: scrutinee' :: cases), final)
-                  else
-                    let (items', next) ← previous.copyMany origin holes renames fresh items
-                    return (.list items', next)
-              | [head, .list bindings, body] =>
-                  if named head "let" then
-                    let (bindings', names, next) ← previous.copyBindings origin holes renames renames fresh bindings
-                    let (body', final) ← previous.copy origin holes names next body
-                    return (.list [head, .list bindings', body'], final)
-                  else if named head "match" then
-                    let (scrutinee', next) ← previous.copy origin holes renames fresh (.list bindings)
-                    let (cases, final) ← previous.copyCases origin holes renames next [body]
-                    return (.list (head :: scrutinee' :: cases), final)
-                  else
-                    let (items', next) ← previous.copyMany origin holes renames fresh items
-                    return (.list items', next)
-              | head :: scrutinee :: firstCase :: tail =>
-                  if named head "match" then
-                    let (scrutinee', next) ← previous.copy origin holes renames fresh scrutinee
-                    let (cases, final) ← previous.copyCases origin holes renames next (firstCase :: tail)
-                    return (.list (head :: scrutinee' :: cases), final)
-                  else
-                    let (items', next) ← previous.copyMany origin holes renames fresh items
-                    return (.list items', next)
-              | _ =>
-                  let (items', next) ← previous.copyMany origin holes renames fresh items
-                  return (.list items', next)
+              | .atom head :: arguments =>
+                  if macros.contains head.name && (lookup head.name holes).isNone then
+                    let (arguments', final) ← previous.copyMany origin holes renames fresh arguments
+                    pure (.list (.atom {head with origin := some origin} :: arguments'), final)
+                  else ordinary
+              | _ => ordinary
         copyMany := fun origin holes renames fresh trees =>
           match trees with
           | [] => some ([], fresh)
@@ -169,18 +202,31 @@ def operations : Nat → Operations
                   let (tail', final) ← previous.copyCases origin holes names next tail
                   return (.list [.list [], body'] :: tail', final)
               | constructor :: parameters =>
+                  let originals ← patternNames parameters
+                  if !Lexical.distinctNames originals then none else
                   let (parameters', localNames, next) ← previous.copyPattern holes names fresh parameters
                   let (body', afterBody) ← previous.copy origin holes localNames next body
                   let (tail', final) ← previous.copyCases origin holes names afterBody tail
                   return (.list [.list (constructor :: parameters'), body'] :: tail', final)
           | _ => none }
 
-def copy (fuel : Nat) := (operations fuel).copy
-def copyMany (fuel : Nat) := (operations fuel).copyMany
-def copyParameters (fuel : Nat) := (operations fuel).copyParameters
-def copyBindings (fuel : Nat) := (operations fuel).copyBindings
-def copyPattern (fuel : Nat) := (operations fuel).copyPattern
-def copyCases (fuel : Nat) := (operations fuel).copyCases
+def copy (fuel : Nat) := (operations [] fuel).copy
+def copyMany (fuel : Nat) := (operations [] fuel).copyMany
+def copyParameters (fuel : Nat) := (operations [] fuel).copyParameters
+def copyBindings (fuel : Nat) := (operations [] fuel).copyBindings
+def copyPattern (fuel : Nat) := (operations [] fuel).copyPattern
+def copyCases (fuel : Nat) := (operations [] fuel).copyCases
+
+def copyWithMacros (macros : List String) (fuel : Nat) := (operations macros fuel).copy
+
+noncomputable def checkCopyWithMacros (macros : List String) (fuel origin : Nat) (holes : Holes)
+    (fresh : Nat) (template actual : Tree) (final : Nat) : Bool :=
+  decide (copyWithMacros macros fuel origin holes [] fresh template = some (actual, final))
+
+theorem checkCopyWithMacros_sound
+    (accepted : checkCopyWithMacros macros fuel origin holes fresh template actual final = true) :
+    copyWithMacros macros fuel origin holes [] fresh template = some (actual, final) :=
+  of_decide_eq_true accepted
 
 noncomputable def checkCopy (fuel origin : Nat) (holes : Holes) (fresh : Nat) (template actual : Tree)
     (final : Nat) : Bool := decide (copy fuel origin holes [] fresh template = some (actual, final))
@@ -188,6 +234,12 @@ noncomputable def checkCopy (fuel origin : Nat) (holes : Holes) (fresh : Nat) (t
 theorem checkCopy_sound (accepted : checkCopy fuel origin holes fresh template actual final = true) :
     copy fuel origin holes [] fresh template = some (actual, final) :=
   of_decide_eq_true accepted
+
+theorem macro_head_retains_namespace (macros : List String) (head replacement : Atom)
+    (known : macros.contains head.name = true) :
+    copyWithMacros macros 3 origin [] [(head.name, replacement)] fresh (.list [.atom head]) =
+      some (.list [.atom {head with origin := some origin}], fresh) := by
+  simp [copyWithMacros, operations, lookup, known]
 
 theorem capture_uses_definition_origin (a : Atom) (origin fresh : Nat) :
     copy 1 origin [] [] fresh (.atom a) =

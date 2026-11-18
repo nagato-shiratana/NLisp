@@ -84,16 +84,54 @@ def run_lean_command(command):
     return result
 
 
+STANDARD_AXIOMS = {'propext', 'Classical.choice', 'Quot.sound'}
+
+
+def generated_theorems(text):
+    namespaces, names = [], []
+    for line in text.split('\n'):
+        opened = re.fullmatch(r'namespace ([A-Za-z_][A-Za-z0-9_.]*)', line.strip())
+        closed = re.fullmatch(r'end(?: [A-Za-z_][A-Za-z0-9_.]*)?', line.strip())
+        theorem = re.match(r'^theorem ([A-Za-z_][A-Za-z0-9_]*)\b', line)
+        if opened:
+            namespaces.append(opened[1])
+        elif closed and namespaces:
+            namespaces.pop()
+        elif theorem:
+            names.append('.'.join([*namespaces, theorem[1]]))
+    return names
+
+
+def check_generated_axioms(output, names):
+    checked = {}
+    for line in output.splitlines():
+        match = re.fullmatch(r"'([^']+)' (does not depend on any axioms|depends on axioms: \[([^\]]*)\])", line)
+        if match:
+            dependencies = set(match[3].split(', ')) if match[3] else set()
+            checked[match[1]] = dependencies
+    for name in names:
+        if name not in checked:
+            raise ValueError('Lean did not report an axiom audit for ' + name)
+        if not checked[name] <= STANDARD_AXIOMS:
+            raise ValueError('certificate depends on unsupported axioms: ' + name + ': ' +
+                             ', '.join(sorted(checked[name] - STANDARD_AXIOMS)))
+
+
 def verify_certificate(certificate, output, lake, publish=True):
     """Build the pinned models, check Lean, then atomically publish the artifact."""
     root = pathlib.Path(__file__).resolve().parents[1]
     if os.path.sep in lake:
         lake = str(pathlib.Path(lake).resolve())
     snapshot = environment_hashes()
+    names = generated_theorems(certificate)
     if certificate.startswith(BUNDLE_HEADER):
         manifest, _ = unpack_bundle(certificate)
         if manifest['environment'] != snapshot:
             raise ValueError('Lean environment changed before certificate verification')
+        primary = ('VerifiedNLispSource.source_rules_wellFounded' if manifest['conversion']['mode'] == 'termination'
+                   else 'VerifiedNLispSource.source_expands_with_scopes')
+        if primary not in names:
+            raise ValueError('certificate lacks the source correspondence theorem')
     run_lean_command([lake, 'build'])
     pinned = (root / 'lean-toolchain').read_text().strip()
     match = re.fullmatch(r'leanprover/lean4:v([0-9]+\.[0-9]+\.[0-9]+)', pinned)
@@ -111,10 +149,15 @@ def verify_certificate(certificate, output, lake, publish=True):
                                          delete=False) as stream:
             staged = pathlib.Path(stream.name).resolve()
             stream.write(certificate)
-        run_lean_command([lake, 'env', 'lean', str(staged)])
+            stream.write('\n' + ''.join('#print axioms ' + name + '\n' for name in names))
+        result = run_lean_command([lake, 'env', 'lean', str(staged)])
+        check_generated_axioms(result.stdout, names)
         if snapshot != environment_hashes():
             raise ValueError('Lean model files changed during certificate verification')
         if publish:
+            # Audit commands are verifier-local; publish the exact hashed artifact.
+            with staged.open('w', encoding='utf-8', newline='') as stream:
+                stream.write(certificate)
             os.replace(staged, output)
             staged = None
     finally:
@@ -595,6 +638,8 @@ def environment_hashes():
 
 
 def lean_string(value):
+    if not isinstance(value, str):
+        raise ValueError('expected a syntax string')
     if all((ord(c) >= 32 and ord(c) != 127) or c in '\n\r\t' for c in value):
         return json.dumps(value, ensure_ascii=False)
     return '(String.mk [' + ', '.join(f'(Char.ofNat {ord(c)})' for c in value) + '])'
@@ -646,7 +691,18 @@ def name_correspondence_proof(document):
     return ''.join(declarations)
 
 
+def natural(value, description):
+    if type(value) is not int or value < 0:
+        raise ValueError('invalid natural number: ' + description)
+    return value
+
+
 def lean_atom(node):
+    if node['origin'] is not None:
+        natural(node['origin'], 'definition origin')
+    natural(node['token_identity'], 'token identity')
+    if node.get('resolved_identity') is not None:
+        natural(node['resolved_identity'], 'resolved binding identity')
     origin = 'none' if node['origin'] is None else f"(some {node['origin']})"
     return f"⟨{lean_string(node['atom'])}, {origin}, {node['token_identity']}⟩"
 
@@ -687,8 +743,11 @@ def source_correspondence_proof(document):
 def copy_correspondence_proof(document):
     declarations = ['\nnamespace CCopyCorrespondence\nopen NLisp.CMacroCopy\n']
     declarations.append('def lexicalSource : List Tree := CSourceCorrespondence.source\n')
+    declarations.append('def namespaceMacros := macroNames (NLisp.CExpansion.sourceRules 0 CSourceCorrespondence.normalized)\n')
     declarations.append('theorem original_atoms_have_source_ids : lexicalSource.all NLisp.CExpansion.sourceAtomsValid = true := by decide\n')
     for index, step in enumerate(document['macro_trace']):
+        for key in ('definition_index', 'fresh_start', 'fresh_end'):
+            natural(step[key], key)
         rule, inputs = step['rule'], step['input']
         parameters = rule[0][1:]
         if len(parameters) != len(inputs) - 1:
@@ -706,11 +765,11 @@ def copy_correspondence_proof(document):
         fuel = 4 * nodes(rule[3]) + 4
         arguments = (f'{fuel} {step["definition_index"]} holes{index} '
                      f'{step["fresh_start"]} template{index} actual{index} {step["fresh_end"]}')
-        declarations.append(f'theorem substitution{index} : checkCopy {arguments} = true := by decide\n')
+        declarations.append(f'theorem substitution{index} : checkCopyWithMacros namespaceMacros {arguments} = true := by decide\n')
         declarations.append(
-            f'theorem substitution{index}_sound : copy {fuel} {step["definition_index"]} '
+            f'theorem substitution{index}_sound : copyWithMacros namespaceMacros {fuel} {step["definition_index"]} '
             f'holes{index} [] {step["fresh_start"]} template{index} = '
-            f'some (actual{index}, {step["fresh_end"]}) := checkCopy_sound substitution{index}\n')
+            f'some (actual{index}, {step["fresh_end"]}) := checkCopyWithMacros_sound substitution{index}\n')
     intervals = ', '.join(f'({step["fresh_start"]}, {step["fresh_end"]})'
                           for step in document['macro_trace'])
     declarations.append(f'def intervals : List (Nat × Nat) := [{intervals}]\n')

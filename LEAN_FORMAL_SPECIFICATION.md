@@ -25,6 +25,7 @@
 | `lean-toolchain` | Lean 4.8.0 の固定 |
 | `lakefile.toml` | Lake ビルド定義 |
 | `NLisp.lean` | ライブラリの入口 |
+| `NLisp/Lexical.lean` | Unicode空白、リテラル、予約語、束縛名の分類 |
 | `NLisp/Core.lean` | 型、項、置換、型付きマクロ展開、値、遷移、定理 |
 | `NLisp/TypedExpansion.lean` | 全実行時型、全26プリミティブ、外在的型付け導出 |
 | `NLisp/ScopedSyntax.lean` | 束縛ID付き環境、所属スコープ、起源を保つ埋め込みと展開 |
@@ -146,7 +147,7 @@ Floatはbinary64の64bitパターン、StringとCharacterはLeanのUnicode文字
 
 ### 3.8 ソース・展開・名前解決の入力ごとの対応検査
 
-`SourceReader.readWithFuel` はASCIIの空白・コメント、Unicodeの識別子、文字列と文字リテラルを読み取り、トークン位置から元の束縛IDを構成する。`SourceReader.normalize` はトップレベルの `defrec` を `defun` 列へ変換する。単一証明書のLean本文は、元のUTF-8バイト列に一致する文字列、読み取り結果、正規化結果を定数として持ち、それぞれの計算結果がCの出力と一致することを閉じた計算で検査する。字句・読み取り・正規化のC実装の一般定理ではなく、当該入力の独立した結果照合である。
+`SourceReader.readWithFuel` はUnicode White_Spaceの空白・コメント、Unicodeの識別子、文字列と文字リテラルを読み取り、トークン位置から元の束縛IDを構成する。`SourceReader.normalize` はトップレベルの `defrec` を `defun` 列へ変換する。単一証明書のLean本文は、元のUTF-8バイト列に一致する文字列、読み取り結果、正規化結果を定数として持ち、それぞれの計算結果がCの出力と一致することを閉じた計算で検査する。字句・読み取り・正規化のC実装の一般定理ではなく、当該入力の独立した結果照合である。
 
 `CNameResolution.findName_sound` は先頭優先の名前解決を関係 `Resolves` に接続し、`checked_lookup_corresponds` と `observations_correspond` が観測した選択を型付き変数と同じ束縛IDへ接続する。型タグはCの型オブジェクトの識別値であり、型意味論の証明済み符号化ではない。対応はタグの任意の `Ty` 解釈について成り立つ。
 
@@ -457,3 +458,11 @@ Build completed successfully.
 `nlisp-process-certificate-v1` は過程記録をLeanコメント内のBase64 JSONとして保持する。Leanカーネルが直接検査するのはLean本文の定義と定理である。専用の `--verify-certificate` が同梱ソースからC処理系とPython変換器を再実行し、読み取り結果・正規化・展開履歴・変換記録・本文を照合する。元ソースの別ファイルは不要である。
 
 同じ実装の再実行だけでは同じ誤りの再現を排除できないため、第3.8節の読み取り・正規化・名前解決・有限展開の独立したLean検査も本文に含める。コメント内の元ソース・過程記録とLean本文の定数が対応することは、専用検証器が本文を再生成して照合する。`lake env lean` だけではコメントを解釈しない。コア変換の一般的な意味保存はなお未証明であり、保証範囲にはその旨と暗号署名がないことを記録する。
+
+
+値の束縛とマクロの名前空間は区別する。`CMacroCopy.copyWithMacros` は有効なマクロ名の集合を引数とし、静的なマクロ呼び出しの先頭を値のα変換から保護する。`macro_head_retains_namespace` は同名の値の置換があっても先頭のマクロ名を保つことを示す。C処理系では、型検査で値に解決した引数の名前空間を挿入後も保持し、定義検査用の穴は新しい不透明な値の名前へ写す。これらを組み合わせた実例の展開・スコープ検査を行う。
+
+
+## 2026-11-18の追加検証
+
+全モデルのビルド、ライブラリ定理47件の公理監査、通常CTest15件、ASan・LeakSanitizer・UBSan構成のCTest15件の対象に成功した。サニタイザー構成はC側11件とLean関連4件に分けて実行した。Pythonのテストは合計67メソッドである。入力ごとの読み取り・正規化・展開導出・スコープの拒否テスト、名前空間の同名衝突、Unicode空白、静的な整礎性証明、生成証明書への独自公理・sorryの混入拒否を含む。詳細と再現手順は `IMPLEMENTATION.md` を参照する。

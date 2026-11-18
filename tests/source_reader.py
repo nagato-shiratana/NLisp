@@ -98,6 +98,13 @@ second")
         result = self.lean(proof)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_unicode_whitespace_matches_c_token_boundaries(self):
+        values = list(range(9, 14)) + [0x20, 0x85, 0xa0, 0x1680] + list(range(0x2000, 0x200b)) + [0x2028, 0x2029, 0x202f, 0x205f, 0x3000]
+        spaces = ''.join(map(chr, values))
+        text = '; ignored\u2028(defun' + spaces + 'main' + spaces + '()' + spaces + 'Integer' + spaces + '42)'
+        result = self.lean(bridge.source_correspondence_proof(self.document(text.encode('utf-8'))))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

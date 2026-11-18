@@ -50,3 +50,6 @@ import NLisp
 
 #print axioms NLisp.ProcessCertificate.source_expands_with_scopes
 #print axioms NLisp.ProcessCertificate.source_rules_wellFounded
+
+#print axioms NLisp.CMacroCopy.checkCopyWithMacros_sound
+#print axioms NLisp.CMacroCopy.macro_head_retains_namespace

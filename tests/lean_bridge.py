@@ -186,12 +186,20 @@ class LeanBridge(unittest.TestCase):
         self.assertIn('program_expands', proof)
         self.assertIn('all_references_correspond', proof)
 
+
+    def test_value_and_macro_namespace_correspondence(self):
+        document = self.document(ROOT / 'examples/macro_namespaces.nlisp')
+        proof, _ = bridge.render_proof(document, 'core',
+            dict(max_certificate_bytes=4194304, max_conversion_steps=100000))
+        result = self.lean(proof)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_kernel_axiom_audit(self):
         result = subprocess.run([LAKE, 'env', 'lean', str(ROOT / 'tests/LeanAudit.lean')],
                                 cwd=ROOT, env=ENV, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        self.assertEqual(len(lines), 45, result.stdout)
+        self.assertEqual(len(lines), 47, result.stdout)
         standard = {'propext', 'Classical.choice', 'Quot.sound'}
         for line in lines:
             if line.startswith("'NLisp.progress'") or line.startswith("'NLisp.notStuck'"):
@@ -361,6 +369,47 @@ def wrong : Embedding Examples.definitionScope Examples.callScope where
                         bridge.verify_certificate('not published', output, LAKE)
                 self.assertEqual(output.read_text(), 'earlier certificate')
             self.assertEqual([p.name for p in pathlib.Path(directory).iterdir()], ['Certificate.lean'])
+
+    def test_generated_certificate_rejects_sorry_and_extra_axioms(self):
+        source = ROOT / 'examples/recursive_expansion.nlisp'
+        document = self.document(source)
+        budget = dict(max_certificate_bytes=4194304, max_conversion_steps=100000)
+        proof, process = bridge.render_proof(document, 'core', budget)
+        sorry = proof.replace('  notStuck expandedProgram', '  by sorry', 1)
+        extra = proof.replace('theorem expandedProgram_notStuck :',
+            'axiom fabricated : Value expandedProgram ∨ ∃ next, Step expandedProgram next\n'
+            'theorem expandedProgram_notStuck :', 1).replace('  notStuck expandedProgram', '  fabricated', 1)
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / 'Certificate.lean'
+            output.write_text('earlier certificate')
+            for body in (sorry, extra):
+                certificate = bridge.pack_bundle(source.read_bytes(), document, process, body, 'core', budget)
+                with self.assertRaisesRegex(ValueError, 'unsupported axioms'):
+                    bridge.verify_certificate(certificate, output, LAKE)
+                self.assertEqual(output.read_text(), 'earlier certificate')
+            self.assertEqual([p.name for p in pathlib.Path(directory).iterdir()], ['Certificate.lean'])
+
+    def test_non_numeric_binding_metadata_is_not_inserted_as_lean_code(self):
+        document = self.document(ROOT / 'examples/recursive_expansion.nlisp')
+        document['macro_trace'][0]['fresh_start'] = '0; axiom injected : False'
+        with self.assertRaisesRegex(ValueError, 'invalid natural number'):
+            bridge.render_proof(document, 'core',
+                dict(max_certificate_bytes=4194304, max_conversion_steps=100000))
+        for value in (-1, True, '0'):
+            node = dict(atom='x', origin=None, token_identity=value, resolved_identity=None)
+            with self.assertRaises(ValueError):
+                bridge.lean_atom(node)
+
+    def test_wrong_lean_version_does_not_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / 'Certificate.lean'
+            output.write_text('earlier certificate')
+            results = [subprocess.CompletedProcess([], 0, '', ''),
+                       subprocess.CompletedProcess([], 0, 'Lean (version 4.9.0, Release)\n', '')]
+            with mock.patch.object(bridge.subprocess, 'run', side_effect=results):
+                with self.assertRaisesRegex(ValueError, 'actual Lean version'):
+                    bridge.verify_certificate('theorem demo : True := True.intro', output, LAKE)
+            self.assertEqual(output.read_text(), 'earlier certificate')
 
     def test_certificate_conversion_limits_are_unknown(self):
         document = self.document(ROOT / 'examples/macros.nlisp')

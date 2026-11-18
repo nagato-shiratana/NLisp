@@ -195,6 +195,49 @@ class Syntax(unittest.TestCase):
         source += '(defun main () Integer early)'
         self.expect_rejected(source, 5, 'before its initialization')
 
+    def test_unicode_whitespace_and_separate_identifier_names(self):
+        spaces = list(range(9, 14)) + [0x20, 0x85, 0xa0, 0x1680] + list(range(0x2000, 0x200b)) + [0x2028, 0x2029, 0x202f, 0x205f, 0x3000]
+        for scalar in spaces:
+            whitespace = chr(scalar)
+            self.expect_run('(defun' + whitespace + 'main' + whitespace + '()' + whitespace +
+                            'Integer' + whitespace + '42)', 42)
+        for scalar in (0x180e, 0x200b, 0xfeff):
+            name = 'v' + chr(scalar) + 'alue'
+            self.expect_run(f'(define ({name} Integer) 42) (defun main () Integer {name})', 42)
+        for separator in ('\u0085', '\u2028', '\u2029'):
+            self.expect_run('; comment' + separator + '(defun main () Integer 42)', 42)
+
+    def test_reserved_identifiers_are_rejected_at_binding_sites(self):
+        for name in ('lambda', 'Integer', 'true', 'Nil'):
+            programs = [f'(defun {name} () Integer 42)',
+                        f'(define ({name} Integer) 42)',
+                        f'(defun f (({name} Integer)) Integer 42)',
+                        f'(defun f (forall ({name}) () Integer) 42)',
+                        macro(name, '42'),
+                        macro('bad', '42', (name,)),
+                        macro('bad', f'((lambda (({name} Integer)) Integer 42) 0)'),
+                        f'(defun f () Integer (let ((({name} Integer) 1)) 42))',
+                        f'(defun f () Integer (match (Some Integer 1) ((None) 0) ((Some {name}) 42)))']
+            for program in programs:
+                with self.subTest(name=name, program=program):
+                    result = self.process(program + '(defun main () Integer 42)')
+                    self.assertEqual(result.returncode, 4, result.stderr)
+
+    def test_duplicate_template_binders_are_rejected_before_freshening(self):
+        bodies = ['((lambda ((x Integer) (x Integer)) Integer x) 1 2)',
+                  '(let (((x Integer) 1) ((x Integer) 2)) x)',
+                  '(match (Cons Integer 1 (Nil Integer)) ((Nil) 0) ((Cons x x) 1))']
+        for body in bodies:
+            result = self.process(macro('bad', body) + '(defun main () Integer 42)')
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertIn('duplicate', result.stderr)
+        self.expect_rejected('(defun main () Integer (let (((x Integer) 1) ((x Integer) 2)) x))',
+                             4, 'duplicate')
+
+    def test_value_and_macro_namespaces_survive_hygienic_copy(self):
+        source = (pathlib.Path(__file__).resolve().parents[1] / 'examples/macro_namespaces.nlisp').read_text()
+        self.expect_run(source, 42)
+
 
 if __name__ == '__main__':
     unittest.main()

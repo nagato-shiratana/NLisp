@@ -36,53 +36,14 @@ def builtinEnvironment : Environment :=
       (fun (index, name) => (⟨name, 3 * (index + 1), 3 * (index + 1)⟩ : Entry))).reverse
 
 def entry : Node → Option Entry
-  | .atom a _ => some ⟨a.name, a.token, a.token⟩
+  | .atom a _ => if Lexical.identifier a.name then some ⟨a.name, a.token, a.token⟩ else none
   | _ => none
 
 def named : Node → String → Bool
   | .atom a _, name => a.name == name
   | _, _ => false
 
-def digits (characters : List Char) : Bool :=
-  !characters.isEmpty && characters.all Char.isDigit
-
-def unsignedCharacters (characters : List Char) : List Char :=
-  match characters with
-  | '-' :: tail => tail
-  | other => other
-
-def integerLiteral (characters : List Char) : Bool :=
-  match unsignedCharacters characters with
-  | ['0'] => true
-  | first :: tail => ('1' ≤ first && first ≤ '9') && tail.all Char.isDigit
-  | [] => false
-
-def exponentLiteral (characters : List Char) : Bool :=
-  match characters with
-  | [] => true
-  | 'e' :: tail | 'E' :: tail =>
-      match tail with
-      | '+' :: rest | '-' :: rest => digits rest
-      | rest => digits rest
-  | _ => false
-
-def floatLiteral (characters : List Char) : Bool :=
-  let unsigned := unsignedCharacters characters
-  match unsigned with
-  | first :: _ =>
-      if !first.isDigit then false else
-      match unsigned.dropWhile Char.isDigit with
-      | '.' :: fraction =>
-          match fraction with
-          | digit :: _ => digit.isDigit && exponentLiteral (fraction.dropWhile Char.isDigit)
-          | [] => false
-      | _ => false
-  | [] => false
-
-def literal (name : String) : Bool :=
-  name == "true" || name == "false" || name == "unit" ||
-  name.startsWith "\"" || name.startsWith "#\\" ||
-  integerLiteral name.toList || floatLiteral name.toList
+def literal := Lexical.literal
 
 def bindParameters : List Node → Environment → Option Environment
   | [], env => some env
