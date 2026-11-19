@@ -52,4 +52,15 @@ theorem source_rules_wellFounded (certificate : CheckedStaticTermination) :
       some certificate.edges ∧ WellFounded (MacroTermination.Calls certificate.edges) :=
   ⟨certificate.graph_matches, MacroTermination.ranked_graph_wellFounded certificate.decreases⟩
 
+theorem source_static_calls_decrease (certificate : CheckedStaticTermination)
+    (edge : MacroTermination.Edge)
+    (call : MacroTermination.GraphCall (CExpansion.sourceRules 0 certificate.normalized)
+      0 (CExpansion.sourceRules 0 certificate.normalized) edge) :
+    MacroTermination.rank certificate.ranks edge.1 < MacroTermination.rank certificate.ranks edge.2 := by
+  apply MacroTermination.checkRanks_decreases certificate.decreases
+  exact MacroTermination.graphRows_contains_static_calls certificate.graphFuel
+    (CExpansion.sourceRules 0 certificate.normalized) 0
+    (CExpansion.sourceRules 0 certificate.normalized) certificate.edges
+    certificate.graph_matches call
+
 end NLisp.ProcessCertificate
