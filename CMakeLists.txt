@@ -10,9 +10,9 @@ target_include_directories(nlisp_core PUBLIC include)
 target_compile_definitions(nlisp_core PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 if(MSVC)
-  target_compile_options(nlisp_core PRIVATE /W4 /WX /permissive-)
+  target_compile_options(nlisp_core PRIVATE /W4 /WX /permissive- /fp:strict)
 else()
-  target_compile_options(nlisp_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  target_compile_options(nlisp_core PRIVATE -Wall -Wextra -Wpedantic -Werror -frounding-math)
 endif()
 
 add_executable(nlisp src/main.c)
