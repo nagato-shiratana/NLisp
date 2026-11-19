@@ -806,7 +806,8 @@ ASSURANCE = {'process': 'deterministic replay',
              'cryptographic_signature': None}
 TERMINATION_ASSURANCE = {
     'process': 'deterministic syntax replay',
-    'kernel_checks': ['source parsing and defrec normalization', 'well-founded static macro call graph'],
+    'kernel_checks': ['source parsing and defrec normalization',
+                      'well-founded conservative macro call candidate graph'],
     'formal_semantic_preservation': False, 'cryptographic_signature': None,
 }
 POLY_ASSURANCE = {
@@ -985,23 +986,49 @@ def syntax_projection(node):
 
 def expansion_correspondence_proof(document):
     declarations = ['\nnamespace CExpansionCorrespondence\n'
-                    'open NLisp.CMacroCopy NLisp.CExpansion\n']
+                    'open NLisp.CMacroCopy NLisp.CExpansion NLisp.ExpansionCertificate\n']
     declarations.append('def source : List Tree := CSourceCorrespondence.normalized\n')
     declarations.append('def rules := sourceRules 0 source\n')
     known = {}
+    serial = 0
+
+    def fresh_name():
+        nonlocal serial
+        name = f'certificateNode{serial}'
+        serial += 1
+        return name
+
+    def define_certificate(term, accepted_proof):
+        name = fresh_name()
+        declarations.append(f'def {name} : Certificate := {term}\n')
+        declarations.append(f'theorem {name}_accepted : check rules {name} = true := {accepted_proof}\n')
+        return name
 
     def derive(before, after):
         before, after = syntax_projection(before), syntax_projection(after)
         if before == after:
-            return '(.refl _)'
+            return define_certificate(f'Certificate.refl {copy_tree(before)}', 'by rfl')
         key = (canonical_json(before), canonical_json(after))
         if key in known:
-            return f'expandedStep{known[key]}'
+            return known[key]
         if isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
-            result = '(.refl _)'
-            for left, right in reversed(list(zip(before, after))):
-                result = f'(.cons {derive(left, right)} {result})'
-            return result
+            current = list(before)
+            accumulator = define_certificate(
+                f'Certificate.refl (.list [{", ".join(copy_tree(item) for item in current)}])', 'by rfl')
+            for position, (left, right) in enumerate(zip(before, after)):
+                if left == right:
+                    continue
+                child = derive(left, right)
+                context = define_certificate(
+                    f'Certificate.congList [{", ".join(copy_tree(item) for item in current[:position])}] '
+                    f'[{", ".join(copy_tree(item) for item in current[position + 1:])}] {child}',
+                    f'by exact check_congList {child}_accepted')
+                combined = define_certificate(
+                    f'Certificate.trans {accumulator} {context}',
+                    f'by exact check_trans {accumulator}_accepted {context}_accepted (by rfl)')
+                current[position] = right
+                accumulator = combined
+            return accumulator
         raise ValueError('expansion trace does not derive the exported syntax')
 
     for index, step in enumerate(document['macro_trace']):
@@ -1010,25 +1037,36 @@ def expansion_correspondence_proof(document):
         def nodes(tree):
             return 1 + sum(map(nodes, tree)) if isinstance(tree, list) else 1
         fuel = 4 * nodes(step['rule'][3]) + 4
-        declarations.append(
-            f'theorem rawStep{index} : Expands rules input{index} CCopyCorrespondence.actual{index} :=\n'
-            f'  .macroStep {step["definition_index"]} {fuel} {step["fresh_start"]} {step["fresh_end"]}\n'
-            f'    rule{index} input{index} CCopyCorrespondence.template{index} '
-            f'CCopyCorrespondence.actual{index} CCopyCorrespondence.holes{index}\n'
-            f'    (by decide) (by decide) CCopyCorrespondence.substitution{index}_sound\n')
+        macro_cert = f'macroCert{index}'
+        declarations.append(f'def {macro_cert} : Certificate := Certificate.macroStep '
+                            f'{step["definition_index"]} {fuel} {step["fresh_start"]} {step["fresh_end"]} '
+                            f'rule{index} input{index} CCopyCorrespondence.actual{index}\n')
+        declarations.append(f'theorem {macro_cert}_accepted : check rules {macro_cert} = true := by\n'
+                            f'  simpa [{macro_cert}, check] using\n'
+                            f'    checkStep_intro (rules := rules) (by decide) (by decide) '
+                            f'CCopyCorrespondence.substitution{index}_sound\n')
         inner = derive(step['substitution'], step['result'])
-        declarations.append(
-            f'theorem expandedStep{index} : Expands rules input{index} result{index} :=\n'
-            f'  .trans rawStep{index} {inner}\n')
+        expanded_cert = f'expandedCert{index}'
+        declarations.append(f'def {expanded_cert} : Certificate := Certificate.trans {macro_cert} {inner}\n')
+        declarations.append(f'theorem {expanded_cert}_accepted : check rules {expanded_cert} = true := by\n'
+                            f'  exact check_trans {macro_cert}_accepted {inner}_accepted (by rfl)\n')
         known[(canonical_json(syntax_projection(step['input'])),
-               canonical_json(syntax_projection(step['result'])))] = index
+               canonical_json(syntax_projection(step['result'])))] = expanded_cert
     raw = [form for form in document['normalized_ast'] if atom(form[0]) != 'define-macro']
     result = document['declarations']
     derivation = derive(raw, result)
     declarations.append('def expanded : List Tree := [' + ', '.join(copy_tree(form) for form in result) + ']\n')
+    declarations.append(f'def programCertificate : Certificate := {derivation}\n')
+    declarations.append('theorem program_certificate_accepted : check rules programCertificate = true :=\n'
+                        f'  {derivation}_accepted\n')
+    declarations.append('theorem program_certificate_fresh :\n'
+                        '  disjointIntervals (freshIntervals programCertificate) = true := by decide\n')
+    declarations.append('theorem program_certificate_fresh_accepted :\n'
+                        '  checkFresh rules programCertificate = true :=\n'
+                        '  checkFresh_intro program_certificate_fresh program_certificate_accepted\n')
     declarations.append('theorem program_expands :\n'
-                        '  Expands rules (.list (programForms source)) (.list expanded) :=\n'
-                        f'  {derivation}\n')
+                        '  Expands rules (.list (programForms source)) (.list expanded) := by\n'
+                        '  exact checkFresh_sound programCertificate program_certificate_fresh_accepted\n')
     declarations.append('end CExpansionCorrespondence\n')
     return ''.join(declarations)
 
@@ -1060,46 +1098,79 @@ def syntax_nodes(tree):
     return 1 + sum(map(syntax_nodes, tree)) if isinstance(tree, list) else 1
 
 
-def termination_plan(document):
+def termination_plan(document, max_steps=100000):
     """Untrusted rank synthesis; Lean re-extracts every edge and checks decreases."""
+    work = 0
+
+    def spend(count=1):
+        nonlocal work
+        if count < 0 or count > max_steps - work:
+            attempted = work + count
+            raise UnknownResult(
+                'termination analysis conversion step limit exceeded '
+                f'(attempted {attempted}, limit {max_steps})')
+        work += count
+
     rules, declaration_index = [], 0
     for form in document['normalized_ast']:
+        spend()
         if atom(form[0]) == 'define-macro':
             for rule in form[2][1:]:
+                spend()
                 rules.append((declaration_index, rule))
         else:
             declaration_index += 1
-    signatures = [(atom(rule[0][0]), len(rule[0]) - 1) for _, rule in rules]
-    table = {key: index for index, key in enumerate(signatures)}
+    signatures = []
+    for _, rule in rules:
+        spend()
+        signatures.append((atom(rule[0][0]), len(rule[0]) - 1))
     edges = []
     try:
         for parent, (_, rule) in enumerate(rules):
+            spend()
+            spend(len(rule[0]))
             holes = {atom(parameter) for parameter in rule[0][1:]}
+
+            def candidates(predicate):
+                matches = []
+                for target, signature in enumerate(signatures):
+                    spend()
+                    if predicate(signature):
+                        matches.append(target)
+                return matches
+
             def calls(tree):
+                spend()
                 if not isinstance(tree, list):
                     return []
                 nested = [target for child in tree for target in calls(child)]
                 if tree and atom(tree[0]) is not None:
                     name = atom(tree[0])
                     if name in holes:
-                        raise ValueError('a syntax hole occurs in call-head position')
-                    target = table.get((name, len(tree) - 1))
-                    if target is not None:
-                        return [target] + nested
+                        arity = len(tree) - 1
+                        return candidates(lambda signature: signature[1] == arity) + nested
+                    arity = len(tree) - 1
+                    return candidates(lambda signature: signature == (name, arity)) + nested
                 return nested
-            edges.extend((child, parent) for child in calls(rule[3]))
+            for child in calls(rule[3]):
+                spend()
+                edges.append((child, parent))
     except ValueError as error:
         return dict(status='unknown', reason=str(error), rules=signatures)
+    spend(5 * len(rules))
     dependencies = [set() for _ in rules]
     parents = [set() for _ in rules]
     for child, parent in edges:
+        spend()
         dependencies[parent].add(child)
         parents[child].add(parent)
     remaining = [len(children) for children in dependencies]
     queue = [index for index, count in enumerate(remaining) if count == 0]
     ranks = [0] * len(rules)
     for child in queue:
-        for parent in sorted(parents[child]):
+        spend()
+        for parent in parents[child]:
+            spend()
             ranks[parent] = max(ranks[parent], ranks[child] + 1)
             remaining[parent] -= 1
             if remaining[parent] == 0:
@@ -1108,7 +1179,7 @@ def termination_plan(document):
         return dict(status='unknown', reason='no decreasing rank found for recursive rule dependencies',
                     rules=signatures, edges=edges)
     return dict(status='proved', rules=signatures, edges=edges, ranks=ranks,
-                guarantee='well-founded static macro call graph')
+                guarantee='well-founded conservative macro call candidate graph')
 
 
 def termination_correspondence_proof(document, plan, standalone=False):
@@ -1133,6 +1204,11 @@ def termination_correspondence_proof(document, plan, standalone=False):
             'theorem every_call_chain_bounded (path : Path edges first last count) :\n'
             '    count + rank ranks last ≤ rank ranks first :=\n'
             '  path_length_bounded rank_checked path\n',
+            f'theorem every_static_rule_call_decreases (edge : Edge)\n'
+            f'    (call : GraphCall rules 0 rules edge) :\n'
+            f'    rank ranks edge.1 < rank ranks edge.2 := by\n'
+            f'  apply checkRanks_decreases rank_checked\n'
+            f'  exact graphRows_contains_static_calls {fuel} rules 0 rules edges graph_matches_source call\n',
         ])
     else:
         declarations.append(f'def reason : String := {lean_string(plan["reason"])}\n')
@@ -1179,11 +1255,14 @@ def process_correspondence_proof(document, mode):
 
 def render_proof(document, mode, budget):
     if mode == 'termination':
-        plan = termination_plan(document)
+        source_nodes = syntax_nodes(document['normalized_ast'])
+        if source_nodes > budget['max_conversion_steps']:
+            raise UnknownResult(
+                'termination analysis source node limit exceeded '
+                f'({source_nodes} nodes, limit {budget["max_conversion_steps"]})')
+        plan = termination_plan(document, budget['max_conversion_steps'])
         if plan['status'] != 'proved':
-            raise UnknownResult('static macro call graph: ' + plan['reason'])
-        if syntax_nodes(document['normalized_ast']) > budget['max_conversion_steps']:
-            raise UnknownResult('termination analysis conversion step limit exceeded')
+            raise UnknownResult('conservative macro call candidate graph: ' + plan['reason'])
         proof = ('import NLisp\nset_option maxRecDepth 4096\nset_option maxHeartbeats 2000000\n' +
                  source_correspondence_proof(document) +
                  termination_correspondence_proof(document, plan, standalone=True) +
@@ -1193,7 +1272,10 @@ def render_proof(document, mode, budget):
         return proof, [{'stage': 'macro_termination', **plan}]
     cls = {'types': TypeExporter, 'poly': PolyExporter}.get(mode, Exporter)
     exporter = cls(document, record_process=True, **budget)
-    plan = termination_plan(document)
+    try:
+        plan = termination_plan(document, budget['max_conversion_steps'])
+    except UnknownResult as error:
+        plan = dict(status='unknown', reason=str(error), rules=[])
     proof = (exporter.export().replace('import NLisp\n',
              'import NLisp\nset_option maxRecDepth 4096\nset_option maxHeartbeats 2000000\n', 1) +
              source_correspondence_proof(document) + name_correspondence_proof(document) +
@@ -1367,7 +1449,7 @@ def main():
                         help='verify a certificate using recorded local derivations and Lean, without running the C expander')
     parser.add_argument('--lake', default='lake')
     parser.add_argument('--mode', choices=('auto', 'core', 'types', 'poly', 'termination'), default='auto',
-                        help='auto/core/types use legacy cores; poly checks shared generic bodies; termination proves a static call graph well-founded without expanding')
+                        help='auto/core/types use legacy cores; poly checks shared generic bodies; termination proves a conservative macro call candidate graph without expanding')
     for option in ('max-expansions', 'max-generated-nodes', 'max-expansion-depth', 'max-check-steps'):
         parser.add_argument('--' + option, type=int)
     parser.add_argument('--max-certificate-bytes', type=int, default=4194304)
@@ -1437,7 +1519,7 @@ def main():
         if isinstance(error, subprocess.CalledProcessError) and error.stdout:
             print(error.stdout, file=sys.stderr)
         return 1
-    kind = 'static macro call graph' if mode == 'termination' else 'expanded ' + mode
+    kind = 'conservative macro call candidate graph' if mode == 'termination' else 'expanded ' + mode
     print(f'Lean checked {kind} certificate: {args.output}')
     return 0
 

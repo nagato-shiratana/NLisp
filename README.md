@@ -37,7 +37,8 @@ nagato-Lisp（NLisp）は、明示的な静的型付けと検証可能なLispを
 - `NLisp/TypedExpansion.lean`: 全実行時型・組み込み関数の型付け証明書
 - `NLisp/ScopedSyntax.lean`: 束縛IDと所属環境を明示した構文・マクロ展開モデル
 - `NLisp/CNameResolution.lean`、`NLisp/CMacroCopy.lean`、`NLisp/CExpansion.lean`、`NLisp/CBindingWalk.lean`: 有限のC展開結果に対する名前解決・衛生的置換・展開導出・スコープの独立検査
-- `NLisp/MacroTermination.lean`: 規則の順位による静的呼び出し関係の整礎性
+- `NLisp/ExpansionCertificate.lean`: 局所展開証書の汎用Boolean検査器と、受理から有限展開導出への健全性
+- `NLisp/MacroTermination.lean`: 規則の順位による保守的なマクロ呼び出し候補関係の整礎性
 - `NLisp/SourceReader.lean`、`NLisp/ProcessCertificate.lean`: 元のUTF-8ソース、読み取り、正規化、展開、スコープを結ぶ証明書
 - `src/nlisp.c`: C17製NLisp-Core参照処理系
 - `examples/`: 適合プログラム例
@@ -139,7 +140,7 @@ python3 tools/verify_lean.py examples/macros.nlisp \
 
 ## 再帰マクロと処理予算
 
-`examples/recursive_expansion.nlisp` は自分自身へ展開する規則を含み、有限回で展開して `42` を返す。マクロ定義は他の規則の型契約で検査するため、未使用の再帰マクロを停止性の理由で拒否しない。これは既存のテンプレート方式の再帰を許すもので、手続き的なコンパイル時計算や新しいパターン構文を追加するものではない。
+`examples/recursive_expansion.nlisp` は同じマクロ名の `answer/1` から基底規則 `answer/0` へ進む再帰的な定義を含み、この入力では有限回で展開して `42` を返す。マクロ定義は他の規則の型契約で検査するため、未使用の再帰マクロを停止性の理由で拒否しない。これは既存のテンプレート方式の再帰を許すもので、手続き的なコンパイル時計算や新しいパターン構文を追加するものではない。
 
 ```sh
 build/nlisp check input.nlisp --max-expansions 1000 --max-generated-nodes 100000
@@ -201,9 +202,16 @@ python3 tools/verify_lean.py --verify-certificate build/MacroTermination.lean
 
 このモードは展開を実行せず、`export-syntax` が出した構文から「マクロ名と引数個数」で規則を識別する。Pythonが順位を候補として作り、Leanがソースの規則から呼び出し辺を再計算し、すべての辺で順位が下がることを検査する。`termination_by` を使って各規則のアクセシビリティを構成し、呼び出し関係の整礎性と呼び出し鎖の長さの上限を証明する。たとえば `answer/1 → answer/0` は同じマクロ名でも証明できる。
 
-循環が残る場合や、構文の穴が呼び出し先を動的に作る場合は `Unknown`（終了コード7）とし、このモードの証明書を発行しない。停止を証明できなかったことを非停止や言語としての不正とは扱わない。通常のモードでは未使用の循環規則があっても、今回の展開が完了すれば有限導出の証明書を発行できる。
+`examples/dynamic_macro_head.nlisp` は型検査や展開用ではなく、この停止性解析における穴頭候補辺を示す構文例である。
 
-ここで証明するのは、構文から抽出した静的なマクロ呼び出し関係の整礎性である。型検査、C展開器全体の終了性との対応、展開サイズ・実行時間の上限、NLisp関数本体の実行終了性は別の問題として残る。証明を得た場合も、通常の展開・検査・出力の資源上限は維持する。証明書は他のモードと同じく元ソース・構文・過程・Lean本文を一つのファイルにまとめる。
+```sh
+python3 tools/verify_lean.py examples/dynamic_macro_head.nlisp \
+  --mode termination --nlisp build/nlisp --output build/DynamicHeadTermination.lean
+```
+
+循環が残る場合は `Unknown`（終了コード7）とし、このモードの証明書を発行しない。構文の穴が呼び出し先になる場合は、該当する引数個数を持つ全マクロ規則を候補辺に加える保守的な解析を行うため、余分な辺によって証明できなくなる場合がある。停止を証明できなかったことを非停止や言語としての不正とは扱わない。通常のモードでは未使用の循環規則があっても、今回の展開が完了すれば有限導出の証明書を発行できる。
+
+ここで証明するのは、構文から抽出した呼び出し辺と、穴頭位置の同arity候補辺を含む保守的なマクロ呼び出し関係の整礎性である。名前付き呼び出しも一致する名前・arityの全規則を候補にし、Cが禁止する重複マクロ名や同arity条項をモデル側でも過小評価しない。型検査、C展開器全体の終了性との対応、展開サイズ・実行時間の上限、NLisp関数本体の実行終了性は別の問題として残る。証明を得た場合も、通常の展開・検査・出力の資源上限は維持する。証明書は他のモードと同じく元ソース・構文・過程・Lean本文を一つのファイルにまとめる。
 
 専用検証器はLeanモデルをビルドし、実際のLeanの版が `lean-toolchain` と一致することを確認してから本文を検査する。モデル、Lake設定、依存指定のハッシュを記録し、検査途中にそれらが変化した場合は公開しない。
 

@@ -153,7 +153,7 @@ Surface.Evaluates sourceProgram environment expression value
 | `NLisp/CExpansion.lean` | 元の規則による有限展開導出と生成IDの分離 |
 | `NLisp/CBindingWalk.lean` | 構文からの環境導出と実効位置・呼び出し位置での束縛ID検査 |
 | `NLisp/SourceReader.lean` | ソース文字列の独立した字句解析・S式読み取り・defrec正規化 |
-| `NLisp/MacroTermination.lean` | 静的呼び出し関係と順位に基づく整礎性 |
+| `NLisp/MacroTermination.lean` | 名前一致の全規則辺と、穴頭位置の保守的候補辺を含む関係の順位に基づく整礎性 |
 | `NLisp/ProcessCertificate.lean` | ソースから有限展開・スコープまでを結ぶ検査済み証明書データ |
 
 検証コマンドは次である。
@@ -274,17 +274,63 @@ Floatはbinary64の64bitパターン、StringとCharacterはLeanのUnicode文字
 
 `CExpansion.Expands` は、元の規則に属すること、呼び出し名・引数個数の一致、衛生的置換の一致を前提とする展開ステップと、その反射・文脈・推移閉包である。`program_expands` は正規化済み宣言から今回の最終宣言までの有限導出を示す。変換器が無関係な型の合う式を出力した場合は、この導出を作れない。
 
+外部証書形式 `ExpansionCertificate.Certificate` は `refl`、リスト文脈の単一要素変更 `congList`、元ルールを参照する `macroStep`、連続性を検査する `trans` からなる。`ExpansionCertificate.check` はルール所属、パターン照合、`copyWithMacros` の結果をBooleanで再計算し、`check_sound` は受理から `CExpansion.Expands` を導く。追加の `checkFresh` は証書に記録されたfresh counter区間の非重複も検査し、`checkFresh_sound` は展開関係を、`checkFresh_intervals` は区間条件を導く。`checkFresh_separates_interval_counters` により、異なる受理済み区間の境界内カウンタ値は異なる。`CMacroCopy.sequential_binders_have_distinct_tokens` は連続して成功するbinder呼び出しのtoken identityが異なることを導く。`tools/verify_lean.py` はCの履歴から証書データを生成し、生成証書に対して `checkFresh` を受理条件として用いる。各局所検査と合成を補題で分け、全プログラムを一度に深く簡約する方式を避ける。
+
 `CBindingWalk` は最終構文から関数・トップレベル値・局所束縛の環境を導出する。各変数について、実効位置で選んだ束縛IDとCの参照IDの一致、両環境のIDの妥当性、選んだ束縛が呼び出し時点の環境にも存在することを確認する。同名の局所変数による遮蔽があっても、定義位置の参照は同じIDを保つ。検査用構文の消去結果と展開導出の出力の一致もLeanで検査する。
 
 `ProcessCertificate.CheckedExpansion` はUTF-8バイト列の一致、読み取り、正規化、有限展開、スコープの各証明を、同じ構文データを共有する一つの構造体にまとめる。生成する `VerifiedNLispSource.source_expands_with_scopes` はこれらを一つの命題として示す。ただし、相互再帰・多相化・カリー化などを含むコア変換の意味保存や、C型表現と `Ty` の意味的同値までは含まない。
 
+局所証書の受理から現在得られる意味的結論は有限の展開関係、記録区間の非重複、および異なる区間内カウンタ値の非衝突である。連続した2つのbinder呼び出しは異なるtokenを生成し、単一binderのtokenは剰余類が異なるsource tokenと衝突しないことも証明した。copy群全体にこれらの性質を合成し、コピー結果中の全生成識別子が各区間内にあることを示して全体のFreshnessへ接続すること、証書全体から非捕捉・表層型保存を一つの合成的定理として導くこと、`TypedExpansion` / `ScopedSyntax` とS式検査器を一般接続することは未完了である。
+
+追加の局所結果として、`CMacroCopy.copyParameters_counter` は成功した仮引数コピーの最終counterが開始counterと引数数の和になることを示す。これはcounter消費数の補題であり、出力tokenごとのcounter対応やtoken列の一意性までは含まない。
+
+`CMacroCopy.copyParameters_token_sequence` は成功時の仮引数出力token列をcounter式で特徴付け、`copyParameters_tokens_unique` はこの列の要素が重複しないことを導く。`copyParameters_tokens_avoid_source` は剰余類1に属するsource tokenが出力列に存在しないことを示す。これらの結論の範囲は `copyParameters` に限定される。
+
+`copyPattern_token_sequence`、`copyPattern_tokens_unique`、`copyPattern_tokens_avoid_source` は、match pattern binder列について同じ性質を示す。さらに `copyCasesWithMacros_preserving_*` は、各case bodyがcounterを保持する条件の下で、case列全体のpattern binder token列を合成し、一意性・source-token分離・区間所属を導く。任意bodyのcounter保存や一般の`copy`全体への接続は未完了である。
+
+`parameter_then_pattern_tokens_unique` は、成功する`copyParameters`の直後に同じcounterを共有する`copyPattern`を実行した場合、両操作のbinder tokenを連結しても一意であることを示す。これは二つの局所操作の合成例であり、bodyや全構文形状を処理する`copy`全体のFreshness定理ではない。
+
+`copy_atom_keeps_counter` は、成功したatomコピーがfresh counterを変えないことを示す。これは構文走査でbinder導入のない葉を扱うための局所補題であり、任意の構文木のcounter単調性を含まない。
+
+`copyWithMacros_atom_keeps_counter` は任意のマクロ名集合を引数に取り、atomコピーでcounterが変化しないことを示す。`copyManyWithMacros_atomic_counter` は同じ一般性の下でatom列の走査がcounterを保持することを示す。これらはC展開器が渡すマクロ名集合に対応するモデル関数の補題だが、マクロ名付きbinding全体の定理やC関数とのシミュレーション定理ではない。`copyBindingsWithMacros` はそのモデル関数を公開する。
+
+`AtomBindingInputs` と `copyBindingsWithMacros_atoms_counter` は、initializerがatomであるbinding列に限って、任意のマクロ名集合でcounterがbinding数だけ進むことを証明する。`copyBindingsWithMacros_atoms_token_sequence` はbinder token列をcounter列に同定し、`copyBindingsWithMacros_atoms_tokens_unique` は列の一意性を導く。`copyBindingsWithMacros_atoms_tokens_avoid_source` と `copyBindingsWithMacros_atoms_tokens_within_interval` はsource-tokenクラスとの分離とfresh区間への所属を示す。singletonから先頭が`match`でない任意長atom-only listまでの任意マクロ集合ケースは、続く `MacroCounterSafeInitializer` の節に記載する。より深い構文木やbinderを含むinitializerは未接続である。
+
+`checkFresh_separates_macro_aware_atom_binding_tokens` は同区間補題を受理済みfresh証書へ接続する。別々の証書区間に属するコピーであればbinder tokenが一致しない。ただしinitializerはatomに限られ、C実装との対応は含まない。
+
+より一般には `CounterPreservingInitializer macros value` をinitializer copyのcounter不変性として定義し、`CounterPreservingBindings` でbinding列へ持ち上げる。`copyBindingsWithMacros_preserving_counter` と `copyBindingsWithMacros_preserving_token_sequence` はこの仮定からcounter消費量とbinder token列を導く。派生定理は一意性、source token剰余類との分離、fresh区間内所属、および `checkFresh_separates_counter_preserving_binding_tokens` による区間間分離を与える。個々のinitializerが前提を満たすこと、およびC `copy_template`との対応は別途必要である。
+
+`atom_initializer_counter_preserving` と `atom_binding_inputs_counter_preserving` は、atom initializerについてこの仮定を構成する。
+
+任意のマクロ集合でatom一個・二個のlist copyがcounterを保持する補題を追加した。対応する`singleton_atom_list_counter_preserving`と`pair_atom_list_counter_preserving`がこの形を合成用述語へ変換する。
+
+`counterSafeInitializer_preserving` と `atomic_binding_inputs_counter_preserving` は、空のマクロ集合で証明済みの短いatom initializer族を同じ抽象条件へ写す。
+
+`CounterPreservingTrees` は各treeのcopy-counter保持性をリスト上で表し、`copyManyWithMacros_preserving_counter` は任意のマクロ集合でそのリスト走査がcounterを保持することを導く。
+
+`CounterPreservingCases` と `copyCasesWithMacros_preserving_counter` は、各case bodyのcounter保存仮定から、copyCases全体のcounter差分がcase pattern binder総数に一致することを示す。`copyCasesWithMacros_preserving_token_sequence` は出力pattern binder tokenをcounter列に同定し、派生定理が一意性・source-token分離・区間所属を導く。`checkFresh_separates_case_copy_tokens` は異なる受理済み区間間を接続する。
+
+`MacroCounterSafeCases` は各case bodyに `MacroCounterSafeInitializer` を要求する構成的入力条件である。atom、短いlist形状、または先頭が`match`でない任意長atom-only listを扱い、`checkFresh_separates_macro_counter_safe_case_tokens` がこれを抽象条件へ変換してfresh区間分離を導く。
+
+`MacroCounterSafeInitializer` / `MacroCounterSafeBindingInputs` は任意のマクロ集合でcounter保存を証明したatom葉と、atom一個・二個list、および先頭が`match`でない任意長atom-only listを構成的に記述する。`atomTrees` と `copyWithMacros_atomTrees_keeps_counter` が任意長リストのコピーでcounterが保存されることを示し、`atomList` constructorがそれを初期化子条件へ接続する。`copyBindingsWithMacros_macro_safe_*` 群がtoken列、一意性、source-token分離、fresh区間所属を示し、`checkFresh_separates_macro_counter_safe_binding_tokens` が異なる受理済み区間へ接続する。ネストした式、binderを含むinitializer、先頭が`match`の長いatom-only listは対象外である。
+
+`counterTokens_within_interval` とその `copyParameters` / `copyPattern` 系の定理は、出力tokenから生成counterを取り出し、局所操作の開始・終了counter間にあることを示す。これはcopy区間への一般的な構造対応ではなく、対象の二つのbinder-list operationに限る。
+
+`ExpansionCertificate.checkFresh_separates_parameter_copy_tokens` と `checkFresh_separates_pattern_copy_tokens` は、この局所対応を受理済み証書の相異なるfresh区間へ結び付け、その二操作の出力token間の非衝突を導く。
+
+各let initializerがatom、atom一個・二個のlist、または先頭atomが`match`でないatom三個・四個のlistである条件を`CounterSafeInitializer` / `AtomicBindingInputs`で表す。この条件下では、`copyBindings_atomic_counter`と`copyBindings_atomic_token_sequence`がcounterとtoken列を特徴付ける。`copyBindings_atomic_tokens_unique`、`copyBindings_atomic_tokens_avoid_source`、`copyBindings_atomic_tokens_within_interval`が局所freshnessを示し、`checkFresh_separates_atomic_binding_tokens`が相異なる証書区間間のtoken非衝突を導く。この条件は深い複合initializerを対象としない。
+
+`AtomicTrees` と `copyMany_atomic_counter` は空のマクロ名集合での結果であり、`copyManyWithMacros_atomic_counter` が任意のマクロ名集合へ拡張する。`copy_single_atom_list_keeps_counter`、`copy_two_atom_list_keeps_counter`、`copy_three_atom_list_keeps_counter`、`copy_four_atom_list_keeps_counter` は、記載した制約下でcounterを保持する。
+
 ### 3.9 静的なマクロ呼び出し関係の整礎性
 
-`--mode termination` は展開を行わず、名前と引数個数で区別した規則間の静的な辺をLeanで再計算する。Pythonが合成した自然数の順位について、各辺で厳密に減少することを検査する。`MacroTermination.accessible` は `termination_by rank ranks node` によりアクセシビリティを構成し、`ranked_graph_wellFounded` が整礎性を、`path_length_bounded` が呼び出し鎖の長さの上限を示す。
+`--mode termination` は展開を行わず、名前と引数個数で区別した呼び出し先の全一致規則と、穴頭位置に対する同arity候補辺をLeanで再計算する。Pythonが合成した自然数の順位について、各辺で厳密に減少することを検査する。`MacroTermination.accessible` は `termination_by rank ranks node` によりアクセシビリティを構成し、`ranked_graph_wellFounded` が保守的な候補関係の整礎性を、`path_length_bounded` が呼び出し鎖の長さの上限を示す。
 
-同じマクロ名でも、例えば `answer/1 → answer/0` のような規則は証明できる。循環が残る場合、または構文の穴が呼び出し先となる場合はUnknownとする。これは非停止の証明ではない。通常のモードでは、静的解析がUnknownでも実際の有限展開が完成すれば、その入力の有限導出を証明できる。
+`MacroTermination.call_extraction_complete` は、成功した有限fuel走査結果が構文木内の全`StaticCall`を含むことを証明する。構文穴が呼び出し先の位置にある場合は、その引数個数に一致する全規則を候補として走査し、名前付き呼び出しでは名前・arity一致の全規則を含める。`findRule_mem_targetsOfArity` と `findRule_mem_targetsOfSignature` は既存の名前検索先も候補集合に含まれることを示す。`graphRows_dependency_edge` は各抽出済み依存先を行の辺に保持し、`graphRows_static_call_edge` はこの二つを合成する。`GraphCall` と `graphRows_contains_static_calls` は規則行リスト全体について辺の保存を帰納的に示す。`ProcessCertificate.source_static_calls_decrease` は受理済みの一般証書から各抽出辺の順位減少を取り出し、停止性証明書の `every_static_rule_call_decreases` もこれを個別に確認する。候補の過近似を含むテンプレート構文の解析であり、C展開器が実際に実行するmacroStepとのシミュレーションや展開処理全体の終了性を証明したものではない。
 
-`ProcessCertificate.CheckedStaticTermination` はソースの読み取り・正規化と、抽出した関係の整礎性を同じデータへ結び付ける。このモードには式の型付けや実行の証明を含めない。また、抽出した関係が整礎であることから、C展開器の全処理が終了することを導く一般的なシミュレーション定理は未証明である。動的な呼び出し先、一般の構造的減少、利用者が指定する任意の整礎関係の自動検査も今後の対象とする。実行時関数の停止性とは区別し、証明の有無にかかわらず処理予算を維持する。
+同じマクロ名でも、例えば `answer/1 → answer/0` のような規則は証明できる。構文穴が呼び出し先の場合、該当する引数個数の規則をすべて候補辺へ加える。過近似されたグラフに循環が残る場合はUnknownとする。これは非停止の証明ではない。通常のモードでは、静的解析がUnknownでも実際の有限展開が完成すれば、その入力の有限導出を証明できる。
+
+`ProcessCertificate.CheckedStaticTermination` はソースの読み取り・正規化と、抽出した関係の整礎性を同じデータへ結び付ける。このモードには式の型付けや実行の証明を含めない。また、抽出した関係が整礎であることから、C展開器の全処理が終了することを導く一般的なシミュレーション定理は未証明である。より精密な動的呼び出し解析、一般の構造的減少、利用者が指定する任意の整礎関係の自動検査も今後の対象とする。実行時関数の停止性とは区別し、証明の有無にかかわらず処理予算を維持する。
 
 ## 4. 値
 

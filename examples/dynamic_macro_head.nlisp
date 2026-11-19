@@ -1,0 +1,15 @@
+; Used with --mode termination: a syntax hole in call-head position
+; conservatively targets every macro rule with the same arity.
+(define-macro sink
+  (syntax-rules/typed
+    ((sink)
+     ()
+     (Syntax Integer)
+     1)))
+
+(define-macro dispatch
+  (syntax-rules/typed
+    ((dispatch f)
+     ((f (Syntax Integer)))
+     (Syntax Integer)
+     (f))))

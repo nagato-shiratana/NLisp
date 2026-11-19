@@ -8,6 +8,8 @@ NLisp 0.2 は、正格・左から右評価の明示型付きLispに、定義位
 
 > 信頼しないマクロ展開器が生成した各展開ステップについて、規則照合、衛生的置換、freshness、非捕捉および型保存を、局所的かつ合成的に検査できる有限証書を設計し、その独立検査器の受理が展開全体の健全性を含意することをLeanで証明できるか。
 
+これは最終目標であり、現在証明済みなのは有限展開関係と証書に記録されたfresh counter区間の非重複検査までである。freshness・非捕捉・型保存の合成的結論はまだ得られていない。
+
 この問いに対する主要成果は、一般的なマクロ展開器の正しさではなく、次の健全性主張である。
 
 \[
@@ -448,21 +450,48 @@ M\vdash e\Longrightarrow e'
 | 定義位置・呼び出し位置を分けた展開 | `ScopedSyntax.Macro.expand` | 型付き抽象モデルで実装済み |
 | 穴と定義位置参照の分離 | `appendSub_hole`, `appendSub_definition` | 証明済み |
 | 生S式の衛生的コピー | `CMacroCopy.copyWithMacros` | 予算付き関数仕様を実装済み |
+| 実例のC copy結果の再検査 | `tools/verify_lean.py` が生成する `CCopyCorrespondence.substitutionN_sound` 群 | トレース中の各有限copy結果をLean仕様で入力ごとに再計算・照合。一般の全C入力についてのシミュレーションではない |
 | 一段・有限展開関係 | `CExpansion.Expands` | 実装済み |
 | source/generated identity分離 | `source_and_generated_ids_differ` | 証明済み |
-| 生成区間の非交差 | `disjointIntervals`, `separated_fresh_values_differ` | 局所補題まで実装済み |
+| 生成区間の非交差 | `disjointIntervals`, `disjoint_interval_counters_differ`, `checkFresh_generated_tokens_differ` | 区間に属すカウンタ/token間の非衝突まで証明済み |
+| counter-preserving initializerからのbinding freshness合成 | `CounterPreservingInitializer`, `CounterPreservingBindings`, `copyBindingsWithMacros_preserving_*` | 任意マクロ集合下でcounter保持が個別に証明されたinitializer列から、binder token列のcounter対応・一意性・source-token分離・区間所属を導く |
+| counter-safe initializer族のfreshness | `MacroCounterSafeInitializer`, `MacroCounterSafeBindingInputs`, `checkFresh_separates_macro_counter_safe_binding_tokens` | atom、atom一個・二個list、先頭が`match`でない任意長atom-only listについて区間分離まで証明済み |
+| counter-preserving case bodyからのpattern freshness | `CounterPreservingCases`, `copyCasesWithMacros_preserving_*`, `checkFresh_separates_case_copy_tokens` | pattern binder token列をcounterへ対応付け、一意性・source-token分離・区間所属・受理済み区間間の非衝突を証明。各bodyのcounter保持は前提 |
+| 構成的なcounter-safe case body条件 | `MacroCounterSafeCases`, `checkFresh_separates_macro_counter_safe_case_tokens` | 前行の抽象body条件を、counter-safe initializer族（任意長atom-only listを含む）から構成する |
+| 単一binderのsource token回避 | `successful_binder_avoids_source_identity` | 証明済み |
+| 連続するbinder生成tokenの一意性 | `sequential_binders_have_distinct_tokens` | 2呼び出し間を証明済み |
+| 静的・候補呼び出し抽出の網羅性 | `MacroTermination.call_extraction_complete`, `targetsOfSignature`, `targetsOfArity` | 成功時に名前・arity一致の全直接規則と、穴頭位置から同arityで到達し得る全規則候補を抽出。名前検索先の候補所属も証明 |
+| 全規則行の辺への保存 | `MacroTermination.GraphCall`, `graphRows_contains_static_calls` | 各行の直接呼び出し・穴頭候補が完成グラフの辺に含まれることを証明済み |
+| 抽出辺の順位減少 | 生成証明書の `every_static_rule_call_decreases` | 成功したグラフに含まれる全抽出候補辺が順位を下げることをLeanで確認 |
+| 停止性候補解析の作業予算 | `tools/verify_lean.py:termination_plan` | 構文走査・候補辺生成・順位構築を `--max-conversion-steps` で逐次制限。これは実行時予算であり、漸近計算量の証明ではない |
 | 最終構文からの環境再構成 | `CBindingWalk.references` | 実装済み |
 | 各参照のidentity対応 | `Corresponds`, `accepts_sound`, `check_sound` | 証明済み |
 | ソースから展開・スコープまでの束ね | `ProcessCertificate.CheckedExpansion` | 実装済み |
-| 明示的な局所証書データ型 | 未定義 | 研究課題 |
-| 局所証書の合成的Boolean検査器 | 部品のみ存在 | 研究課題 |
+| 明示的な局所証書データ型 | `ExpansionCertificate.Certificate` | 実装済み |
+| 局所証書の合成的Boolean検査器 | `ExpansionCertificate.check`, `check_sound` | 有限展開関係への健全性を証明済み |
 | freshnessの全展開定理 | 未証明 | 研究課題 |
 | `NonCapture`という単一の意味的定理 | 未証明 | 研究課題 |
 | 生S式展開と型付き抽象展開の対応 | 未証明 | 研究課題 |
 | 証書受理から表層型保存 | 未証明 | 研究課題 |
 | 局所再検査量の上界 | 未証明 | 研究課題 |
 
-現在の `CheckedExpansion` は、同じ入力データについて有限展開導出と参照対応を一つのLean構造体へ束ねる。しかし、証書フォーマット自体の局所性、子証書の再利用、freshnessと非捕捉の統合定理、型付き抽象モデルへの接続はまだ研究成果として完成していない。
+2026-11-19追補: Phase 1の証書計算は `NLisp.ExpansionCertificate.Certificate` と `check` により実装した。マクロ規則名・origin・fuel・fresh区間と入出力、リスト文脈、推移合成を証書に保持し、規則所属・パターン照合・`copyWithMacros` は検査器が再計算する。`check_sound` は受理から `CExpansion.Expands` を導く。`checkFresh` は証書の区間非重複も要求し、`checkFresh_sound` と `checkFresh_intervals` が有限展開と区間条件をそれぞれ導く。さらに `disjoint_interval_counters_differ` と `checkFresh_separates_interval_counters` により、異なる受理済み区間内のカウンタ値が一致しないことを証明した。`CMacroCopy.binder_success_counter` と `sequential_binders_have_distinct_tokens` は、個々の連続binder呼び出しがcounterを1ずつ進め、異なるtokenを出力する性質を証明する。`tools/verify_lean.py` は展開トレースをこの証書データへ変換し、生成証書がfreshness付き検査を受理することもLeanで確認する。Phase 1の完了条件は `examples/macros.nlisp` の単一ファイル証明書で確認した。
+
+2026-11-20追補: `MacroTermination.call_extraction_complete` は成功した有限fuel走査が、穴でない直接呼び出しを含め木中の全`StaticCall`を結果へ含むことを証明する。`GraphCall` と `graphRows_contains_static_calls` はその辺が規則リスト全体のグラフに保存されることを導き、生成証明書の `every_static_rule_call_decreases` は全静的辺の順位減少をLeanで検査する。`examples/math_macros.nlisp` の証明書生成・Lean検査も成功した。ただし、これはC展開器の置換や引数複製とStaticCall実行列とのシミュレーションを証明しない。
+
+2026-11-20追補: 呼び出し先が構文穴となる位置を即Unknownにせず、`targetsOfArity` で同じ引数個数を持つ全マクロ規則を候補として加える保守的解析へ拡張した。さらに名前付き呼び出しも `targetsOfSignature` で一致する全規則を辺に含める。`findRule_mem_targetsOfArity` と `findRule_mem_targetsOfSignature` は既存の名前検索先が候補集合に含まれることを証明する。Pythonの順位候補生成とLeanのグラフ再計算を揃え、`examples/dynamic_macro_head.nlisp` の終了性証明書生成が通ることを確認した。これは穴から実際に選ばれる名前を追跡するものではなく、候補辺の過近似であり、循環の導入により証明できない場合がある。展開器の実際のmacroStep列とのシミュレーションは未証明である。
+
+同日追補: 停止性候補解析のPython順位合成へ作業予算を逐次課金し、構文・署名走査、辺列挙、順位グラフ構築が `--max-conversion-steps` を超えた場合にUnknownにする。専用停止性モードでは証明書を発行しない一方、通常モードでは任意の終了性解析が予算超過しても有限展開証明を続行し、停止性状態のみUnknownとして記録する。予算0でUnknownになること、通常の `examples/macros.nlisp` が証明書生成・過程再生を通ることを確認した。さらに、候補解析の超過診断へ試行操作数と上限値を含めた。これは操作カウントの制限で、ビットサイズに対する計算量上界の証明ではない。
+
+同日補正: `examples/recursive_expansion.nlisp` は循環する同一ruleへの展開ではなく、`answer/1` から `answer/0` へarityが減る例であるとREADMEを明確化した。別の一時的な自己循環 `loop/0 → loop/0` は停止性モードで終了コード7のUnknownとなり、証明書を発行しないことを確認した。
+
+同日追補: fresh tokenの局所合成を `CMacroCopy` で拡張した。任意のマクロ名集合でatomと先頭`match`でない任意長atom-only list initializerのcounter保存を示し、`MacroCounterSafeBindingInputs`からbinding token列の一意性・source-token分離・counter区間所属を導く。`CounterPreservingInitializer`条件からの一般binding合成と`checkFresh_separates_counter_preserving_binding_tokens`、およびcounter-preserving case body条件からの `copyCasesWithMacros` counter/token列・区間分離定理も追加した。さらに`MacroCounterSafeCases`から抽象条件へ変換し、`checkFresh_separates_macro_counter_safe_case_tokens`で区間分離を直接導く。これは構成的な前提に対する局所定理であり、任意の深いinitializer/bodyがその前提を満たすこと、全copy分岐を実C実装へ対応づけること、生成token全体を一つのFreshness定理へまとめることは未証明である。
+
+`tools/verify_lean.py` は別途、Cが実行時に記録したmacro traceの各substitutionについて `CCopyCorrespondence.substitutionN_sound` を生成し、同じ入力・rule・hole・fresh区間を使う`copyWithMacros`結果をLeanで一致検査する。この入力ごとの再検査は、未観測入力を含むC `copy_template`全体のシミュレーション定理とは区別する。
+
+この補正でPhase 2以降を完了したとは扱わない。証書のfresh interval全体・非捕捉・型保存をまとめる健全性定理、S式の型付き解釈、局所性ベンチマークは残る。
+
+現在の `CheckedExpansion` は、同じ入力データについて有限展開導出と参照対応を一つのLean構造体へ束ねる。明示的な局所証書と汎用検査器はPhase 1で追加した。異なる区間内カウンタの非衝突と連続binder呼び出しの識別子一意性も証明したが、copy群全体の構造に沿って出力中の全生成識別子をカウンタ境界へ結び、Freshness・非捕捉と統合する定理、型付き抽象モデルへの接続、資源計測と増分再検査はまだ完成していない。
 
 ## 9. 研究課題
 
@@ -531,12 +560,12 @@ Lean内で定義したBoolean検査器と、実際に配布する検査実行物
 
 ### Phase 1 証書計算の固定
 
-- `ExpansionCertificate` をLeanで定義する。
-- `refl`、`congList`、`step`、`trans` の各検査規則を実装する。
-- 現在の展開履歴から証書データを生成する。
-- 証書が保持する情報と検査器が再計算する情報を区別する。
+- [x] `ExpansionCertificate` をLeanで定義する。
+- [x] `refl`、`congList`、`step`、`trans` の各検査規則を実装する。
+- [x] 現在の展開履歴から証書データを生成する。
+- [x] 証書が保持する情報と検査器が再計算する情報を区別する。
 
-完了条件は、既存の実例が、生成されたLean証明本文ではなく同じ汎用 `check` 関数への証書入力として受理されることである。
+完了条件は、既存の実例が、生成された個別の展開証明項ではなく同じ汎用検査器への証書入力として受理されることである。`examples/macros.nlisp` で `checkFresh` による検査を達成し、生成証明書をLeanで検査した。Phase 1の区間検査は記録されたカウンタ区間の非重複までを扱い、生成識別子全体の非衝突証明はPhase 2に残す。
 
 ### Phase 2 freshnessと非捕捉
 
