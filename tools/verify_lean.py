@@ -69,7 +69,7 @@ def run_export(command, max_output_bytes):
 
 def run_lean_command(command):
     root = pathlib.Path(__file__).resolve().parents[1]
-    result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    result = subprocess.run(command, cwd=root, capture_output=True, encoding='utf-8')
     if result.returncode:
         if result.returncode < 0 or result.returncode in (134, 137, 139, 143):
             raise UnknownResult(f'Lean process terminated abnormally (status {result.returncode})')
@@ -786,7 +786,7 @@ class PolyExporter(Exporter):
                 'def source : Definitions := signatures.zip bodies\n'
                 'theorem program_erasure : program.erase = NLisp.PolyIR.eraseDefinitions source := by rfl\n'
                 f'def entry : Expr := .app (.global {self.indices["main"]} []) []\n'
-                'theorem entry_checks : (infer 512 signatures 0 [] entry).isSome = true := by decide\n'
+                'theorem entry_checks : (elaborate 512 signatures 0 [] entry Ty.integer).isSome = true := by decide\n'
                 'theorem execution_erases (fuel : Nat) :\n'
                 '    NLisp.PolyIR.eraseResult (evaluate source fuel [] entry) =\n'
                 '      NLisp.PolyIR.evaluate program.erase fuel [] (NLisp.PolyIR.erase entry) := by\n'
@@ -809,10 +809,19 @@ TERMINATION_ASSURANCE = {
     'kernel_checks': ['source parsing and defrec normalization', 'well-founded static macro call graph'],
     'formal_semantic_preservation': False, 'cryptographic_signature': None,
 }
+POLY_ASSURANCE = {
+    **ASSURANCE,
+    'kernel_checks': [*ASSURANCE['kernel_checks'], 'generic body and integer entry typing',
+                      'annotated source to IR structural correspondence',
+                      'finite identity-based source evaluation preservation',
+                      'polymorphic evaluator type preservation and exclusion of type errors'],
+}
 
 
 def assurance_for(mode):
-    return TERMINATION_ASSURANCE if mode == 'termination' else ASSURANCE
+    if mode == 'termination':
+        return TERMINATION_ASSURANCE
+    return POLY_ASSURANCE if mode == 'poly' else ASSURANCE
 
 
 C_LIMITS = {'max_expansions': 10000, 'max_generated_nodes': 100000,
@@ -1191,6 +1200,32 @@ def render_proof(document, mode, budget):
              copy_correspondence_proof(document) + expansion_correspondence_proof(document) +
              binding_walk_proof(document) + termination_correspondence_proof(document, plan) +
              process_correspondence_proof(document, mode))
+    if mode == 'poly':
+        proof += ('\nnamespace VerifiedPolyProgram\n'
+                  'theorem source_lowering_checked :\n'
+                  '    NLisp.ExpansionLowering.checkProgram 512 CProgramScope.forms signatures bodies = true := by decide\n'
+                  'theorem main_is_entry : NLisp.ExpansionLowering.checkMain 512 CProgramScope.forms ' + str(exporter.indices['main']) + ' = true := by decide\n'
+                  'theorem program_typed : NLisp.PolyIR.ProgramTyped signatures source :=\n'
+                  '  NLisp.Surface.elaborateProgram_programTyped all_bodies_check\n'
+                  'theorem entry_has_no_type_error (fuel : Nat) (fault : NLisp.PolyIR.Fault)\n'
+                  '    (h : NLisp.PolyIR.evaluate program.erase fuel [] (NLisp.PolyIR.erase entry) = .error fault) :\n'
+                  '    fault = .outOfFuel := by\n'
+                  '  rw [program_erasure] at h\n'
+                  '  exact NLisp.PolyIR.evaluation_no_type_error program_typed\n'
+                  '    (NLisp.Surface.elaborate_typed entry_checks)\n'
+                  '    (assignment := fun _ => Ty.unit) (by simpa only [NLisp.Surface.interpretTypes] using NLisp.PolyIR.ValuesTyped.nil) h\n'
+                  'def decoded := NLisp.Named.decodeProgram 512 CProgramScope.forms\n'
+                  'theorem source_decodes : decoded.isSome = true := by decide\n'
+                  'def namedSource : NLisp.Named.Definitions := decoded.get source_decodes\n'
+                  'theorem lowered_source_matches : NLisp.Named.lowerDefinitions namedSource = program.erase := by rfl\n'
+                  'def namedEntry : NLisp.Named.Expr := .app (.global ' + str(exporter.indices['main']) + ') []\n'
+                  'theorem source_evaluation_preserved {value : NLisp.Named.Value}\n'
+                  '    (h : NLisp.Named.Evaluates namedSource [] namedEntry value) :\n'
+                  '    NLisp.PolyIR.Evaluates program.erase [] (NLisp.PolyIR.erase entry) (NLisp.Named.lowerValue value) := by\n'
+                  '  have preserved := NLisp.Named.evaluation_preserved h\n'
+                  '  simpa [lowered_source_matches, namedEntry, entry, NLisp.Named.lowerEnv,\n'
+                  '    NLisp.Named.lower, NLisp.Named.identities] using preserved\n'
+                  'end VerifiedPolyProgram\n')
     exporter.check_term(proof)
     exporter.record_event({'stage': 'macro_termination', **plan})
     return proof, exporter.process

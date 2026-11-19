@@ -1764,9 +1764,13 @@ static Value *vnew(Runtime *r, VKind k) {
 static RBind *rbind(Runtime *r, RBind *env, const char *name, Value *v) {
     RBind *b = (RBind *)aalloc(r->a, sizeof(*b)); b->name = name; b->value = v; b->next = env; return b;
 }
-static Value *rlookup(RBind *env, const char *name) {
-    for (; env != NULL; env = env->next) if (strcmp(env->name, name) == 0) return env->value;
+static RBind *rfind(RBind *env, const char *name) {
+    for (; env != NULL; env = env->next) if (strcmp(env->name, name) == 0) return env;
     return NULL;
+}
+static Value *rlookup(RBind *env, const char *name) {
+    RBind *binding = rfind(env, name);
+    return binding == NULL ? NULL : binding->value;
 }
 
 /* GMP's mpz_get_d truncates. Round the discarded magnitude bits explicitly
@@ -1949,9 +1953,17 @@ static Value *eval(Runtime *r, const SExpr *x, RBind *env) {
         if (strcmp(x->atom, "unit") == 0) return vnew(r, V_UNIT);
         if (integer_atom(x->atom)) { v = vnew(r, V_INT); (void)mpz_set_str(v->as.integer, x->atom, 10); return v; }
         if (float_atom(x->atom, &floating)) { v = vnew(r, V_FLOAT); v->as.floating = floating; return v; }
-        v = rlookup(x->origin == NULL ? env : x->origin->runtime_env, x->atom);
-        if (v == NULL) (void)fail(r->e, NLISP_RUNTIME_ERROR, x->span, "internal unbound name");
-        return v;
+        {
+            RBind *binding = rfind(x->origin == NULL ? env : x->origin->runtime_env, x->atom);
+            if (binding == NULL) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, x->span, "internal unbound name"); return NULL;
+            }
+            if (binding->value == NULL) {
+                (void)fail(r->e, NLISP_RUNTIME_ERROR, x->span,
+                           "global value '%s' read before its initialization", x->atom); return NULL;
+            }
+            return binding->value;
+        }
     }
     if (is_atom(x->items[0], "if")) {
         Value *c = eval(r, x->items[1], env); if (c == NULL) return NULL;
@@ -2010,11 +2022,18 @@ static RBind *runtime_builtins(Runtime *r) {
 static Value *run_program(Arena *a, Program *p, Error *e) {
     Runtime r = {a, e}; RBind *env = runtime_builtins(&r);
     Value **closures = (Value **)aalloc(a, p->count * sizeof(*closures));
-    size_t count = 0U, i, j; Value *main_value;
+    RBind **value_slots = (RBind **)aalloc(a, p->count * sizeof(*value_slots));
+    size_t count = 0U, i; Value *main_value;
     for (i = 0U; i < p->count; i++) if (p->data[i].kind == D_FUN) {
         FunDef *f = &p->data[i].as.fun; Value *v = vnew(&r, V_CLOSURE);
         v->as.closure = (Closure){f->params, f->arity, f->body, NULL};
         closures[count++] = v; env = rbind(&r, env, f->name, v);
+    }
+    /* Global bindings exist once for the whole execution. Closures retain
+       these shared cells, including cells filled by a later initializer. */
+    for (i = 0U; i < p->count; i++) if (p->data[i].kind == D_VAL) {
+        env = rbind(&r, env, p->data[i].as.val.name, NULL);
+        value_slots[i] = env;
     }
     for (i = 0U; i < count; i++) closures[i]->as.closure.env = env;
     for (i = 0U; i < p->count; i++) if (p->data[i].kind == D_VAL) {
@@ -2022,16 +2041,14 @@ static Value *run_program(Arena *a, Program *p, Error *e) {
         Macro *m;
         for (m = a->macros; m != NULL; m = m->next)
             if (m->declaration_index <= i && m->runtime_env == NULL) m->runtime_env = env;
-        for (j = 0U; j < count; j++) closures[j]->as.closure.env = env;
         v = eval(&r, p->data[i].as.val.init, env); if (v == NULL) return NULL;
-        env = rbind(&r, env, p->data[i].as.val.name, v);
+        value_slots[i]->value = v;
     }
     {
         Macro *m;
         for (m = a->macros; m != NULL; m = m->next)
             if (m->runtime_env == NULL) m->runtime_env = env;
     }
-    for (i = 0U; i < count; i++) closures[i]->as.closure.env = env;
     main_value = rlookup(env, "main");
     return apply(&r, main_value, NULL, 0U, (Span){1U, 1U});
 }

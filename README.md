@@ -1,8 +1,8 @@
 # nagato-Lisp
 
-表層意味論、多相型付きIR、証明を保持する型検査器、型消去を実装した。汎用関数本体は型引数ごとに複製せず、共有する。Cの展開結果からこのIRを構成する経路は `--mode poly` で利用できる。変換器全体の意味保存は後続課題。
+表層意味論、多相型付きIR、証明を保持する型検査器、型消去を実装した。汎用関数本体は型引数ごとに複製せず、共有する。Cの展開結果からこのIRを構成する経路は `--mode poly` で利用できる。元構文との独立照合と、束縛IDを持つソース意味論から実行用IRへの有限評価の前向き保存も検査する。
 
-Leanで型消去の意味保存、有限評価と実行用評価器の健全性・完全性、終了の保存・反映、同じfuelでの値・エラーの一致、評価の決定性を検査済み。「すべてのfuelで予算切れ」の対応も証明したが、単発の予算切れから非停止を判定しない。C変換器・C実行器の意味保存と新多相モデルの型安全性は未証明。
+Leanで型消去の意味保存、有限評価と実行用評価器の健全性・完全性、終了の保存・反映、同じfuelでの値・エラーの一致、評価の決定性を検査済み。新多相モデルでは、型検査器の受理から、実行用評価器の結果の型保存と参照切れ・引数個数違い・形状違いの排除も証明した。「すべてのfuelで予算切れ」の対応は単発の予算切れから非停止を判定するものではない。束縛ID意味論の逆向き評価反映、C実行器との一般的な対応、Float等への拡張とトップレベル初期化の形式化は残る。
 
 `SurfaceChecker.elaborateProgram` は明示的な型引数を持つ汎用本体から証明付きIRを構築する。多相再帰を含む本体も一度検査する。現在の新モデルの対象はBoolean/Integer/Unit/関数/List/Option。旧モデルとC実装はFloat/String/Characterおよび全組み込み関数も扱う。
 
@@ -20,6 +20,10 @@ lake env lean tests/Erasure.lean
 lake env lean tests/EvaluatorCorrectness.lean
 lake env lean tests/ErasureExecution.lean
 lake env lean tests/SurfaceChecker.lean
+lake env lean tests/ExpansionLowering.lean
+lake env lean tests/NameLowering.lean
+lake env lean tests/TypeArguments.lean
+lake env lean tests/PolymorphicSafety.lean
 ```
 
 nagato-Lisp（NLisp）は、明示的な静的型付けと検証可能なLispを目標とする研究用言語である。
@@ -28,6 +32,7 @@ nagato-Lisp（NLisp）は、明示的な静的型付けと検証可能なLispを
 
 - `SPECIFICATION.md`: NLisp 0.2規範仕様
 - `LEAN_FORMAL_SPECIFICATION.md`: Lean形式仕様と検証範囲
+- `RESEARCH_FORMALIZATION.md`: 現行仕様の数理モデル、局所展開証書の主定理、研究課題と実装計画
 - `NLisp/Core.lean`: Leanで検査済みのコア計算体系
 - `NLisp/TypedExpansion.lean`: 全実行時型・組み込み関数の型付け証明書
 - `NLisp/ScopedSyntax.lean`: 束縛IDと所属環境を明示した構文・マクロ展開モデル

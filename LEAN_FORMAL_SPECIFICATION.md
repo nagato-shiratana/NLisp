@@ -1,5 +1,55 @@
 # nagato-Lisp Lean 形式仕様書
 
+## 2026-11-19 追補: 束縛IDを持つ展開後構文から実行用IR
+
+`NamedSemantics` は束縛IDを使う独立した大ステップ意味論、`NameLowering` はID参照を位置添字へ変換する関数とその前向きシミュレーションを定義する。
+
+```text
+Named.Evaluates definitions environment expression value
+  ⇒ PolyIR.Evaluates (Named.lowerDefinitions definitions)
+       (Named.lowerEnv environment)
+       (Named.lower (Named.identities environment) expression)
+       (Named.lowerValue value)
+```
+
+変換関数を呼んでソースの評価を定義する方式ではなく、ソースの変数探索はIDの対応列を独立に探索する。証明はその評価導出の相互帰納法であり、関数本体の型や終了性を隠れた前提としない。letの成功規則は束縛ID数と初期化結果数の一致を要求する。元のlet構文では各束縛に初期化式が一つあり、正しい構文のデコードはこの個数を保持する。
+
+`NamedDecoder` はCBindingWalkの注釈付き構文から操作的なNamed構文を独立に読み取る。poly証書は同じ `CProgramScope.forms` に対して、シグネチャと全式の `ExpansionLowering.checkProgram`、mainの選択、独立した読み取り、`Named.lowerDefinitions namedSource = program.erase` を検査する。型注釈・明示/省略型適用は元ノードとSurfaceの対応検査と型検査で照合し、操作的Named構文では消去する。
+
+これにより、元の有限展開証書で検査した構文のNamed評価から、型検査済みProgramの実行用IRへの前向き保存を、入力ごとの `source_evaluation_preserved` として得る。型が合う無関係な出力、引数順の変更、束縛IDと添字の変更は対応検査で拒否する。Namedモデルからの終了反映・エラー/発散の対応、C実行器との一般的な対応、新多相モデルの型安全性は引き続き未証明。以下の2026-11-18記録の未接続範囲は、この前向き保存と構文対応の範囲について更新された。
+
+`tests/NameLowering.lean` はクロージャ・並列let・コンストラクタ照合の導出と、導出から十分なfuelでIR評価器が成功することを確認する。`tests/ExpansionLowering.lean` は同じ型・名前でも異なる束縛IDの参照、計算や引数順のすり替えを拒否する。`tests/poly_bridge.py` は実際の証書を使い、型の合う加算から減算への変更をカーネルが拒否することも確認する。
+
+`TypeArguments.inferred_arguments_unique` は、`inferrable` が受理するシグネチャについて、同じ仮引数型列を同じ実引数型列へ具体化する二つの型引数列が等しいことを示す。証明は、型変数の出現位置を辿ればその型引数の成分が一致するという補題と、量化変数すべての被覆からなる。これは呼び出し側の型変数を解く単一化ではなく、固定された実引数型に対する一方向照合である。
+
+`inferTypeArguments` は制約の収集後、具体化の全体一致と呼び出し側の整形式性を再検査し、`TypeArgumentSolution` として一致・一意性の証明を返す。期待される戻り値型を参照しない。`tests/TypeArguments.lean` は高階関数型、競合、未決定変数、TからList Tへの多相再帰の具体化、呼び出し側のスコープ違反を確認する。noneは深さ予算超過も表し、完全性や不適合の証明ではない。Cの推論アルゴリズムの一般的な正しさをこの結果だけで主張しない。
+
+### 多相IR評価器の型保存と型エラー排除
+
+`PolymorphicSafety.lean` の `interpret` は型変数を任意の型へ解釈し、`interpret_instantiate` は整形式な型について型引数の代入と解釈が対応することを示す。`ValueTyped` は実行用IRの値の論理的な型付けである。クロージャには元の型付き本体・捕捉環境・型変数解釈の存在を要求し、global値には同じ関数表のシグネチャとの対応を要求する。`ProgramTyped` はすべての参照可能な関数本体がその汎用シグネチャで型付けされることを要求する。
+
+```text
+ProgramTyped globals definitions
+∧ HasType globals count context expression type
+∧ ValuesTyped globals environment (interpretTypes assignment context)
+⇒ OutcomeTyped (ValueTyped globals · (interpret assignment type))
+    (evaluate (eraseDefinitions definitions) fuel environment (erase expression))
+```
+
+`OutcomeTyped` が許す結果はokの型付き値とoutOfFuelだけである。`evaluator_type_safe` は式・引数列・begin列について同時に証明し、自己再帰・相互再帰・多相再帰を含む。`evaluation_preserves_type` は成功した結果の型保存、`evaluation_no_type_error` はエラー結果がoutOfFuelに限られることを取り出す。発散する関数に十分なfuelが存在するとは主張しない。
+
+`elaborateProgram_programTyped` は型検査器の受理から `ProgramTyped` を導く。途中の証明付きexpressionが入力本体そのものであることと、全シグネチャ・本体の列の対応も検査する。poly証書の `entry_has_no_type_error` は実際に生成した `program.erase` のmainへこの一般定理を適用する。既存の単相コアの定理を借用せずに、新多相モデルについて証明した。
+
+対象の評価関係は予算付き大ステップ評価器である。小ステップ簡約を別途定義して得る構文的Progress、Namedモデルの逆向きシミュレーション、Float等の拡張、トップレベル初期化の証明は残る。以下の過去の未証明範囲の記録は、この意味的な型安全性の範囲について更新された。
+
+### 大域ストアと検査コストの基礎
+
+`GlobalIR` は明示的な大域ストアとgetterを持つ追加の実行モデルである。ユーザー関数は共通の型消去済み本体と元の引数個数を保持し、大域値を読むgetterだけが現在のストアへアクセスする。初期化前の読み出しは `beforeInitialization` として型エラーと分ける。局所クロージャは大域ストアのスナップショットを捕捉しない。
+
+成功した初期化について、セル数の保存、先行するセルの不変性、初期化対象範囲の各セルに値が存在することを証明した。ソースからGlobalIRへの変換、GlobalIRに対する型安全性、Cの共有セルとの一般的な対応は後続課題である。旧PolyIRの型安全性定理を、この追加モデルの証明として流用しない。
+
+`PolyIR.erase` の終了性の尺度は、数値リテラルや添字の数値を数えない構文ノード数に変更した。数値の大きさは入力のビット長と異なるため、既定のsizeOfをそのまま検査コストと見なしてはならない。新尺度は証明用であり、消去関数自体はネイティブ実行できる。大きな整数の回帰例を追加したが、全検査手続き・Leanカーネルの計算量の多項式上界は依然として未証明である。
+
 ## 2026-11-18 追補: 表層意味論・多相型付き中間表現
 
 ### 現在の保証範囲

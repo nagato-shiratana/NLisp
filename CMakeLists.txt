@@ -51,6 +51,8 @@ if(BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/builtins.py $<TARGET_FILE:nlisp>)
     add_test(NAME syntax_run COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/syntax.py $<TARGET_FILE:nlisp>)
+    add_test(NAME global_initialization COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/global_initialization.py $<TARGET_FILE:nlisp>)
     add_test(NAME independent_certificate COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/independent_certificate.py)
     find_program(NLISP_LAKE lake HINTS ${CMAKE_CURRENT_SOURCE_DIR}/.tools/lean-4.8.0/bin
@@ -69,7 +71,7 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_bridge.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
       set_tests_properties(lean_bridge macro_termination source_reader poly_bridge PROPERTIES
         FIXTURES_REQUIRED lean_library)
-      foreach(model SurfaceIR Erasure EvaluatorCorrectness ErasureExecution SurfaceChecker)
+      foreach(model SurfaceIR Erasure ErasureMagnitude EvaluatorCorrectness ErasureExecution SurfaceChecker ExpansionLowering NameLowering TypeArguments PolymorphicSafety GlobalIR CheckerCompleteness)
         add_test(NAME lean_${model} COMMAND ${NLISP_LAKE} env lean tests/${model}.lean)
         set_tests_properties(lean_${model} PROPERTIES
           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} FIXTURES_REQUIRED lean_library)

@@ -1,5 +1,6 @@
 """Integration checks for shared generic bodies and certificate-only replay."""
 import importlib.util
+import json
 import pathlib
 import subprocess
 import sys
@@ -33,6 +34,10 @@ class PolymorphicBridge(unittest.TestCase):
                     self.assertEqual(len(programs), 1)
                     self.assertEqual(len(programs[0]['bodies']), expected_bodies)
                     self.assertIn('execution_erases', proof)
+                    self.assertIn('source_lowering_checked', proof)
+                    self.assertIn('lowered_source_matches', proof)
+                    self.assertIn('source_evaluation_preserved', proof)
+                    self.assertIn('entry_has_no_type_error', proof)
                     self.assertNotIn('Expr.fix', proof)
                     # The certificate checker must not start any C executable.
                     result = subprocess.run(
@@ -44,7 +49,6 @@ class PolymorphicBridge(unittest.TestCase):
     def test_top_level_captures_are_not_silently_reinterpreted(self):
         result = subprocess.run([NLISP, 'export-core', str(ROOT / 'examples/closure.nlisp')],
                                 cwd=ROOT, capture_output=True, encoding='utf-8', check=True)
-        import json
         document = json.loads(result.stdout)
         # Test a real declaration if present; insert a top-level value otherwise.
         if not any(bridge.atom(d[0]) == 'define' for d in document['declarations']):
@@ -52,6 +56,22 @@ class PolymorphicBridge(unittest.TestCase):
             document['declarations'].insert(0, [atom('define'), [atom('x'), atom('Integer')], atom('1')])
         with self.assertRaisesRegex(ValueError, 'top-level captures'):
             bridge.PolyExporter(document)
+
+    def test_kernel_rejects_type_correct_operation_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / 'input.nlisp'
+            source.write_text('(defun main () Integer (+ 40 2))', encoding='utf-8')
+            result = subprocess.run([NLISP, 'export-core', str(source)],
+                                    capture_output=True, encoding='utf-8', check=True)
+            document = json.loads(result.stdout)
+            proof, _ = bridge.render_proof(document, 'poly',
+                {'max_certificate_bytes': 4194304, 'max_conversion_steps': 100000})
+            altered = proof.replace('(Expr.add ', '(Expr.sub ', 1)
+            self.assertNotEqual(proof, altered)
+            output = pathlib.Path(directory) / 'Unrelated.lean'
+            with self.assertRaises(subprocess.CalledProcessError):
+                bridge.verify_certificate(altered, output, LAKE)
+            self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

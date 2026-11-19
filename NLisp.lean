@@ -22,3 +22,10 @@ import NLisp.ErasureExecution
 import NLisp.SemanticDeterminism
 import NLisp.SurfaceChecker
 import NLisp.SurfaceEvaluatorCompleteness
+import NLisp.ExpansionLowering
+import NLisp.NameLowering
+import NLisp.NamedDecoder
+import NLisp.TypeArguments
+import NLisp.PolymorphicSafety
+import NLisp.GlobalIR
+import NLisp.CheckerCompleteness

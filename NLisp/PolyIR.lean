@@ -30,6 +30,36 @@ inductive Term where
   | matchOption : Term → Term → Term → Term
   deriving Repr
 
+/- Count only recursive syntax nodes. The default sizeOf also counts the
+numeric magnitude of integer literals; using that magnitude as the kernel's
+termination measure can make checking a short literal prohibitively costly.
+The nested recursors are used only in termination proofs, so their lack of
+native code generation in Lean 4.8 does not affect executable erasure. -/
+macro "source_nodes_using " recursor:term : term => `(
+  $recursor (motive_1 := fun _ => Nat) (motive_2 := fun _ => Nat)
+    (fun _ => 1) (fun _ _ => 1) (fun _ => 1) (fun _ => 1) 1
+    (fun _ _ _ body => 1 + body)
+    (fun _ _ f args => 1 + f + args)
+    (fun _ _ _ c y n => 1 + c + y + n)
+    (fun _ _ a b => 1 + a + b)
+    (fun _ _ a b => 1 + a + b)
+    (fun _ _ a b => 1 + a + b)
+    (fun _ _ a b => 1 + a + b)
+    (fun _ _ a b => 1 + a + b)
+    (fun _ _ _ values body => 1 + values + body)
+    (fun _ _ first rest => 1 + first + rest)
+    (fun _ => 1) (fun _ _ _ head tail => 1 + head + tail)
+    (fun _ => 1) (fun _ _ value => 1 + value)
+    (fun _ _ _ target empty full => 1 + target + empty + full)
+    (fun _ _ _ target empty full => 1 + target + empty + full)
+    0 (fun _ _ head tail => 1 + head + tail))
+
+noncomputable def sourceNodes (expression : Surface.Expr) : Nat :=
+  (source_nodes_using Surface.Expr.rec) expression
+
+noncomputable def sourceListNodes (expressions : List Surface.Expr) : Nat :=
+  (source_nodes_using Surface.Expr.rec_1) expressions
+
 mutual
 def erase (expression : Surface.Expr) : Term :=
   match expression with
@@ -54,15 +84,15 @@ def erase (expression : Surface.Expr) : Term :=
   | .some _ value => .some (erase value)
   | .matchList target empty full => .matchList (erase target) (erase empty) (erase full)
   | .matchOption target empty full => .matchOption (erase target) (erase empty) (erase full)
-termination_by sizeOf expression
-decreasing_by all_goals simp_wf; omega
+termination_by sourceNodes expression
+decreasing_by all_goals simp_wf; simp only [sourceNodes, sourceListNodes]; omega
 
 def eraseList (expressions : List Surface.Expr) : List Term :=
   match expressions with
   | [] => []
   | e :: es => erase e :: eraseList es
-termination_by sizeOf expressions
-decreasing_by all_goals simp_wf; omega
+termination_by sourceListNodes expressions
+decreasing_by all_goals simp_wf; simp only [sourceNodes, sourceListNodes]; omega
 end
 
 /- A proof-carrying IR node retains its full polymorphic source term. This
