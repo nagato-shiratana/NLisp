@@ -64,6 +64,15 @@ structure Header where
   result : Ty
   body : Node
 
+/- A top-level value keeps its annotated source identity and declaration
+position. `order` is the position among all normalized top-level forms, so
+initialization order survives when function declarations are interspersed. -/
+structure GlobalHeader where
+  identity : Nat
+  type : Ty
+  initializer : Node
+  order : Nat
+
 def Header.signature (h : Header) : Signature :=
   ⟨h.variables.length, h.parameters.map Prod.snd, h.result⟩
 
@@ -78,6 +87,92 @@ def readHeader (fuel : Nat) : Node → Option Header
     return ⟨← binder id, variables, ← readParameters fuel variables parameters,
       ← readType fuel variables result, body⟩
   | _ => none
+
+def readGlobalHeader (fuel order : Nat) : Node → Option GlobalHeader
+  | .list [head, .list [identifier, annotation], initializer] => do
+      if name head ≠ some "define" then none else
+      return ⟨← binder identifier, ← readType fuel [] annotation, initializer, order⟩
+  | _ => none
+
+def readGlobalHeaders (fuel : Nat) : Nat → List Node → Option (List GlobalHeader)
+  | _, [] => some []
+  | order, form :: tail => do
+      match readGlobalHeader fuel order form with
+      | some value => return value :: (← readGlobalHeaders fuel (order + 1) tail)
+      | none =>
+          if (readHeader fuel form).isSome then
+            readGlobalHeaders fuel (order + 1) tail
+          else none
+
+structure ProgramHeaders where
+  functions : List Header
+  globals : List GlobalHeader
+
+/- Read mixed top-level declarations in one pass. Each output list preserves
+its source order, and every define retains its original form position. -/
+def readProgramHeaders (fuel : Nat) : Nat → List Node → Option ProgramHeaders
+  | _, [] => some ⟨[], []⟩
+  | order, form :: tail => do
+      let rest ← readProgramHeaders fuel (order + 1) tail
+      match readHeader fuel form with
+      | some function => pure ⟨function :: rest.functions, rest.globals⟩
+      | none => do
+          let global ← readGlobalHeader fuel order form
+          pure ⟨rest.functions, global :: rest.globals⟩
+
+/- Global values use their position among value declarations for store slots;
+the source token remains the key used to resolve references. `order` on the
+header is reserved for initialization order and is not a slot number. -/
+def globalValueIndex (identity : Nat) : List GlobalHeader → Option Nat
+  | [] => none
+  | header :: tail =>
+      if header.identity = identity then some 0
+      else (globalValueIndex identity tail).map Nat.succ
+
+theorem globalValueIndex_lookup_sound (identity : Nat) (headers : List GlobalHeader)
+    (slot : Nat) (resolved : globalValueIndex identity headers = some slot) :
+    ∃ header, headers[slot]? = some header ∧ header.identity = identity := by
+  induction headers generalizing slot with
+  | nil => simp [globalValueIndex, getElem?_def] at resolved
+  | cons head tail ih =>
+      by_cases same : head.identity = identity
+      · simp [globalValueIndex, same] at resolved
+        subst slot
+        exact ⟨head, by simp [getElem?_def], same⟩
+      · cases tailResult : globalValueIndex identity tail with
+        | none => simp [globalValueIndex, same, tailResult] at resolved
+        | some tailSlot =>
+            have slotEq : tailSlot + 1 = slot := by
+              simpa [globalValueIndex, same, tailResult] using resolved
+            subst slot
+            obtain ⟨header, headerEntry, identityEq⟩ := ih tailSlot tailResult
+            have headerEntry' : (head :: tail)[tailSlot + 1]? = some header := by
+              have tailBound : tailSlot < tail.length := by
+                by_contra notBound
+                simp [getElem?_def, notBound] at headerEntry
+              have headBound : tailSlot + 1 < (head :: tail).length := by
+                simp only [List.length_cons]
+                omega
+              simpa [getElem?_def, tailBound, headBound] using headerEntry
+            exact ⟨header, headerEntry', identityEq⟩
+
+def globalValueReferenceIndex (functionCount identity : Nat)
+    (headers : List GlobalHeader) : Option Nat :=
+  (globalValueIndex identity headers).map (functionCount + ·)
+
+theorem globalValueReferenceIndex_sound (functionCount identity index : Nat)
+    (headers : List GlobalHeader)
+    (resolved : globalValueReferenceIndex functionCount identity headers = some index) :
+    ∃ slot header, index = functionCount + slot ∧ headers[slot]? = some header ∧
+      header.identity = identity := by
+  cases valueIndex : globalValueIndex identity headers with
+  | none => simp [globalValueReferenceIndex, valueIndex] at resolved
+  | some slot =>
+      have indexEq : functionCount + slot = index := by
+        simpa [globalValueReferenceIndex, valueIndex] using resolved
+      obtain ⟨header, headerEntry, identityEq⟩ :=
+        globalValueIndex_lookup_sound identity headers slot valueIndex
+      exact ⟨slot, header, indexEq.symm, headerEntry, identityEq⟩
 
 mutual
 def occurs : Nat → Nat → Ty → Bool

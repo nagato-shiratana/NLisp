@@ -71,6 +71,9 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_bridge.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
       set_tests_properties(lean_bridge macro_termination source_reader poly_bridge PROPERTIES
         FIXTURES_REQUIRED lean_library)
+      set_tests_properties(builtins_run syntax_run global_initialization independent_certificate
+        lean_bridge macro_termination source_reader poly_bridge PROPERTIES
+        ENVIRONMENT "PYTHONUTF8=1")
       foreach(model SurfaceIR Erasure ErasureMagnitude EvaluatorCorrectness ErasureExecution SurfaceChecker ExpansionLowering NameLowering TypeArguments PolymorphicSafety GlobalIR CheckerCompleteness)
         add_test(NAME lean_${model} COMMAND ${NLISP_LAKE} env lean tests/${model}.lean)
         set_tests_properties(lean_${model} PROPERTIES

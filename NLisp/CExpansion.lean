@@ -28,6 +28,55 @@ def holeEntries : List Tree → List Tree → Option Holes
       return (parameter.name, argument) :: (← holeEntries parameters arguments)
   | _, _ => none
 
+/- Structural cost model for the parameter/argument walk after a macro head
+has matched. Each paired parameter consumes one unit; reaching the end or a
+shape/arity mismatch consumes one terminal unit. String comparison and list
+allocation costs are outside this model. -/
+def holeEntriesWithCost : List Tree → List Tree → Option Holes × Nat
+  | [], [] => (some [], 1)
+  | .atom parameter :: parameters, argument :: arguments =>
+      let (entries, cost) := holeEntriesWithCost parameters arguments
+      (entries.map (fun holes => (parameter.name, argument) :: holes), cost + 1)
+  | _, _ => (none, 1)
+
+theorem holeEntriesWithCost_result (parameters arguments : List Tree) :
+    (holeEntriesWithCost parameters arguments).1 = holeEntries parameters arguments := by
+  induction parameters generalizing arguments with
+  | nil => cases arguments <;> rfl
+  | cons parameter tail ih =>
+      cases parameter with
+      | atom atom =>
+          cases arguments with
+          | nil => rfl
+          | cons argument arguments =>
+              have recursiveResult := ih arguments
+              cases costed : holeEntriesWithCost tail arguments with
+              | mk entries cost =>
+                  have entriesEq : entries = holeEntries tail arguments := by
+                    simpa [costed] using recursiveResult
+                  simp only [holeEntriesWithCost, costed]
+                  rw [entriesEq]
+                  simpa only [holeEntries] using
+                    (CMacroCopy.option_map_eq_bind_some (holeEntries tail arguments)
+                      (fun holes => (atom.name, argument) :: holes))
+      | list children => cases arguments <;> rfl
+
+theorem holeEntriesWithCost_cost_le_parameters_add_one
+    (parameters arguments : List Tree) :
+    (holeEntriesWithCost parameters arguments).2 ≤ parameters.length + 1 := by
+  induction parameters generalizing arguments with
+  | nil => cases arguments <;> simp [holeEntriesWithCost]
+  | cons parameter tail ih =>
+      cases parameter with
+      | atom atom =>
+          cases arguments with
+          | nil => simp [holeEntriesWithCost, List.length_cons]
+          | cons argument arguments =>
+              simp only [holeEntriesWithCost, List.length_cons]
+              have tailBound := ih arguments
+              omega
+      | list children => cases arguments <;> simp [holeEntriesWithCost, List.length_cons]
+
 def matchRule (rule input : Tree) : Option (Holes × Tree) :=
   match rule, input with
   | .list [.list (.atom pattern :: parameters), _, _, template], .list (.atom called :: arguments) =>
@@ -35,6 +84,64 @@ def matchRule (rule input : Tree) : Option (Holes × Tree) :=
         (holeEntries parameters arguments).map (fun holes => (holes, template))
       else none
   | _, _ => none
+
+def matchRuleParameterCount : Tree → Nat
+  | .list [.list (.atom _ :: parameters), _, _, _] => parameters.length
+  | _ => 0
+
+def matchRulePayloadWithCost (pattern : Atom) (parameters : List Tree)
+    (template : Tree) (called : Atom) (arguments : List Tree) :
+    Option (Holes × Tree) × Nat :=
+  if pattern.name = called.name then
+    let (entries, cost) := holeEntriesWithCost parameters arguments
+    (entries.map (fun holes => (holes, template)), cost + 1)
+  else (none, 1)
+
+theorem matchRulePayloadWithCost_result (pattern : Atom) (parameters : List Tree)
+    (template : Tree) (called : Atom) (arguments : List Tree) :
+    (matchRulePayloadWithCost pattern parameters template called arguments).1 =
+      (if pattern.name = called.name then
+        (holeEntries parameters arguments).map (fun holes => (holes, template)) else none) := by
+  by_cases same : pattern.name = called.name
+  · cases entries : holeEntries parameters arguments with
+    | none => simp [matchRulePayloadWithCost, same, holeEntriesWithCost_result, entries]
+    | some holes => simp [matchRulePayloadWithCost, same, holeEntriesWithCost_result, entries]
+  · simp [matchRulePayloadWithCost, same]
+
+theorem matchRulePayloadWithCost_cost_le (pattern : Atom) (parameters : List Tree)
+    (template : Tree) (called : Atom) (arguments : List Tree) :
+    (matchRulePayloadWithCost pattern parameters template called arguments).2 ≤
+      parameters.length + 2 := by
+  by_cases same : pattern.name = called.name
+  · have holesBound := holeEntriesWithCost_cost_le_parameters_add_one parameters arguments
+    simp only [matchRulePayloadWithCost, if_pos same, Prod.snd]
+    omega
+  · simp only [matchRulePayloadWithCost, if_neg same, Prod.snd]
+    omega
+
+/- Costed version of the shallow rule-shape/head check plus the instrumented
+parameter walk. One unit covers the top-level dispatch and head-name check;
+the parameter/argument traversal uses `holeEntriesWithCost`. -/
+def matchRuleWithCost (rule input : Tree) : Option (Holes × Tree) × Nat :=
+  match rule, input with
+  | .list [.list (.atom pattern :: parameters), _, _, template],
+      .list (.atom called :: arguments) =>
+      matchRulePayloadWithCost pattern parameters template called arguments
+  | _, _ => (none, 1)
+
+theorem matchRuleWithCost_result (rule input : Tree) :
+    (matchRuleWithCost rule input).1 = matchRule rule input := by
+  unfold matchRuleWithCost matchRule
+  split
+  · exact matchRulePayloadWithCost_result _ _ _ _ _
+  · rfl
+
+theorem matchRuleWithCost_cost_le_parameters_add_two (rule input : Tree) :
+    (matchRuleWithCost rule input).2 ≤ matchRuleParameterCount rule + 2 := by
+  unfold matchRuleWithCost matchRuleParameterCount
+  split
+  · simp [matchRulePayloadWithCost_cost_le]
+  · omega
 
 /- The reflexive, transitive, context closure of hygienic rule substitution.
 A certificate supplies a finite derivation, without claiming all macros stop. -/

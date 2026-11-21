@@ -2,15 +2,15 @@
 
 ## 1. 研究対象と結論
 
-NLisp 0.2 は、正格・左から右評価の明示型付きLispに、定義位置と呼び出し位置を区別する型付き衛生テンプレートマクロを加えた言語である。現在の実装は、個別の有限入力について、元ソースの読み取り、正規化、実在するマクロ規則による展開、生成束縛のfreshness、最終構文の名前解決をLeanで独立に照合できる。
+NLisp 0.2 は、正格・左から右評価の明示型付きLispに、定義位置と呼び出し位置を区別する型付き衛生テンプレートマクロを加えた言語である。現在の証書は、個別の有限入力について、元ソースの読み取り、正規化、実在するマクロ規則による有限展開、最終構文の束縛identityをLeanで独立に照合する。freshnessは証書区間の分離と条件付きの複数copy族について補題があるが、全構文・全展開に対する生成束縛のfreshness定理は未証明である。
 
 本研究の中心課題を次の問いに定める。
 
 > 信頼しないマクロ展開器が生成した各展開ステップについて、規則照合、衛生的置換、freshness、非捕捉および型保存を、局所的かつ合成的に検査できる有限証書を設計し、その独立検査器の受理が展開全体の健全性を含意することをLeanで証明できるか。
 
-これは最終目標であり、現在証明済みなのは有限展開関係と証書に記録されたfresh counter区間の非重複検査までである。freshness・非捕捉・型保存の合成的結論はまだ得られていない。
+これは最終目標であり、以下の式は現在達成済みの定理ではなく、証明対象としての目標である。現時点では、有限の展開証書が`CExpansion.Expands`を導くこと、証書内のfresh区間の分離、binder/copyの複数の条件付きfreshness補題、保守的な静的呼び出し候補の抽出と順位減少を証明している。これらの補題を任意の入力に対する全体freshness・非捕捉・型保存へ合成する定理、マクロ展開器全体との一般シミュレーション、検査器全体の多項式計算量上界はまだ得られていない。現行の細目は8節の対応表と`REMAINING_TASKS.md`を参照する。
 
-この問いに対する主要成果は、一般的なマクロ展開器の正しさではなく、次の健全性主張である。
+研究で最終的に示したい健全性主張は、一般的なマクロ展開器の完全正当性ではなく、次の条件付き命題である。
 
 \[
   \operatorname{check}(P,e,e',C)=\mathsf{true}
@@ -452,6 +452,7 @@ M\vdash e\Longrightarrow e'
 | 生S式の衛生的コピー | `CMacroCopy.copyWithMacros` | 予算付き関数仕様を実装済み |
 | 実例のC copy結果の再検査 | `tools/verify_lean.py` が生成する `CCopyCorrespondence.substitutionN_sound` 群 | トレース中の各有限copy結果をLean仕様で入力ごとに再計算・照合。一般の全C入力についてのシミュレーションではない |
 | 一段・有限展開関係 | `CExpansion.Expands` | 実装済み |
+| 成功したmacro呼び出しと静的候補 | `MacroTermination.successful_match_has_signature`, `macro_step_input_is_static_candidate` | 規則membershipと成功照合から、実際のroot callをsome targetへの`StaticCall`候補として導く。`tests/MacroTermination.lean`で例を検査。呼び出し元ruleのowner/node indexへ辺を結ぶ合成とC展開列の対応は未証明 |
 | source/generated identity分離 | `source_and_generated_ids_differ` | 証明済み |
 | 生成区間の非交差 | `disjointIntervals`, `disjoint_interval_counters_differ`, `checkFresh_generated_tokens_differ` | 区間に属すカウンタ/token間の非衝突まで証明済み |
 | counter-preserving initializerからのbinding freshness合成 | `CounterPreservingInitializer`, `CounterPreservingBindings`, `copyBindingsWithMacros_preserving_*` | 任意マクロ集合下でcounter保持が個別に証明されたinitializer列から、binder token列のcounter対応・一意性・source-token分離・区間所属を導く |
@@ -474,6 +475,21 @@ M\vdash e\Longrightarrow e'
 | 生S式展開と型付き抽象展開の対応 | 未証明 | 研究課題 |
 | 証書受理から表層型保存 | 未証明 | 研究課題 |
 | 局所再検査量の上界 | 未証明 | 研究課題 |
+
+ここで「証明済み」は表のLean定義・定理がカーネルで検査される範囲を指す。C側処理系全体の対応や論文の目標定理を意味しない。性能実験は各条件一回の予備測定であり、統計的評価や多項式時間の根拠ではない。具体的な測定値・実行条件・既存バイナリの制約は`IMPLEMENTATION.md`の実験節に記録する。
+
+### 型引数収集器とC実装の対応範囲
+
+`src/nlisp.c` の `match_type` と `NLisp.Surface.collectArgument` は、単相型木を対象に、List/Optionの要素と関数型の仮引数・戻り値を同じ順で再帰照合する。量化変数の初回出現では実引数型を記録し、再出現では既記録型との構文的な完全一致を要求する。Cの `check_call` は仮引数を左から走査し、全型変数が埋まった後に戻り値型を置換する。Leanの `collectArguments` と `inferTypeArguments` も仮引数列だけを走査し、全変数の割当てを要求してから解を返す。両者とも期待戻り値型を使わず、呼び出し側の型変数を再帰的に解決しない。
+
+| C実装 | Leanモデル | 差分・未証明事項 |
+| --- | --- | --- |
+| 型変数へのポインタ同一性 (`scheme->variables`) | シグネチャ内の de Bruijn index (`Ty.var`) | 名前解決・`Type*`構築から添字型への一般的な表現対応は未証明 |
+| `Type **sub` のnull/既割当分岐 | `List (Option Ty)` の更新・比較 | 成功結果の健全性と一意性は証明済み。C配列操作とのシミュレーションは未証明 |
+| `monotype(actual)` によるforall排除 | `Ty`文法にforall構築子がない | Leanモデルの型表現が単相であることによる一致。Cの全呼び出し経路との対応は未証明 |
+| `match_type` のkind・arity・子型照合 | `collectArgument` の構造再帰 | 一般入力についてのC実装対Lean関数の定理、収集アルゴリズムの完全性、明示的fuel上界は未証明 |
+
+これはソースコードとモデルのアルゴリズム構造を比較した記述であり、「Cの型引数推論との一般的な形式対応」を完了とする根拠にはしない。タスク一覧では対応定理、完全性、構造的fuel上界を別々の未完了項目として管理する。
 
 2026-11-19追補: Phase 1の証書計算は `NLisp.ExpansionCertificate.Certificate` と `check` により実装した。マクロ規則名・origin・fuel・fresh区間と入出力、リスト文脈、推移合成を証書に保持し、規則所属・パターン照合・`copyWithMacros` は検査器が再計算する。`check_sound` は受理から `CExpansion.Expands` を導く。`checkFresh` は証書の区間非重複も要求し、`checkFresh_sound` と `checkFresh_intervals` が有限展開と区間条件をそれぞれ導く。さらに `disjoint_interval_counters_differ` と `checkFresh_separates_interval_counters` により、異なる受理済み区間内のカウンタ値が一致しないことを証明した。`CMacroCopy.binder_success_counter` と `sequential_binders_have_distinct_tokens` は、個々の連続binder呼び出しがcounterを1ずつ進め、異なるtokenを出力する性質を証明する。`tools/verify_lean.py` は展開トレースをこの証書データへ変換し、生成証書がfreshness付き検査を受理することもLeanで確認する。Phase 1の完了条件は `examples/macros.nlisp` の単一ファイル証明書で確認した。
 

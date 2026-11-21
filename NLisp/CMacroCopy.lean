@@ -42,12 +42,121 @@ noncomputable def treeDecEq : DecidableEq Tree :=
 
 noncomputable instance : DecidableEq Tree := treeDecEq
 
+/- Count the full constructor payload of a syntax tree. The nested recursor
+keeps this measure independent of the sizes of atom names and numeric fields. -/
+noncomputable def treeNodeCount : Tree → Nat :=
+  Tree.rec
+    (motive_1 := fun _ => Nat)
+    (motive_2 := fun _ => Nat)
+    (fun _ => 1)
+    (fun _ children => children + 1)
+    0
+    (fun _ _ head tail => head + tail)
+
+noncomputable def treeListNodeCount : List Tree → Nat :=
+  Tree.rec_1
+    (motive_1 := fun _ => Nat)
+    (motive_2 := fun _ => Nat)
+    (fun _ => 1)
+    (fun _ children => children + 1)
+    0
+    (fun _ _ head tail => head + tail)
+
+theorem treeNodeCount_list (trees : List Tree) :
+    treeNodeCount (.list trees) = treeListNodeCount trees + 1 := rfl
+
+theorem treeListNodeCount_append (left right : List Tree) :
+    treeListNodeCount (left ++ right) = treeListNodeCount left + treeListNodeCount right := by
+  induction left with
+  | nil => simp [treeListNodeCount]
+  | cons head tail ih =>
+      change treeNodeCount head + treeListNodeCount (tail ++ right) =
+        (treeNodeCount head + treeListNodeCount tail) + treeListNodeCount right
+      rw [ih]
+      exact (Nat.add_assoc _ _ _).symm
+
+theorem option_map_eq_bind_some {α β : Type} (result : Option α) (f : α → β) :
+    result.map f = result.bind (fun value => some (f value)) := by
+  cases result <;> rfl
+
+/- Conservative structural cost for an equality decision: charge one unit for
+every constructor in the left operand, even when the comparison would stop at
+an earlier mismatch. Atom payload comparisons and their bit cost are excluded. -/
+noncomputable def treeEqWithWorstCaseCost (left right : Tree) : Bool × Nat :=
+  (decide (left = right), treeNodeCount left)
+
+theorem treeEqWithWorstCaseCost_result (left right : Tree) :
+    (treeEqWithWorstCaseCost left right).1 = decide (left = right) := rfl
+
+theorem treeEqWithWorstCaseCost_cost (left right : Tree) :
+    (treeEqWithWorstCaseCost left right).2 = treeNodeCount left := rfl
+
 abbrev Holes := List (String × Tree)
 abbrev Renames := List (String × Atom)
 
 def lookup (name : String) : List (String × α) → Option α
   | [] => none
   | (key, value) :: tail => if name = key then some value else lookup name tail
+
+/- Instrumented environment lookup: one unit is charged for each examined key,
+including the successful key. String comparison itself is treated as one unit
+here; its bit cost is outside this structural model. -/
+def lookupWithCost (name : String) : List (String × α) → Option α × Nat
+  | [] => (none, 0)
+  | (key, value) :: tail =>
+      if name = key then (some value, 1)
+      else
+        let (result, cost) := lookupWithCost name tail
+        (result, cost + 1)
+
+theorem lookupWithCost_result (name : String) (entries : List (String × α)) :
+    (lookupWithCost name entries).1 = lookup name entries := by
+  induction entries with
+  | nil => rfl
+  | cons entry tail ih =>
+      rcases entry with ⟨key, value⟩
+      by_cases same : name = key
+      · simp [lookupWithCost, lookup, same]
+      · simp [lookupWithCost, lookup, same, ih]
+
+theorem lookupWithCost_cost_le_length (name : String) (entries : List (String × α)) :
+    (lookupWithCost name entries).2 ≤ entries.length := by
+  induction entries with
+  | nil => simp [lookupWithCost]
+  | cons entry tail ih =>
+      rcases entry with ⟨key, value⟩
+      by_cases same : name = key
+      · simp [lookupWithCost, same]
+      · simp [lookupWithCost, same, List.length_cons]
+        omega
+
+theorem lookupWithCost_miss_scans_all (name : String) (entries : List (String × α))
+    (missing : lookup name entries = none) :
+    (lookupWithCost name entries).2 = entries.length := by
+  induction entries with
+  | nil => rfl
+  | cons entry tail ih =>
+      rcases entry with ⟨key, value⟩
+      by_cases same : name = key
+      · simp [lookup, same] at missing
+      · have tailMissing : lookup name tail = none := by
+          simpa [lookup, same] using missing
+        simp [lookupWithCost, lookup, same, ih tailMissing, List.length_cons]
+
+theorem lookup_isSome_of_mem_keys (name : String) (entries : List (String × α))
+    (member : name ∈ entries.map Prod.fst) : (lookup name entries).isSome = true := by
+  induction entries with
+  | nil => simp at member
+  | cons entry tail ih =>
+      rcases entry with ⟨key, value⟩
+      simp only [List.map_cons, List.mem_cons] at member
+      by_cases same : name = key
+      · simp [lookup, same]
+      · simp only [lookup, same]
+        apply ih
+        rcases member with equal | rest
+        · exact False.elim (same equal)
+        · exact rest
 
 def named (tree : Tree) (name : String) : Bool :=
   match tree with
@@ -64,6 +173,58 @@ def binder (holes : Holes) (renames : Renames) (fresh : Nat) (tree : Tree) :
       some (.atom b, (a.name, b) :: renames, next)
   | _ => none
 
+/- Instrument the environment lookup performed by `binder`. Identifier
+validation is not charged here; if it succeeds, one unit is charged for each
+hole key examined by the structural lookup model above. -/
+def binderWithLookupCost (holes : Holes) (renames : Renames) (fresh : Nat)
+    (tree : Tree) : Option (Tree × Renames × Nat) × Nat :=
+  match tree with
+  | .atom a =>
+      if !Lexical.identifier a.name then (none, 0) else
+      let (found, cost) := lookupWithCost a.name holes
+      if found.isSome then (none, cost) else
+      let next := fresh + 1
+      let b : Atom := ⟨"#%nlisp" ++ toString next, a.origin, 3 * next + 2⟩
+      (some (.atom b, (a.name, b) :: renames, next), cost)
+  | .list _ => (none, 0)
+
+theorem binderWithLookupCost_result (holes : Holes) (renames : Renames)
+    (fresh : Nat) (tree : Tree) :
+    (binderWithLookupCost holes renames fresh tree).1 = binder holes renames fresh tree := by
+  cases tree with
+  | list items => rfl
+  | atom a =>
+      by_cases valid : Lexical.identifier a.name = true
+      · by_cases found : (lookup a.name holes).isSome = true
+        · simp [binderWithLookupCost, binder, valid, found, lookupWithCost_result]
+        · simp [binderWithLookupCost, binder, valid, found, lookupWithCost_result]
+      · simp [binderWithLookupCost, binder, valid]
+
+theorem binderWithLookupCost_cost_le_holes (holes : Holes) (renames : Renames)
+    (fresh : Nat) (tree : Tree) :
+    (binderWithLookupCost holes renames fresh tree).2 ≤ holes.length := by
+  cases tree with
+  | list items => simp [binderWithLookupCost]
+  | atom a =>
+      by_cases valid : Lexical.identifier a.name = true
+      · by_cases found : (lookupWithCost a.name holes).1.isSome = true
+        · simpa [binderWithLookupCost, valid, found] using
+            lookupWithCost_cost_le_length a.name holes
+        · simpa [binderWithLookupCost, valid, found] using
+            lookupWithCost_cost_le_length a.name holes
+      · simp [binderWithLookupCost, valid]
+
+theorem binderScanStep_cost_le (cost holeCount tailLength : Nat)
+    (costBound : cost ≤ holeCount) :
+    cost + 1 ≤ (tailLength + 1) * (holeCount + 1) + 1 := by
+  have productNonnegative : 0 ≤ tailLength * (holeCount + 1) := Nat.zero_le _
+  calc
+    cost + 1 ≤ holeCount + 1 := Nat.add_le_add_right costBound 1
+    _ ≤ holeCount + (tailLength * (holeCount + 1)) + 2 := by omega
+    _ = (tailLength + 1) * (holeCount + 1) + 1 := by
+      simp [Nat.succ_mul]
+      omega
+
 theorem binder_success_counter (holes : Holes) (renames : Renames) (fresh : Nat)
     (tree : Tree) (copied : Tree) (names : Renames) (final : Nat)
     (accepted : binder holes renames fresh tree = some (copied, names, final)) :
@@ -77,6 +238,39 @@ theorem binder_success_counter (holes : Holes) (renames : Renames) (fresh : Nat)
       · simp only [Option.some.injEq, Prod.mk.injEq, Tree.atom.injEq] at accepted
         rcases accepted with ⟨rfl, _, rfl⟩
         exact ⟨_, rfl, rfl, rfl⟩
+
+/- C stores generated identities in size_t using 3*counter+2. The C helper
+rejects a step when the next counter would make that identity unrepresentable. -/
+def nextFreshScope (sizeMax fresh : Nat) : Option Nat :=
+  if fresh < (sizeMax - 2) / 3 then some (fresh + 1) else none
+
+theorem nextFreshScope_identity_fits (sizeMax fresh final : Nat)
+    (sizeMax_ge_two : 2 ≤ sizeMax)
+    (step : nextFreshScope sizeMax fresh = some final) :
+    final = fresh + 1 ∧ 3 * final + 2 ≤ sizeMax := by
+  unfold nextFreshScope at step
+  split at step
+  · simp only [Option.some.injEq] at step
+    subst final
+    constructor
+    · rfl
+    · omega
+  · simp at step
+
+theorem binder_success_identity_fits_c_range (sizeMax : Nat) (holes : Holes)
+    (renames : Renames) (fresh : Nat) (tree copied : Tree)
+    (names : Renames) (final : Nat)
+    (accepted : binder holes renames fresh tree = some (copied, names, final))
+    (sizeMax_ge_two : 2 ≤ sizeMax)
+    (freshStep : nextFreshScope sizeMax fresh = some final) :
+    ∃ atom, copied = .atom atom ∧ final = fresh + 1 ∧ atom.token ≤ sizeMax := by
+  obtain ⟨atom, shape, counter, token⟩ :=
+    binder_success_counter holes renames fresh tree copied names final accepted
+  obtain ⟨_, identityFits⟩ :=
+    nextFreshScope_identity_fits sizeMax fresh final sizeMax_ge_two freshStep
+  refine ⟨atom, shape, counter, ?_⟩
+  rw [token]
+  exact identityFits
 
 theorem sequential_binders_have_distinct_tokens
     (firstHoles : Holes) (firstRenames : Renames) (fresh : Nat) (firstTree : Tree)
@@ -262,6 +456,405 @@ def copyPatternWithMacros (macros : List String) (fuel : Nat) :=
   (operations macros fuel).copyPattern
 def copyCasesWithMacros (macros : List String) (fuel : Nat) :=
   (operations macros fuel).copyCases
+
+/- Partial cost model for parameter-binder copying. Each parameter-list node
+costs one unit for the structural scan, and binder lookup charges the number
+of examined hole keys. Type payload copying/validation is not included. -/
+def copyParametersWithLookupCost : Nat → Holes → Renames → Nat → List Tree →
+    Option (List Tree × Renames × Nat) × Nat
+  | 0, _, _, _, _ => (none, 1)
+  | fuel + 1, holes, renames, fresh, [] => (some ([], renames, fresh), 1)
+  | fuel + 1, holes, renames, fresh, .list [name, type] :: tail =>
+      let binderResult := binderWithLookupCost holes renames fresh name
+      match binderResult.1 with
+      | none => (none, binderResult.2 + 1)
+      | some (nameCopy, names, next) =>
+          let tailResult := copyParametersWithLookupCost fuel holes names next tail
+          (tailResult.1.map (fun (tailCopy, finalNames, final) =>
+            (.list [nameCopy, type] :: tailCopy, finalNames, final)), binderResult.2 + tailResult.2 + 1)
+  | fuel + 1, _, _, _, _ :: _ => (none, 1)
+
+theorem copyParametersWithLookupCost_result (fuel : Nat) (holes : Holes)
+    (renames : Renames) (fresh : Nat) (trees : List Tree) :
+    (copyParametersWithLookupCost fuel holes renames fresh trees).1 =
+      copyParameters fuel holes renames fresh trees := by
+  induction fuel generalizing holes renames fresh trees with
+  | zero => rfl
+  | succ fuel ih =>
+      cases trees with
+      | nil => rfl
+      | cons head tail =>
+          cases head with
+          | atom atom => rfl
+          | list items =>
+              cases items with
+              | nil => rfl
+              | cons name rest =>
+                  cases rest with
+                  | nil => rfl
+                  | cons type extra =>
+                      cases extra with
+                      | cons extraHead extraTail => rfl
+                      | nil =>
+                          cases lookupResult : binderWithLookupCost holes renames fresh name with
+                          | mk binderResult binderCost =>
+                              have binderResultEq : binder holes renames fresh name = binderResult := by
+                                have resultEq := binderWithLookupCost_result holes renames fresh name
+                                simpa [lookupResult] using resultEq.symm
+                              cases binderResult with
+                              | none => simp [copyParametersWithLookupCost, copyParameters,
+                                  operations, lookupResult, binderResultEq]
+                              | some result =>
+                                  rcases result with ⟨nameCopy, names, next⟩
+                                  cases tailResult : copyParametersWithLookupCost fuel holes names next tail with
+                                  | mk tailEntries tailCost =>
+                                      have tailEntriesEq :
+                                          tailEntries = copyParameters fuel holes names next tail := by
+                                        have tailEquality := ih holes names next tail
+                                        rw [tailResult] at tailEquality
+                                        exact tailEquality
+                                      simp only [copyParametersWithLookupCost, lookupResult,
+                                        tailResult]
+                                      rw [tailEntriesEq, option_map_eq_bind_some]
+                                      simp [copyParametersWithLookupCost, copyParameters,
+                                        operations, lookupResult, binderResultEq, tailResult,
+                                        Option.bind]
+
+theorem copyParametersWithLookupCost_cost_le (fuel : Nat) (holes : Holes)
+    (renames : Renames) (fresh : Nat) (trees : List Tree) :
+    (copyParametersWithLookupCost fuel holes renames fresh trees).2 ≤
+      trees.length * (holes.length + 1) + 1 := by
+  induction fuel generalizing holes renames fresh trees with
+  | zero => simp [copyParametersWithLookupCost]
+  | succ fuel ih =>
+      cases trees with
+      | nil => simp [copyParametersWithLookupCost]
+      | cons head tail =>
+          cases head with
+          | atom atom => simp [copyParametersWithLookupCost, List.length_cons]
+          | list items =>
+              cases items with
+              | nil => simp [copyParametersWithLookupCost, List.length_cons]
+              | cons name rest =>
+                  cases rest with
+                  | nil => simp [copyParametersWithLookupCost, List.length_cons]
+                  | cons type extra =>
+                      cases extra with
+                      | cons extraHead extraTail =>
+                          simp [copyParametersWithLookupCost, List.length_cons]
+                      | nil =>
+                          cases lookupResult : binderWithLookupCost holes renames fresh name with
+                          | mk binderResult binderCost =>
+                              have binderBound := binderWithLookupCost_cost_le_holes
+                                holes renames fresh name
+                              have costBound : binderCost ≤ holes.length := by
+                                simpa [lookupResult] using binderBound
+                              cases binderResult with
+                              | none =>
+                                  simp only [copyParametersWithLookupCost, lookupResult,
+                                    List.length_cons]
+                                  exact binderScanStep_cost_le binderCost holes.length
+                                    tail.length costBound
+                              | some result =>
+                                  rcases result with ⟨nameCopy, names, next⟩
+                                  cases tailResult : copyParametersWithLookupCost
+                                      fuel holes names next tail with
+                                  | mk tailEntries tailCost =>
+                                      have tailBound := ih holes names next tail
+                                      rw [tailResult] at tailBound
+                                      simp only [copyParametersWithLookupCost, lookupResult,
+                                        tailResult, List.length_cons]
+                                      have combinedBound :
+                                          binderCost + tailCost ≤ holes.length +
+                                            (tail.length * (holes.length + 1) + 1) :=
+                                        Nat.add_le_add costBound tailBound
+                                      calc
+                                        binderCost + tailCost + 1 ≤
+                                            holes.length +
+                                              (tail.length * (holes.length + 1) + 1) + 1 :=
+                                          Nat.add_le_add_right combinedBound 1
+                                        _ = (tail.length + 1) * (holes.length + 1) + 1 := by
+                                          simp [Nat.succ_mul]
+                                          omega
+
+def copyPatternWithLookupCost (macros : List String) : Nat → Holes → Renames → Nat → List Tree →
+    Option (List Tree × Renames × Nat) × Nat
+  | 0, _, _, _, _ => (none, 1)
+  | fuel + 1, holes, renames, fresh, [] => (some ([], renames, fresh), 1)
+  | fuel + 1, holes, renames, fresh, head :: tail =>
+      let binderResult := binderWithLookupCost holes renames fresh head
+      match binderResult.1 with
+      | none => (none, binderResult.2 + 1)
+      | some (headCopy, names, next) =>
+          let tailResult := copyPatternWithLookupCost macros fuel holes names next tail
+          (tailResult.1.map (fun (tailCopy, finalNames, final) =>
+            (headCopy :: tailCopy, finalNames, final)), binderResult.2 + tailResult.2 + 1)
+
+theorem copyPatternWithLookupCost_result (macros : List String) (fuel : Nat) (holes : Holes)
+    (renames : Renames) (fresh : Nat) (trees : List Tree) :
+    (copyPatternWithLookupCost macros fuel holes renames fresh trees).1 =
+      copyPatternWithMacros macros fuel holes renames fresh trees := by
+  induction fuel generalizing holes renames fresh trees with
+  | zero => rfl
+  | succ fuel ih =>
+      cases trees with
+      | nil => rfl
+      | cons head tail =>
+          cases lookupResult : binderWithLookupCost holes renames fresh head with
+          | mk binderResult binderCost =>
+              have binderResultEq : binder holes renames fresh head = binderResult := by
+                have resultEq := binderWithLookupCost_result holes renames fresh head
+                simpa [lookupResult] using resultEq.symm
+              cases binderResult with
+              | none => simp [copyPatternWithLookupCost, copyPatternWithMacros, operations,
+                  lookupResult, binderResultEq]
+              | some result =>
+                  rcases result with ⟨headCopy, names, next⟩
+                  cases tailResult : copyPatternWithLookupCost macros fuel holes names next tail with
+                  | mk tailEntries tailCost =>
+                      have tailEntriesEq :
+                          tailEntries = (operations macros fuel).copyPattern holes names next tail := by
+                        have tailEquality := ih holes names next tail
+                        rw [tailResult] at tailEquality
+                        exact tailEquality
+                      simp only [copyPatternWithLookupCost, lookupResult, tailResult]
+                      rw [tailEntriesEq, option_map_eq_bind_some]
+                      simp [copyPatternWithLookupCost, copyPatternWithMacros, operations,
+                        lookupResult, binderResultEq, tailResult, Option.bind]
+
+theorem copyPatternWithLookupCost_cost_le (macros : List String) (fuel : Nat) (holes : Holes)
+    (renames : Renames) (fresh : Nat) (trees : List Tree) :
+    (copyPatternWithLookupCost macros fuel holes renames fresh trees).2 ≤
+      trees.length * (holes.length + 1) + 1 := by
+  induction fuel generalizing holes renames fresh trees with
+  | zero => simp [copyPatternWithLookupCost]
+  | succ fuel ih =>
+      cases trees with
+      | nil => simp [copyPatternWithLookupCost]
+      | cons head tail =>
+          cases lookupResult : binderWithLookupCost holes renames fresh head with
+          | mk binderResult binderCost =>
+              have binderBound := binderWithLookupCost_cost_le_holes
+                holes renames fresh head
+              have costBound : binderCost ≤ holes.length := by
+                simpa [lookupResult] using binderBound
+              cases binderResult with
+              | none =>
+                  simp only [copyPatternWithLookupCost, lookupResult, List.length_cons]
+                  exact binderScanStep_cost_le binderCost holes.length tail.length costBound
+              | some result =>
+                  rcases result with ⟨headCopy, names, next⟩
+                  cases tailResult : copyPatternWithLookupCost macros fuel holes names next tail with
+                  | mk tailEntries tailCost =>
+                      have tailBound := ih holes names next tail
+                      rw [tailResult] at tailBound
+                      simp only [copyPatternWithLookupCost, lookupResult, tailResult,
+                        List.length_cons]
+                      have combinedBound :
+                          binderCost + tailCost ≤ holes.length +
+                            (tail.length * (holes.length + 1) + 1) :=
+                        Nat.add_le_add costBound tailBound
+                      calc
+                        binderCost + tailCost + 1 ≤
+                            holes.length + (tail.length * (holes.length + 1) + 1) + 1 :=
+                          Nat.add_le_add_right combinedBound 1
+                        _ = (tail.length + 1) * (holes.length + 1) + 1 := by
+                          simp [Nat.succ_mul]
+                          omega
+
+/- Partial cost model for let binding rows. Binder lookup and binding-row
+traversal are counted; the initializer copy is executed by the ordinary
+implementation and its internal work is deliberately excluded. -/
+def copyBindingsWithBinderLookupCost (macros : List String) : Nat → Nat → Holes →
+    Renames → Renames → Nat → List Tree →
+    Option (List Tree × Renames × Nat) × Nat
+  | 0, _, _, _, _, _, _ => (none, 1)
+  | fuel + 1, origin, holes, outside, names, fresh, [] =>
+      (some ([], names, fresh), 1)
+  | fuel + 1, origin, holes, outside, names, fresh,
+      .list [.list [name, type], value] :: tail =>
+      let binderResult := binderWithLookupCost holes names fresh name
+      match binderResult.1 with
+      | none => (none, binderResult.2 + 1)
+      | some (nameCopy, names', next) =>
+          match copyWithMacros macros fuel origin holes outside next value with
+          | none => (none, binderResult.2 + 1)
+          | some (valueCopy, afterValue) =>
+              let tailResult := copyBindingsWithBinderLookupCost macros fuel origin holes
+                outside names' afterValue tail
+              (tailResult.1.map (fun (tailCopy, finalNames, final) =>
+                (.list [.list [nameCopy, type], valueCopy] :: tailCopy, finalNames, final)),
+                binderResult.2 + tailResult.2 + 1)
+  | fuel + 1, _, _, _, _, _, _ :: _ => (none, 1)
+
+theorem copyBindingsWithBinderLookupCost_result (macros : List String) (fuel origin : Nat)
+    (holes : Holes) (outside names : Renames) (fresh : Nat) (trees : List Tree) :
+    (copyBindingsWithBinderLookupCost macros fuel origin holes outside names fresh trees).1 =
+      copyBindingsWithMacros macros fuel origin holes outside names fresh trees := by
+  induction fuel generalizing origin holes outside names fresh trees with
+  | zero => rfl
+  | succ fuel ih =>
+      cases trees with
+      | nil => rfl
+      | cons head tail =>
+          cases head with
+          | atom atom => simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+          | list rows =>
+              cases rows with
+              | nil => simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+              | cons binding rest =>
+                  cases rest with
+                  | nil => simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+                  | cons value extra =>
+                      cases extra with
+                      | cons extraHead extraTail =>
+                          simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+                      | nil =>
+                          cases binding with
+                          | atom atom =>
+                              simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+                          | list fields =>
+                              cases fields with
+                              | nil =>
+                                  simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+                              | cons name restFields =>
+                                  cases restFields with
+                                  | nil =>
+                                      simp [copyBindingsWithBinderLookupCost, copyBindingsWithMacros, operations]
+                                  | cons type fieldTail =>
+                                      cases fieldTail with
+                                      | cons extraField extraFields =>
+                                          simp [copyBindingsWithBinderLookupCost,
+                                            copyBindingsWithMacros, operations]
+                                      | nil =>
+                                          cases lookupResult : binderWithLookupCost holes names fresh name with
+                                          | mk binderResult binderCost =>
+                                              have binderResultEq : binder holes names fresh name = binderResult := by
+                                                have resultEq := binderWithLookupCost_result holes names fresh name
+                                                simpa [lookupResult] using resultEq.symm
+                                              cases binderResult with
+                                              | none => simp [copyBindingsWithBinderLookupCost,
+                                                  copyBindingsWithMacros, operations, lookupResult,
+                                                  binderResultEq]
+                                              | some result =>
+                                                  rcases result with ⟨nameCopy, names', next⟩
+                                                  cases valueResult : copyWithMacros macros fuel origin
+                                                      holes outside next value with
+                                                  | none =>
+                                                      have valueResultEq :
+                                                          (operations macros fuel).copy origin holes
+                                                            outside next value = none := by
+                                                        simpa [copyWithMacros] using valueResult
+                                                      simp only [copyBindingsWithBinderLookupCost,
+                                                        lookupResult, valueResult]
+                                                      simp [copyBindingsWithMacros, operations,
+                                                        binderResultEq, valueResultEq,
+                                                        copyWithMacros, Option.bind]
+                                                  | some copiedValue =>
+                                                      rcases copiedValue with ⟨valueCopy, afterValue⟩
+                                                      have valueResultEq :
+                                                          (operations macros fuel).copy origin holes
+                                                            outside next value = some (valueCopy, afterValue) := by
+                                                        simpa [copyWithMacros] using valueResult
+                                                      cases tailResult : copyBindingsWithBinderLookupCost
+                                                          macros fuel origin holes outside names' afterValue tail with
+                                                      | mk tailEntries tailCost =>
+                                                          have tailEntriesEq :
+                                                              tailEntries = (operations macros fuel).copyBindings
+                                                                origin holes outside names' afterValue tail := by
+                                                            have tailEquality := ih origin holes outside
+                                                              names' afterValue tail
+                                                            rw [tailResult] at tailEquality
+                                                            exact tailEquality
+                                                          simp only [copyBindingsWithBinderLookupCost,
+                                                            lookupResult, valueResult, tailResult]
+                                                          simp [copyBindingsWithMacros, operations,
+                                                            binderResultEq, valueResultEq,
+                                                            tailEntriesEq, option_map_eq_bind_some,
+                                                            copyWithMacros, Option.bind]
+
+theorem copyBindingsWithBinderLookupCost_cost_le (macros : List String) (fuel origin : Nat)
+    (holes : Holes) (outside names : Renames) (fresh : Nat) (trees : List Tree) :
+    (copyBindingsWithBinderLookupCost macros fuel origin holes outside names fresh trees).2 ≤
+      trees.length * (holes.length + 1) + 1 := by
+  induction fuel generalizing origin holes outside names fresh trees with
+  | zero => simp [copyBindingsWithBinderLookupCost]
+  | succ fuel ih =>
+      cases trees with
+      | nil => simp [copyBindingsWithBinderLookupCost]
+      | cons head tail =>
+          cases head with
+          | atom atom => simp [copyBindingsWithBinderLookupCost, List.length_cons]
+          | list rows =>
+              cases rows with
+              | nil => simp [copyBindingsWithBinderLookupCost, List.length_cons]
+              | cons binding rest =>
+                  cases rest with
+                  | nil => simp [copyBindingsWithBinderLookupCost, List.length_cons]
+                  | cons value extra =>
+                      cases extra with
+                      | cons extraHead extraTail =>
+                          simp [copyBindingsWithBinderLookupCost, List.length_cons]
+                      | nil =>
+                          cases binding with
+                          | atom atom => simp [copyBindingsWithBinderLookupCost, List.length_cons]
+                          | list fields =>
+                              cases fields with
+                              | nil => simp [copyBindingsWithBinderLookupCost, List.length_cons]
+                              | cons name restFields =>
+                                  cases restFields with
+                                  | nil => simp [copyBindingsWithBinderLookupCost, List.length_cons]
+                                  | cons type fieldTail =>
+                                      cases fieldTail with
+                                      | cons extraField extraFields =>
+                                          simp [copyBindingsWithBinderLookupCost, List.length_cons]
+                                      | nil =>
+                                          cases lookupResult : binderWithLookupCost holes names fresh name with
+                                          | mk binderResult binderCost =>
+                                              have binderBound := binderWithLookupCost_cost_le_holes
+                                                holes names fresh name
+                                              have costBound : binderCost ≤ holes.length := by
+                                                simpa [lookupResult] using binderBound
+                                              cases binderResult with
+                                              | none =>
+                                                  simp only [copyBindingsWithBinderLookupCost,
+                                                    lookupResult, List.length_cons]
+                                                  exact binderScanStep_cost_le binderCost
+                                                    holes.length tail.length costBound
+                                              | some result =>
+                                                  rcases result with ⟨nameCopy, names', next⟩
+                                                  cases valueResult : copyWithMacros macros fuel origin
+                                                      holes outside next value with
+                                                  | none =>
+                                                      simp only [copyBindingsWithBinderLookupCost,
+                                                        lookupResult, valueResult, List.length_cons]
+                                                      exact binderScanStep_cost_le binderCost
+                                                        holes.length tail.length costBound
+                                                  | some copiedValue =>
+                                                      rcases copiedValue with ⟨valueCopy, afterValue⟩
+                                                      cases tailResult : copyBindingsWithBinderLookupCost
+                                                          macros fuel origin holes outside names'
+                                                          afterValue tail with
+                                                      | mk tailEntries tailCost =>
+                                                          have tailBound := ih origin holes outside
+                                                            names' afterValue tail
+                                                          rw [tailResult] at tailBound
+                                                          simp only [copyBindingsWithBinderLookupCost,
+                                                            lookupResult, valueResult, tailResult,
+                                                            List.length_cons]
+                                                          have combinedBound :
+                                                              binderCost + tailCost ≤ holes.length +
+                                                                (tail.length * (holes.length + 1) + 1) :=
+                                                            Nat.add_le_add costBound tailBound
+                                                          calc
+                                                            binderCost + tailCost + 1 ≤
+                                                                holes.length +
+                                                                  (tail.length * (holes.length + 1) + 1) + 1 :=
+                                                              Nat.add_le_add_right combinedBound 1
+                                                            _ = (tail.length + 1) *
+                                                                (holes.length + 1) + 1 := by
+                                                              simp [Nat.succ_mul]
+                                                              omega
 
 def counterTokens (fresh : Nat) : Nat → List Nat
   | 0 => []
@@ -683,6 +1276,109 @@ theorem copyManyWithMacros_preserving_counter (macros : List String) (fuel origi
                       exact tailResult)
                   rw [← finalEq, tailCounter, headCounter]
 
+def counterNeutralListHead (macros : List String) : List Tree → Bool
+  | .atom head :: _ =>
+      !(macros.contains head.name) && head.name != "match" &&
+        head.name != "let" && head.name != "lambda"
+  | _ => true
+
+theorem copyNeutralList_uses_copyMany (macros : List String) (fuel origin : Nat)
+    (holes : Holes) (renames : Renames) (fresh : Nat) (items : List Tree)
+    (headSafe : counterNeutralListHead macros items = true) :
+    (operations macros (fuel + 1)).copy origin holes renames fresh (.list items) = (do
+      let (copies, final) ← (operations macros fuel).copyMany origin holes renames fresh items
+      pure (.list copies, final)) := by
+  cases items with
+  | nil => simp only [operations]
+  | cons first tail =>
+      cases first with
+      | list nested =>
+          cases tail with
+          | nil => simp only [operations] at *
+          | cons second tail =>
+              cases tail with
+              | nil => simp only [operations] at *
+              | cons third tail =>
+                  cases tail with
+                  | nil =>
+                      simp only [operations] at *
+                      cases second <;> simp_all [named]
+                  | cons fourth tail =>
+                      cases tail with
+                      | nil =>
+                          simp only [operations] at *
+                          cases second <;> simp_all [named]
+                      | cons fifth tail => simp only [operations] at *; simp_all [named]
+      | atom head =>
+          cases tail with
+          | nil => simp only [operations] at *; simp_all [named, counterNeutralListHead]
+          | cons second tail =>
+              cases tail with
+              | nil => simp only [operations] at *; simp_all [named, counterNeutralListHead]
+              | cons third tail =>
+                  cases tail with
+                  | nil =>
+                      simp only [operations] at *
+                      cases second <;> simp_all [named, counterNeutralListHead]
+                  | cons fourth tail =>
+                      cases tail with
+                      | nil =>
+                          simp only [operations] at *
+                          cases second <;> simp_all [named, counterNeutralListHead]
+                      | cons fifth tail => simp only [operations] at *; simp_all [named, counterNeutralListHead]
+
+mutual
+  inductive CounterNeutralTree (macros : List String) : Tree → Prop where
+    | atom (value : Atom) : CounterNeutralTree macros (.atom value)
+    | list (items : List Tree) (headSafe : counterNeutralListHead macros items = true)
+        (children : CounterNeutralTrees macros items) :
+        CounterNeutralTree macros (.list items)
+
+  inductive CounterNeutralTrees (macros : List String) : List Tree → Prop where
+    | nil : CounterNeutralTrees macros []
+    | cons (head : Tree) (headSafe : CounterNeutralTree macros head)
+        (tail : List Tree) (tailSafe : CounterNeutralTrees macros tail) :
+        CounterNeutralTrees macros (head :: tail)
+end
+
+theorem counterNeutralTree_preserving (macros : List String) (value : Tree)
+    (safe : CounterNeutralTree macros value) : CounterPreservingInitializer macros value := by
+  refine CounterNeutralTree.rec
+    (motive_1 := fun value _ => CounterPreservingInitializer macros value)
+    (motive_2 := fun trees _ => CounterPreservingTrees macros trees)
+    ?_ ?_ ?_ ?_ safe
+  · intro atom
+    exact atom_initializer_counter_preserving macros atom
+  · intro items headSafe _children childrenIH
+    intro fuel origin holes renames fresh copied final accepted
+    cases fuel with
+    | zero => simp [copyWithMacros, operations] at accepted
+    | succ fuel =>
+        change (operations macros (fuel + 1)).copy origin holes renames fresh (.list items) =
+          some (copied, final) at accepted
+        rw [copyNeutralList_uses_copyMany macros fuel origin holes renames fresh items headSafe]
+          at accepted
+        cases copied with
+        | atom atom => simp at accepted
+        | list copiedItems =>
+            generalize manyRun : (operations macros fuel).copyMany origin holes renames
+                fresh items = manyOption at accepted
+            cases manyOption with
+            | none => simp [manyRun] at accepted
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    items = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh items = _
+                  exact manyRun
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh items manyCopies middle childrenIH manyAccepted
+                simp [manyRun] at accepted
+                omega
+  · exact CounterPreservingTrees.nil
+  · intro head _headSafe tail _tailSafe headIH tailIH
+    exact .cons head headIH tail tailIH
+
 theorem copyWithMacros_single_atom_list_keeps_counter (macros : List String)
     (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
     (atom : Atom) (copied : Tree) (final : Nat)
@@ -1031,9 +1727,238 @@ theorem copyWithMacros_atomTrees_keeps_counter (macros : List String)
                             simp [manyRun] at ordinary
                             omega
 
+theorem copyWithMacros_singleton_child_preserves_counter (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (child : Tree) (childSafe : CounterPreservingInitializer macros child)
+    (copied : Tree) (final : Nat)
+    (accepted : copyWithMacros macros fuel origin holes renames fresh (.list [child]) =
+      some (copied, final)) : final = fresh := by
+  cases child with
+  | atom atom =>
+      exact copyWithMacros_single_atom_list_keeps_counter macros fuel origin holes renames fresh
+        atom copied final accepted
+  | list children =>
+      cases fuel with
+      | zero => simp [copyWithMacros, operations] at accepted
+      | succ fuel =>
+          cases copied with
+          | atom atom => simp [copyWithMacros, operations] at accepted
+          | list copiedChildren =>
+              simp only [copyWithMacros, operations] at accepted
+              generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+                [.list children] = manyOption at accepted
+              cases manyOption with
+              | none => simp [manyRun] at accepted
+              | some result =>
+                  rcases result with ⟨manyCopies, middle⟩
+                  have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                      [.list children] = some (manyCopies, middle) := by
+                    change (operations macros fuel).copyMany origin holes renames fresh
+                      [.list children] = _
+                    exact manyRun
+                  have manySafe : CounterPreservingTrees macros [.list children] :=
+                    .cons (.list children) childSafe [] .nil
+                  have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                    renames fresh [.list children] manyCopies middle manySafe manyAccepted
+                  simp [manyRun] at accepted
+                  omega
+
+theorem copyWithMacros_pair_child_preserves_counter (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (head : Atom) (child : Tree) (childSafe : CounterPreservingInitializer macros child)
+    (copied : Tree) (final : Nat)
+    (accepted : copyWithMacros macros fuel origin holes renames fresh
+      (.list [.atom head, child]) = some (copied, final)) : final = fresh := by
+  cases fuel with
+  | zero => simp [copyWithMacros, operations] at accepted
+  | succ fuel =>
+      cases copied with
+      | atom atom =>
+          simp only [copyWithMacros, operations] at accepted
+          split at accepted <;> simp_all
+      | list items =>
+          simp only [copyWithMacros, operations] at accepted
+          split at accepted
+          · generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+              [child] = manyOption at accepted
+            cases manyOption with
+            | none => simp [manyRun] at accepted
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    [child] = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh [child] = _
+                  exact manyRun
+                have manySafe : CounterPreservingTrees macros [child] :=
+                  .cons child childSafe [] .nil
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh [child] manyCopies middle manySafe manyAccepted
+                simp [manyRun] at accepted
+                omega
+          · have ordinary := accepted
+            simp only [named] at ordinary
+            generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+              [.atom head, child] = manyOption at ordinary
+            cases manyOption with
+            | none => simp [manyRun] at ordinary
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have allSafe : CounterPreservingTrees macros [.atom head, child] :=
+                  .cons (.atom head) (atom_initializer_counter_preserving macros head)
+                    [child] (.cons child childSafe [] .nil)
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    [.atom head, child] = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh _ = _
+                  exact manyRun
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh [.atom head, child] manyCopies middle allSafe manyAccepted
+                simp [manyRun] at ordinary
+                omega
+
+theorem copyWithMacros_triple_children_preserves_counter (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (head first : Atom) (second : Tree)
+    (headNotMatch : head.name ≠ "match")
+    (secondSafe : CounterPreservingInitializer macros second)
+    (copied : Tree) (final : Nat)
+    (accepted : copyWithMacros macros fuel origin holes renames fresh
+      (.list [.atom head, .atom first, second]) = some (copied, final)) : final = fresh := by
+  cases fuel with
+  | zero => simp [copyWithMacros, operations] at accepted
+  | succ fuel =>
+      cases copied with
+      | atom atom =>
+          simp only [copyWithMacros, operations] at accepted
+          split at accepted <;> simp_all [named, headNotMatch]
+      | list items =>
+          simp only [copyWithMacros, operations] at accepted
+          split at accepted
+          · generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+              [.atom first, second] = manyOption at accepted
+            cases manyOption with
+            | none => simp [manyRun] at accepted
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    [.atom first, second] = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh
+                    [.atom first, second] = _
+                  exact manyRun
+                have manySafe : CounterPreservingTrees macros [.atom first, second] :=
+                  .cons (.atom first) (atom_initializer_counter_preserving macros first)
+                    [second] (.cons second secondSafe [] .nil)
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh [.atom first, second] manyCopies middle manySafe manyAccepted
+                simp [manyRun] at accepted
+                omega
+          · have ordinary := accepted
+            simp [named, headNotMatch] at ordinary
+            generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+              [.atom head, .atom first, second] = manyOption at ordinary
+            cases manyOption with
+            | none => simp [manyRun] at ordinary
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have allSafe : CounterPreservingTrees macros [.atom head, .atom first, second] :=
+                  .cons (.atom head) (atom_initializer_counter_preserving macros head)
+                    [.atom first, second]
+                    (.cons (.atom first) (atom_initializer_counter_preserving macros first)
+                      [second] (.cons second secondSafe [] .nil))
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    [.atom head, .atom first, second] = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh _ = _
+                  exact manyRun
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh [.atom head, .atom first, second] manyCopies middle allSafe manyAccepted
+                simp [manyRun] at ordinary
+                omega
+
+theorem copyWithMacros_quadruple_children_preserves_counter (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (head first second : Atom) (third : Tree)
+    (headNotMatch : head.name ≠ "match")
+    (thirdSafe : CounterPreservingInitializer macros third)
+    (copied : Tree) (final : Nat)
+    (accepted : copyWithMacros macros fuel origin holes renames fresh
+      (.list [.atom head, .atom first, .atom second, third]) = some (copied, final)) :
+    final = fresh := by
+  cases fuel with
+  | zero => simp [copyWithMacros, operations] at accepted
+  | succ fuel =>
+      cases copied with
+      | atom atom =>
+          simp only [copyWithMacros, operations] at accepted
+          split at accepted <;> simp_all [named, headNotMatch]
+      | list items =>
+          simp only [copyWithMacros, operations] at accepted
+          split at accepted
+          · generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+              [.atom first, .atom second, third] = manyOption at accepted
+            cases manyOption with
+            | none => simp [manyRun] at accepted
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    [.atom first, .atom second, third] = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh
+                    [.atom first, .atom second, third] = _
+                  exact manyRun
+                have manySafe : CounterPreservingTrees macros
+                    [.atom first, .atom second, third] :=
+                  .cons (.atom first) (atom_initializer_counter_preserving macros first)
+                    [.atom second, third]
+                    (.cons (.atom second) (atom_initializer_counter_preserving macros second)
+                      [third] (.cons third thirdSafe [] .nil))
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh [.atom first, .atom second, third] manyCopies middle
+                  manySafe manyAccepted
+                simp [manyRun] at accepted
+                omega
+          · have ordinary := accepted
+            simp [named, headNotMatch] at ordinary
+            generalize manyRun : (operations macros fuel).copyMany origin holes renames fresh
+              [.atom head, .atom first, .atom second, third] = manyOption at ordinary
+            cases manyOption with
+            | none => simp [manyRun] at ordinary
+            | some result =>
+                rcases result with ⟨manyCopies, middle⟩
+                have manyAccepted : copyManyWithMacros macros fuel origin holes renames fresh
+                    [.atom head, .atom first, .atom second, third] = some (manyCopies, middle) := by
+                  change (operations macros fuel).copyMany origin holes renames fresh _ = _
+                  exact manyRun
+                have allSafe : CounterPreservingTrees macros
+                    [.atom head, .atom first, .atom second, third] :=
+                  .cons (.atom head) (atom_initializer_counter_preserving macros head)
+                    [.atom first, .atom second, third]
+                    (.cons (.atom first) (atom_initializer_counter_preserving macros first)
+                      [.atom second, third]
+                      (.cons (.atom second) (atom_initializer_counter_preserving macros second)
+                        [third] (.cons third thirdSafe [] .nil)))
+                have middleEq := copyManyWithMacros_preserving_counter macros fuel origin holes
+                  renames fresh [.atom head, .atom first, .atom second, third] manyCopies middle
+                  allSafe manyAccepted
+                simp [manyRun] at ordinary
+                omega
+
 inductive MacroCounterSafeInitializer (macros : List String) : Tree → Prop where
   | atom (value : Atom) : MacroCounterSafeInitializer macros (.atom value)
+  | neutralTree (value : Tree) (safe : CounterNeutralTree macros value) :
+      MacroCounterSafeInitializer macros value
   | singletonList (value : Atom) : MacroCounterSafeInitializer macros (.list [.atom value])
+  | singletonWrapped (child : Tree) (childSafe : MacroCounterSafeInitializer macros child) :
+      MacroCounterSafeInitializer macros (.list [child])
+  | pairChild (head : Atom) (child : Tree)
+      (childSafe : MacroCounterSafeInitializer macros child) :
+      MacroCounterSafeInitializer macros (.list [.atom head, child])
+  | tripleChildren (head first : Atom) (second : Tree)
+      (headNotMatch : head.name ≠ "match")
+      (secondSafe : MacroCounterSafeInitializer macros second) :
+      MacroCounterSafeInitializer macros (.list [.atom head, .atom first, second])
+  | quadrupleChildren (head first second : Atom) (third : Tree)
+      (headNotMatch : head.name ≠ "match")
+      (thirdSafe : MacroCounterSafeInitializer macros third) :
+      MacroCounterSafeInitializer macros
+        (.list [.atom head, .atom first, .atom second, third])
   | pairList (head argument : Atom) :
       MacroCounterSafeInitializer macros (.list [.atom head, .atom argument])
   | tripleList (head first second : Atom) (headNotMatch : head.name ≠ "match") :
@@ -1048,7 +1973,30 @@ theorem macroCounterSafeInitializer_preserving (macros : List String) (value : T
     (safe : MacroCounterSafeInitializer macros value) : CounterPreservingInitializer macros value := by
   cases safe with
   | atom atom => exact atom_initializer_counter_preserving macros atom
+  | neutralTree value neutral => exact counterNeutralTree_preserving macros value neutral
   | singletonList atom => exact singleton_atom_list_counter_preserving macros atom
+  | singletonWrapped child childSafe =>
+      intro fuel origin holes renames fresh copied final accepted
+      exact copyWithMacros_singleton_child_preserves_counter macros fuel origin holes renames
+        fresh child (macroCounterSafeInitializer_preserving macros child childSafe) copied final
+        accepted
+  | pairChild head child childSafe =>
+      intro fuel origin holes renames fresh copied final accepted
+      exact copyWithMacros_pair_child_preserves_counter macros fuel origin holes renames fresh
+        head child (macroCounterSafeInitializer_preserving macros child childSafe) copied final
+        accepted
+  | tripleChildren head first second headNotMatch secondSafe =>
+      intro fuel origin holes renames fresh copied final accepted
+      exact copyWithMacros_triple_children_preserves_counter macros fuel origin holes renames fresh
+        head first second headNotMatch
+        (macroCounterSafeInitializer_preserving macros second secondSafe)
+        copied final accepted
+  | quadrupleChildren head first second third headNotMatch thirdSafe =>
+      intro fuel origin holes renames fresh copied final accepted
+      exact copyWithMacros_quadruple_children_preserves_counter macros fuel origin holes renames
+        fresh head first second third headNotMatch
+        (macroCounterSafeInitializer_preserving macros third thirdSafe)
+        copied final accepted
   | pairList head argument => exact pair_atom_list_counter_preserving macros head argument
   | tripleList head first second headNotMatch =>
       exact triple_atom_list_counter_preserving macros head first second headNotMatch
@@ -2267,6 +3215,245 @@ theorem macro_head_retains_namespace (macros : List String) (head replacement : 
     copyWithMacros macros 3 origin [] [(head.name, replacement)] fresh (.list [.atom head]) =
       some (.list [.atom {head with origin := some origin}], fresh) := by
   simp [copyWithMacros, operations, lookup, known]
+
+/-- A zero-argument macro call that is written literally in a template keeps
+its macro head when the template is copied, provided no hole substitutes that
+head. This is the smallest call-site preservation fact needed to connect a
+template call to a call in the copied output. -/
+theorem copyWithMacros_preserves_zero_arg_macro_call (macros : List String)
+    (origin fresh : Nat) (holes : Holes) (head : Atom)
+    (known : macros.contains head.name = true)
+    (notHole : (lookup head.name holes).isNone = true) :
+    copyWithMacros macros 2 origin holes [] fresh (.list [.atom head]) =
+      some (.list [.atom {head with origin := some origin}], fresh) := by
+  simp [copyWithMacros, operations, lookup, known, notHole]
+
+theorem copyManyWithMacros_preserves_length (macros : List String) (fuel origin : Nat)
+    (holes : Holes) (renames : Renames) (fresh : Nat) (trees copied : List Tree)
+    (final : Nat)
+    (accepted : copyManyWithMacros macros fuel origin holes renames fresh trees =
+      some (copied, final)) :
+    copied.length = trees.length := by
+  induction fuel generalizing trees copied final fresh with
+  | zero => simp [copyManyWithMacros, operations] at accepted
+  | succ fuel ih =>
+      cases trees with
+      | nil =>
+          simp [copyManyWithMacros, operations] at accepted
+          rcases accepted with ⟨rfl, rfl⟩
+          simp
+      | cons head tail =>
+          simp only [copyManyWithMacros, operations] at accepted
+          generalize headResult : (operations macros fuel).copy origin holes renames fresh head =
+            headOption at accepted
+          cases headOption with
+          | none => simp [headResult] at accepted
+          | some headPair =>
+              rcases headPair with ⟨headCopy, next⟩
+              generalize tailResult : (operations macros fuel).copyMany origin holes renames
+                next tail = tailOption at accepted
+              cases tailOption with
+              | none => simp [headResult, tailResult] at accepted
+              | some tailPair =>
+                  rcases tailPair with ⟨tailCopies, last⟩
+                  simp [headResult, tailResult] at accepted
+                  rcases accepted with ⟨copiedEq, _⟩
+                  have tailLength := ih next tail tailCopies last tailResult
+                  rw [← copiedEq]
+                  simp [tailLength]
+
+theorem copyManyWithMacros_cons_parts (macros : List String) (fuel origin : Nat)
+    (holes : Holes) (renames : Renames) (fresh : Nat) (head : Tree) (tail : List Tree)
+    (copied : List Tree) (final : Nat)
+    (accepted : copyManyWithMacros macros fuel origin holes renames fresh (head :: tail) =
+      some (copied, final)) :
+    ∃ copiedHead copiedTail middle,
+      (operations macros (fuel - 1)).copy origin holes renames fresh head =
+        some (copiedHead, middle) ∧
+      copyManyWithMacros macros (fuel - 1) origin holes renames middle tail =
+        some (copiedTail, final) ∧ copied = copiedHead :: copiedTail := by
+  cases fuel with
+  | zero => simp [copyManyWithMacros, operations] at accepted
+  | succ fuel =>
+      simp only [copyManyWithMacros, operations] at accepted
+      generalize headResult : (operations macros fuel).copy origin holes renames fresh head =
+        headOption at accepted
+      cases headOption with
+      | none => simp [headResult] at accepted
+      | some headPair =>
+          rcases headPair with ⟨copiedHead, middle⟩
+          generalize tailResult : (operations macros fuel).copyMany origin holes renames
+            middle tail = tailOption at accepted
+          cases tailOption with
+          | none => simp [headResult, tailResult] at accepted
+          | some tailPair =>
+              rcases tailPair with ⟨copiedTail, final'⟩
+              simp [headResult, tailResult] at accepted
+              rcases accepted with ⟨copiedEq, finalEq⟩
+              subst copied
+              subst final'
+              refine ⟨copiedHead, copiedTail, middle, headResult, ?_, rfl⟩
+              simpa [copyManyWithMacros] using tailResult
+
+/-- Split a successful list copy around an element at any position. The fuel
+available to that element decreases once for each preceding sibling. -/
+theorem copyManyWithMacros_extract_element (macros : List String)
+    (childFuel origin fresh : Nat) (holes : Holes) (renames : Renames)
+    (beforeItems : List Tree) (item : Tree) (suffix copied : List Tree) (final : Nat)
+    (accepted : copyManyWithMacros macros (childFuel + beforeItems.length + 1) origin
+      holes renames fresh (beforeItems ++ item :: suffix) = some (copied, final)) :
+    ∃ copiedPrefix copiedItem copiedSuffix before middle,
+      (operations macros childFuel).copy origin holes renames before item =
+        some (copiedItem, middle) ∧
+      copyManyWithMacros macros childFuel origin holes renames middle suffix =
+        some (copiedSuffix, final) ∧
+      copied = copiedPrefix ++ copiedItem :: copiedSuffix := by
+  induction beforeItems generalizing childFuel fresh copied final with
+  | nil =>
+      have parts := copyManyWithMacros_cons_parts macros (childFuel + 1) origin holes
+        renames fresh item suffix copied final (by simpa using accepted)
+      obtain ⟨copiedItem, copiedSuffix, middle, itemCopy, suffixCopy, outputEq⟩ := parts
+      refine ⟨[], copiedItem, copiedSuffix, fresh, middle, itemCopy, suffixCopy, ?_⟩
+      simpa using outputEq
+  | cons head beforeItems ih =>
+      have accepted' : copyManyWithMacros macros (childFuel + beforeItems.length + 2)
+          origin holes renames fresh (head :: (beforeItems ++ item :: suffix)) =
+          some (copied, final) := by
+        simpa [List.length, Nat.add_assoc] using accepted
+      have headAndTail := copyManyWithMacros_cons_parts macros
+        (childFuel + beforeItems.length + 2) origin holes renames fresh head
+        (beforeItems ++ item :: suffix) copied final accepted'
+      obtain ⟨copiedHead, copiedRest, afterHead, _headCopy, restCopy, outputEq⟩ :=
+        headAndTail
+      have restAccepted : copyManyWithMacros macros
+          (childFuel + beforeItems.length + 1) origin holes renames afterHead
+          (beforeItems ++ item :: suffix) = some (copiedRest, final) := by
+        have fuelDecrease : childFuel + beforeItems.length + 2 - 1 =
+            childFuel + beforeItems.length + 1 := by omega
+        simpa [fuelDecrease, copyManyWithMacros] using restCopy
+      obtain ⟨copiedPrefix, copiedItem, copiedSuffix, before, middle,
+        itemCopy, suffixCopy, restShape⟩ :=
+        ih (childFuel := childFuel) (fresh := afterHead) (copied := copiedRest)
+          (final := final) restAccepted
+      refine ⟨copiedHead :: copiedPrefix, copiedItem, copiedSuffix, before, middle,
+        itemCopy, suffixCopy, ?_⟩
+      rw [outputEq, restShape]
+      simp [List.append_assoc]
+
+theorem copyWithMacros_preserves_root_macro_call (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh final : Nat)
+    (head : Atom) (arguments copiedArguments : List Tree)
+    (known : macros.contains head.name = true)
+    (headNotSubstituted : (lookup head.name holes).isNone = true)
+    (argumentsCopied : copyManyWithMacros macros fuel origin holes renames fresh arguments =
+      some (copiedArguments, final)) :
+    copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list (.atom head :: arguments)) =
+        some (.list (.atom {head with origin := some origin} :: copiedArguments), final) := by
+  simp [copyWithMacros, operations, known, headNotSubstituted]
+  refine ⟨(copiedArguments, final), ?_, rfl, rfl⟩
+  simpa [copyManyWithMacros] using argumentsCopied
+
+theorem copyWithMacros_root_macro_call_parts (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh final : Nat)
+    (head : Atom) (arguments : List Tree) (output : Tree)
+    (known : macros.contains head.name = true)
+    (headNotSubstituted : (lookup head.name holes).isNone = true)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list (.atom head :: arguments)) = some (output, final)) :
+    ∃ copiedArguments,
+      copyManyWithMacros macros fuel origin holes renames fresh arguments =
+        some (copiedArguments, final) ∧
+      output = .list (.atom {head with origin := some origin} :: copiedArguments) := by
+  have raw := accepted
+  simp [copyWithMacros, operations, known, headNotSubstituted] at raw
+  obtain ⟨pair, argumentsAccepted, outputEq, finalEq⟩ := raw
+  rcases pair with ⟨copiedArguments, middle⟩
+  have middleEq : middle = final := by simpa using finalEq
+  have argumentsAccepted' : copyManyWithMacros macros fuel origin holes renames fresh arguments =
+      some (copiedArguments, final) := by
+    rw [middleEq] at argumentsAccepted
+    simpa [copyManyWithMacros] using argumentsAccepted
+  have outputEq' : output =
+      .list (.atom {head with origin := some origin} :: copiedArguments) := by
+    simpa using outputEq.symm
+  exact ⟨copiedArguments, argumentsAccepted', outputEq'⟩
+
+theorem copyManyWithMacros_preserves_literal_call_child (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh final : Nat)
+    (head : Atom) (arguments tail copied : List Tree)
+    (known : macros.contains head.name = true)
+    (headNotSubstituted : (lookup head.name holes).isNone = true)
+    (accepted : copyManyWithMacros macros (fuel + 2) origin holes renames fresh
+      (.list (.atom head :: arguments) :: tail) = some (copied, final)) :
+    ∃ copiedArguments copiedTail middle,
+      copyManyWithMacros macros fuel origin holes renames fresh arguments =
+        some (copiedArguments, middle) ∧
+      copyManyWithMacros macros (fuel + 1) origin holes renames middle tail =
+        some (copiedTail, final) ∧
+      copied = .list (.atom {head with origin := some origin} :: copiedArguments) :: copiedTail := by
+  obtain ⟨copiedCall, copiedTail, middle, callCopy, tailCopy, outputEq⟩ :=
+    copyManyWithMacros_cons_parts macros (fuel + 2) origin holes renames fresh
+      (.list (.atom head :: arguments)) tail copied final accepted
+  have callCopy' : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list (.atom head :: arguments)) = some (copiedCall, middle) := by
+    change (operations macros (fuel + 1)).copy origin holes renames fresh
+      (.list (.atom head :: arguments)) = some (copiedCall, middle)
+    exact callCopy
+  obtain ⟨copiedArguments, argumentsCopy, callShape⟩ :=
+    copyWithMacros_root_macro_call_parts macros fuel origin holes renames fresh middle
+      head arguments copiedCall known headNotSubstituted callCopy'
+  refine ⟨copiedArguments, copiedTail, middle, argumentsCopy, tailCopy, ?_⟩
+  rw [outputEq, callShape]
+
+private theorem option_pair_components {α : Type} {result : Option (List α × Nat)}
+    {values : List α} {final : Nat}
+    (accepted : ∃ pair, result = some pair ∧ pair.1 = values ∧ pair.2 = final) :
+    result = some (values, final) := by
+  obtain ⟨pair, resultEq, valuesEq, finalEq⟩ := accepted
+  cases pair with
+  | mk actualValues actualFinal =>
+      simp only [Prod.fst, Prod.snd] at valuesEq finalEq
+      subst actualValues
+      subst actualFinal
+      exact resultEq
+
+theorem copyWithMacros_substituted_head_uses_copyMany (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (head : Atom) (arguments : List Tree) (copiedItems : List Tree) (final : Nat)
+    (headSubstituted : (lookup head.name holes).isSome = true)
+    (ordinaryHead : head.name ≠ "lambda" ∧ head.name ≠ "let" ∧ head.name ≠ "match")
+    (copied : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list (.atom head :: arguments)) = some (.list copiedItems, final)) :
+    (operations macros fuel).copyMany origin holes renames fresh (.atom head :: arguments) =
+      some (copiedItems, final) := by
+  cases lookupResult : lookup head.name holes with
+  | none => simp [lookupResult] at headSubstituted
+  | some replacement =>
+      cases arguments with
+      | nil =>
+          simp [copyWithMacros, operations, lookupResult, named] at copied
+          exact option_pair_components copied
+      | cons first tail =>
+          cases tail with
+          | nil =>
+              simp [copyWithMacros, operations, lookupResult, named] at copied
+              exact option_pair_components copied
+          | cons second tail =>
+              cases tail with
+              | nil =>
+                  cases first <;>
+                    simp [copyWithMacros, operations, lookupResult, named, ordinaryHead] at copied
+                  all_goals exact option_pair_components copied
+              | cons third tail =>
+                  cases tail with
+                  | nil =>
+                      cases first <;>
+                        simp [copyWithMacros, operations, lookupResult, named, ordinaryHead] at copied
+                      all_goals exact option_pair_components copied
+                  | cons fourth rest =>
+                      simp [copyWithMacros, operations, lookupResult, named, ordinaryHead] at copied
+                      exact option_pair_components copied
 
 theorem capture_uses_definition_origin (a : Atom) (origin fresh : Nat) :
     copy 1 origin [] [] fresh (.atom a) =

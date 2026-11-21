@@ -895,12 +895,22 @@ static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *
 
 static SExpr *copy_template(Arena *a, Macro *m, SExpr *x, SExpr **args, Rename *renames, Error *e);
 
+static bool next_fresh_scope(Arena *a, Span span, size_t *scope, Error *e) {
+    if (a->fresh_scope >= (SIZE_MAX - 2U) / 3U)
+        return fail(e, NLISP_UNKNOWN, span, "Unknown: generated binding identity range exhausted");
+    a->fresh_scope++;
+    *scope = a->fresh_scope;
+    return true;
+}
+
 static SExpr *fresh_value_atom(Arena *a, const SExpr *source, Error *e) {
     char buffer[80];
+    size_t scope;
     SExpr *result = macro_node(a, source->span, e);
     if (result == NULL) return NULL;
     *result = *source;
-    (void)snprintf(buffer, sizeof(buffer), "#%%nlisp%zu", ++a->fresh_scope);
+    if (!next_fresh_scope(a, source->span, &scope, e)) return NULL;
+    (void)snprintf(buffer, sizeof(buffer), "#%%nlisp%zu", scope);
     result->atom = astr(a, buffer, strlen(buffer)); result->origin = NULL; result->expanded = NULL;
     result->token_identity = name_identity(a, result->atom); result->resolved_identity = 0U;
     return result;
@@ -910,13 +920,15 @@ static SExpr *copy_binder(Arena *a, Macro *m, SExpr *x, Rename **renames, Error 
     SExpr *r;
     Rename *name;
     size_t ignored;
+    size_t scope;
     char buffer[80];
     if (!identifier(x) || macro_parameter(m, x->atom, &ignored)) {
         (void)fail(e, NLISP_PARSE_ERROR, x->span, "invalid template binding identifier; macro holes cannot occur in binding positions");
         return NULL;
     }
     r = macro_node(a, x->span, e); if (r == NULL) return NULL; *r = *x;
-    (void)snprintf(buffer, sizeof(buffer), "#%%nlisp%zu", ++a->fresh_scope);
+    if (!next_fresh_scope(a, x->span, &scope, e)) return NULL;
+    (void)snprintf(buffer, sizeof(buffer), "#%%nlisp%zu", scope);
     r->atom = astr(a, buffer, strlen(buffer));
     r->token_identity = name_identity(a, r->atom); r->resolved_identity = 0U;
     name = (Rename *)aalloc(a, sizeof(*name));

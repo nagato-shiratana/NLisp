@@ -50,7 +50,8 @@ class MacroTermination(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             manifest, proof = bridge.unpack_bundle(certificate.read_text())
             self.assertEqual(manifest['conversion']['mode'], 'termination')
-            self.assertIn('well-founded static macro call graph', manifest['assurance']['kernel_checks'])
+            self.assertIn('well-founded conservative macro call candidate graph',
+                          manifest['assurance']['kernel_checks'])
             self.assertIn('rule_calls_wellFounded', proof)
             self.assertIn('every_call_chain_bounded', proof)
             self.assertNotIn('expandedProgram', proof)
@@ -95,7 +96,7 @@ class MacroTermination(unittest.TestCase):
                 self.assertIn('no decreasing rank', result.stderr)
                 self.assertEqual(certificate.read_bytes(), b'previous valid artifact\n')
 
-    def test_dynamic_head_is_unknown(self):
+    def test_dynamic_head_uses_conservative_arity_candidates(self):
         text = '''
 (define-macro apply (syntax-rules/typed
  ((apply f x) ((f (Syntax (Function (Integer) Integer))) (x (Syntax Integer)))
@@ -106,9 +107,11 @@ class MacroTermination(unittest.TestCase):
             source = pathlib.Path(directory) / 'dynamic.nlisp'
             source.write_text(text)
             document = self.syntax(source)
-            self.assertEqual(bridge.termination_plan(document)['status'], 'unknown')
-            with self.assertRaisesRegex(bridge.UnknownResult, 'head position'):
-                bridge.render_proof(document, 'termination', BUDGET)
+            plan = bridge.termination_plan(document)
+            self.assertEqual(plan['status'], 'proved')
+            proof, _ = bridge.render_proof(document, 'termination', BUDGET)
+            result = self.lean(proof.removeprefix('import NLisp\n'))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_wrong_ranks_are_rejected_by_lean(self):
         document = self.syntax(ROOT / 'examples/recursive_expansion.nlisp')

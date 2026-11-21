@@ -76,6 +76,14 @@ theorem lowerMany_eq (locals : List Nat) (expressions : List Expr) :
     | e :: es => lower locals e :: lowerMany locals es := by
   cases expressions <;> rfl
 
+theorem lowerMany_length (locals : List Nat) (expressions : List Expr) :
+    (lowerMany locals expressions).length = expressions.length := by
+  induction expressions with
+  | nil => rfl
+  | cons expression rest ih =>
+      change (lower locals expression :: lowerMany locals rest).length = _
+      simp [ih]
+
 def identities (env : Environment) : List Nat := env.map Prod.fst
 
 @[simp] theorem identities_nil : identities [] = [] := rfl
@@ -147,6 +155,22 @@ theorem lowerEnv_bind (ids : List Nat) (values : List Value) (arity : values.len
       simp only [List.length_cons, Nat.add_right_cancel_iff] at arity
       simpa [bind, lowerEnv, lowerValues] using congrArg (List.cons (lowerValue value)) (ih values (by omega))
 
+theorem lowerEnv_bind_append (ids : List Nat) (values : List Value) (env : Environment)
+    (arity : values.length = ids.length) :
+    lowerEnv (bind ids values ++ env) = lowerValues values ++ lowerEnv env := by
+  rw [lowerEnv_append, lowerEnv_bind ids values arity]
+
+theorem identities_bind_append (ids : List Nat) (values : List Value) (env : Environment)
+    (arity : values.length = ids.length) :
+    identities (bind ids values ++ env) = ids ++ identities env := by
+  rw [identities_append, bind_identifiers ids values arity]
+
+theorem lower_call_body (ids : List Nat) (values : List Value) (env : Environment)
+    (body : Expr) (arity : values.length = ids.length) :
+    lower (identities (bind ids values ++ env)) body =
+      lower (ids ++ identities env) body := by
+  rw [identities_bind_append ids values env arity]
+
 theorem lookup_lowered (env : Environment) (id : Nat) (h : lookup id env = some value) :
     (lowerEnv env)[position id (identities env)]? = some (lowerValue value) := by
   induction env with
@@ -159,6 +183,36 @@ theorem lookup_lowered (env : Environment) (id : Nat) (h : lookup id env = some 
       simp [lowerEnv, identities, position, same, getElem?_def]
     · have ht : lookup id tail = some value := by simpa [lookup, same] using h
       simpa [lowerEnv, identities, position, same, getElem?_def, Nat.succ_lt_succ_iff] using ih ht
+
+theorem lookup_lowered_reflects (env : Environment) (id : Nat) (loweredValue : PolyIR.Value)
+    (h : (lowerEnv env)[position id (identities env)]? = some loweredValue) :
+    ∃ value, lookup id env = some value ∧ lowerValue value = loweredValue := by
+  induction env with
+  | nil => simp [lowerEnv, identities, position, getElem?_def] at h
+  | cons entry tail ih =>
+      rcases entry with ⟨key, item⟩
+      by_cases same : key = id
+      · subst key
+        refine ⟨item, ?_, ?_⟩
+        · simp [lookup]
+        · simpa [lowerEnv, identities, position, getElem?_def] using h
+      · have tailValue :
+            (lowerEnv tail)[position id (identities tail)]? = some loweredValue := by
+          simpa [lowerEnv, identities, position, same, getElem?_def,
+            Nat.succ_lt_succ_iff] using h
+        obtain ⟨value, found, lowered⟩ := ih tailValue
+        exact ⟨value, by simp [lookup, same, found], lowered⟩
+
+theorem variable_evaluation_reflected (program : Definitions) (env : Environment) (id : Nat)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (.var (position id (identities env))) value) :
+    ∃ sourceValue, Evaluates program env (.var id) sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | var found =>
+      obtain ⟨sourceValue, sourceFound, sameValue⟩ :=
+        lookup_lowered_reflects env id value found
+      exact ⟨sourceValue, .var sourceFound, sameValue⟩
 
 theorem definitions_lookup (program : Definitions) {index : Nat} {ids : List Nat} {body : Expr}
     (h : program[index]? = some (ids, body)) :
@@ -174,6 +228,652 @@ theorem definitions_lookup (program : Definitions) {index : Nat} {ids : List Nat
     | succ index =>
       simpa [lowerDefinitions, getElem?_def, Nat.succ_lt_succ_iff] using
         ih (index := index) (by simpa [getElem?_def, Nat.succ_lt_succ_iff] using h)
+
+theorem definitions_lookup_reflects (program : Definitions) (index : Nat)
+    (runtimeDefinition : PolyIR.RuntimeDefinition)
+    (h : (lowerDefinitions program)[index]? = some runtimeDefinition) :
+    ∃ ids body, program[index]? = some (ids, body) ∧
+      runtimeDefinition = PolyIR.RuntimeDefinition.mk ids.length (lower ids body) := by
+  induction program generalizing index with
+  | nil => simp [lowerDefinitions, getElem?_def, Nat.not_lt_zero] at h
+  | cons first tail ih =>
+      rcases first with ⟨ids, body⟩
+      cases index with
+      | zero =>
+          have definitionEq :
+              PolyIR.RuntimeDefinition.mk ids.length (lower ids body) = runtimeDefinition := by
+            simpa [lowerDefinitions, getElem?_def] using h
+          exact ⟨ids, body, by simp [getElem?_def], definitionEq.symm⟩
+      | succ index =>
+          obtain ⟨ids, body, found, definitionEq⟩ := ih index (by
+            simpa [lowerDefinitions, getElem?_def, Nat.succ_lt_succ_iff] using h)
+          exact ⟨ids, body, by simpa [getElem?_def, Nat.succ_lt_succ_iff] using found,
+            definitionEq⟩
+
+theorem global_evaluation_reflected (program : Definitions) (env : Environment) (index : Nat)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (.global index) (.global index)) :
+    Evaluates program env (.global index) (.global index) := by
+  cases evaluated with
+  | global found =>
+      obtain ⟨ids, body, sourceFound, _definitionEq⟩ :=
+        definitions_lookup_reflects program index _ found
+      exact .global sourceFound
+
+theorem boolean_evaluation_reflected (program : Definitions) (env : Environment) (b : Bool)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) (.bool b) value) :
+    ∃ sourceValue, Evaluates program env (.bool b) sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | bool =>
+      refine ⟨Value.bool b, Evaluates.bool, ?_⟩
+      simp [lowerValue]
+
+theorem integer_evaluation_reflected (program : Definitions) (env : Environment) (n : Int)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) (.int n) value) :
+    ∃ sourceValue, Evaluates program env (.int n) sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | int =>
+      refine ⟨Value.int n, Evaluates.int, ?_⟩
+      simp [lowerValue]
+
+theorem unit_evaluation_reflected (program : Definitions) (env : Environment)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) .unit value) :
+    ∃ sourceValue, Evaluates program env .unit sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | unit => exact ⟨Value.unit, Evaluates.unit, rfl⟩
+
+theorem nil_evaluation_reflected (program : Definitions) (env : Environment)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) .nil value) :
+    ∃ sourceValue, Evaluates program env .nil sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | nil => exact ⟨Value.nil, Evaluates.nil, rfl⟩
+
+theorem none_evaluation_reflected (program : Definitions) (env : Environment)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) .none value) :
+    ∃ sourceValue, Evaluates program env .none sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | none => exact ⟨Value.none, Evaluates.none, rfl⟩
+
+theorem lambda_evaluation_reflected (program : Definitions) (env : Environment)
+    (parameters : List Nat) (body : Expr) (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.lam parameters body)) value) :
+    ∃ sourceValue, Evaluates program env (.lam parameters body) sourceValue ∧
+      lowerValue sourceValue = value := by
+  change PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+    (.lam parameters.length (lower (parameters ++ identities env) body)) value at evaluated
+  cases evaluated with
+  | lam =>
+      refine ⟨Value.closure parameters body env, Evaluates.lam, ?_⟩
+      simp [lowerValue]
+
+theorem add_evaluation_reflected (program : Definitions) (env : Environment)
+    (left right : Expr)
+    (leftReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) left) value →
+      ∃ sourceValue, Evaluates program env left sourceValue ∧ lowerValue sourceValue = value)
+    (rightReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) right) value →
+      ∃ sourceValue, Evaluates program env right sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.add left right)) value) :
+    ∃ sourceValue, Evaluates program env (.add left right) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | add leftEval rightEval =>
+      obtain ⟨leftValue, leftSourceEval, leftLowered⟩ := leftReflected leftEval
+      obtain ⟨rightValue, rightSourceEval, rightLowered⟩ := rightReflected rightEval
+      cases leftValue <;> simp_all [lowerValue]
+      cases rightValue <;> simp_all [lowerValue]
+      exact ⟨.int (_ + _), .add leftSourceEval rightSourceEval, by simp_all [lowerValue]⟩
+
+theorem sub_evaluation_reflected (program : Definitions) (env : Environment)
+    (left right : Expr)
+    (leftReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) left) value →
+      ∃ sourceValue, Evaluates program env left sourceValue ∧ lowerValue sourceValue = value)
+    (rightReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) right) value →
+      ∃ sourceValue, Evaluates program env right sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.sub left right)) value) :
+    ∃ sourceValue, Evaluates program env (.sub left right) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | sub leftEval rightEval =>
+      obtain ⟨leftValue, leftSourceEval, leftLowered⟩ := leftReflected leftEval
+      obtain ⟨rightValue, rightSourceEval, rightLowered⟩ := rightReflected rightEval
+      cases leftValue <;> simp_all [lowerValue]
+      cases rightValue <;> simp_all [lowerValue]
+      exact ⟨.int (_ - _), .sub leftSourceEval rightSourceEval, by simp_all [lowerValue]⟩
+
+theorem mul_evaluation_reflected (program : Definitions) (env : Environment)
+    (left right : Expr)
+    (leftReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) left) value →
+      ∃ sourceValue, Evaluates program env left sourceValue ∧ lowerValue sourceValue = value)
+    (rightReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) right) value →
+      ∃ sourceValue, Evaluates program env right sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.mul left right)) value) :
+    ∃ sourceValue, Evaluates program env (.mul left right) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | mul leftEval rightEval =>
+      obtain ⟨leftValue, leftSourceEval, leftLowered⟩ := leftReflected leftEval
+      obtain ⟨rightValue, rightSourceEval, rightLowered⟩ := rightReflected rightEval
+      cases leftValue <;> simp_all [lowerValue]
+      cases rightValue <;> simp_all [lowerValue]
+      exact ⟨.int (_ * _), .mul leftSourceEval rightSourceEval, by simp_all [lowerValue]⟩
+
+theorem le_evaluation_reflected (program : Definitions) (env : Environment)
+    (left right : Expr)
+    (leftReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) left) value →
+      ∃ sourceValue, Evaluates program env left sourceValue ∧ lowerValue sourceValue = value)
+    (rightReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) right) value →
+      ∃ sourceValue, Evaluates program env right sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.le left right)) value) :
+    ∃ sourceValue, Evaluates program env (.le left right) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | le leftEval rightEval =>
+      obtain ⟨leftValue, leftSourceEval, leftLowered⟩ := leftReflected leftEval
+      obtain ⟨rightValue, rightSourceEval, rightLowered⟩ := rightReflected rightEval
+      cases leftValue <;> simp_all [lowerValue]
+      cases rightValue <;> simp_all [lowerValue]
+      exact ⟨.bool (decide (_ ≤ _)), .le leftSourceEval rightSourceEval,
+        by simp_all [lowerValue]⟩
+
+theorem intEq_evaluation_reflected (program : Definitions) (env : Environment)
+    (left right : Expr)
+    (leftReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) left) value →
+      ∃ sourceValue, Evaluates program env left sourceValue ∧ lowerValue sourceValue = value)
+    (rightReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) right) value →
+      ∃ sourceValue, Evaluates program env right sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.intEq left right)) value) :
+    ∃ sourceValue, Evaluates program env (.intEq left right) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | intEq leftEval rightEval =>
+      obtain ⟨leftValue, leftSourceEval, leftLowered⟩ := leftReflected leftEval
+      obtain ⟨rightValue, rightSourceEval, rightLowered⟩ := rightReflected rightEval
+      cases leftValue <;> simp_all [lowerValue]
+      cases rightValue <;> simp_all [lowerValue]
+      exact ⟨.bool (_ == _), .intEq leftSourceEval rightSourceEval,
+        by simp_all [lowerValue]⟩
+
+theorem ite_evaluation_reflected (program : Definitions) (env : Environment)
+    (condition yes no : Expr)
+    (conditionReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) condition) value →
+      ∃ sourceValue, Evaluates program env condition sourceValue ∧ lowerValue sourceValue = value)
+    (yesReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) yes) value →
+      ∃ sourceValue, Evaluates program env yes sourceValue ∧ lowerValue sourceValue = value)
+    (noReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) no) value →
+      ∃ sourceValue, Evaluates program env no sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.ite condition yes no)) value) :
+    ∃ sourceValue, Evaluates program env (.ite condition yes no) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | ifTrue conditionEval yesEval =>
+      obtain ⟨conditionValue, conditionSourceEval, conditionLowered⟩ :=
+        conditionReflected conditionEval
+      cases conditionValue <;> simp_all [lowerValue]
+      obtain ⟨yesValue, yesSourceEval, yesLowered⟩ := yesReflected yesEval
+      exact ⟨yesValue, .ifTrue conditionSourceEval yesSourceEval, yesLowered⟩
+  | ifFalse conditionEval noEval =>
+      obtain ⟨conditionValue, conditionSourceEval, conditionLowered⟩ :=
+        conditionReflected conditionEval
+      cases conditionValue <;> simp_all [lowerValue]
+      obtain ⟨noValue, noSourceEval, noLowered⟩ := noReflected noEval
+      exact ⟨noValue, .ifFalse conditionSourceEval noSourceEval, noLowered⟩
+
+theorem matchList_evaluation_reflected (program : Definitions) (env : Environment)
+    (target empty : Expr) (headId tailId : Nat) (full : Expr)
+    (targetReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) target) value →
+      ∃ sourceValue, Evaluates program env target sourceValue ∧ lowerValue sourceValue = value)
+    (emptyReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) empty) value →
+      ∃ sourceValue, Evaluates program env empty sourceValue ∧ lowerValue sourceValue = value)
+    (consBodyReflected : ∀ (sourceHead sourceTail : Value) (irHead irTail : PolyIR.Value),
+      lowerValue sourceHead = irHead → lowerValue sourceTail = irTail → ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (irHead :: irTail :: lowerEnv env)
+        (lower (headId :: tailId :: identities env) full) value →
+      ∃ sourceValue,
+        Evaluates program ((headId, sourceHead) :: (tailId, sourceTail) :: env) full sourceValue ∧
+          lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.matchList target empty headId tailId full)) value) :
+    ∃ sourceValue,
+      Evaluates program env (.matchList target empty headId tailId full) sourceValue ∧
+        lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | matchNil targetEval emptyEval =>
+      obtain ⟨sourceTarget, sourceTargetEval, targetLowered⟩ :=
+        targetReflected targetEval
+      cases sourceTarget <;> simp_all [lowerValue]
+      obtain ⟨sourceEmpty, sourceEmptyEval, emptyLowered⟩ := emptyReflected emptyEval
+      exact ⟨sourceEmpty, .matchNil sourceTargetEval sourceEmptyEval, emptyLowered⟩
+  | matchCons targetEval bodyEval =>
+      obtain ⟨sourceTarget, sourceTargetEval, targetLowered⟩ :=
+        targetReflected targetEval
+      cases sourceTarget with
+      | cons sourceHead sourceTail =>
+          simp [lowerValue] at targetLowered
+          obtain ⟨headLowered, tailLowered⟩ := targetLowered
+          obtain ⟨sourceBody, sourceBodyEval, bodyLowered⟩ :=
+            consBodyReflected sourceHead sourceTail _ _ headLowered tailLowered bodyEval
+          exact ⟨sourceBody, .matchCons sourceTargetEval sourceBodyEval, bodyLowered⟩
+      | bool _ => simp [lowerValue] at targetLowered
+      | int _ => simp [lowerValue] at targetLowered
+      | unit => simp [lowerValue] at targetLowered
+      | closure _ _ _ => simp [lowerValue] at targetLowered
+      | global _ => simp [lowerValue] at targetLowered
+      | nil => simp [lowerValue] at targetLowered
+      | none => simp [lowerValue] at targetLowered
+      | some _ => simp [lowerValue] at targetLowered
+
+theorem matchOption_evaluation_reflected (program : Definitions) (env : Environment)
+    (target empty : Expr) (binderId : Nat) (full : Expr)
+    (targetReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) target) value →
+      ∃ sourceValue, Evaluates program env target sourceValue ∧ lowerValue sourceValue = value)
+    (emptyReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) empty) value →
+      ∃ sourceValue, Evaluates program env empty sourceValue ∧ lowerValue sourceValue = value)
+    (someBodyReflected : ∀ (sourceItem : Value) (irItem : PolyIR.Value),
+      lowerValue sourceItem = irItem → ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (irItem :: lowerEnv env)
+        (lower (binderId :: identities env) full) value →
+      ∃ sourceValue,
+        Evaluates program ((binderId, sourceItem) :: env) full sourceValue ∧
+          lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.matchOption target empty binderId full)) value) :
+    ∃ sourceValue,
+      Evaluates program env (.matchOption target empty binderId full) sourceValue ∧
+        lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | matchNone targetEval emptyEval =>
+      obtain ⟨sourceTarget, sourceTargetEval, targetLowered⟩ :=
+        targetReflected targetEval
+      cases sourceTarget <;> simp_all [lowerValue]
+      obtain ⟨sourceEmpty, sourceEmptyEval, emptyLowered⟩ := emptyReflected emptyEval
+      exact ⟨sourceEmpty, .matchNone sourceTargetEval sourceEmptyEval, emptyLowered⟩
+  | matchSome targetEval bodyEval =>
+      obtain ⟨sourceTarget, sourceTargetEval, targetLowered⟩ :=
+        targetReflected targetEval
+      cases sourceTarget with
+      | some sourceItem =>
+          simp [lowerValue] at targetLowered
+          obtain ⟨sourceBody, sourceBodyEval, bodyLowered⟩ :=
+            someBodyReflected sourceItem _ targetLowered bodyEval
+          exact ⟨sourceBody, .matchSome sourceTargetEval sourceBodyEval, bodyLowered⟩
+      | bool _ => simp [lowerValue] at targetLowered
+      | int _ => simp [lowerValue] at targetLowered
+      | unit => simp [lowerValue] at targetLowered
+      | closure _ _ _ => simp [lowerValue] at targetLowered
+      | global _ => simp [lowerValue] at targetLowered
+      | nil => simp [lowerValue] at targetLowered
+      | cons _ _ => simp [lowerValue] at targetLowered
+      | none => simp [lowerValue] at targetLowered
+
+theorem some_evaluation_reflected (program : Definitions) (env : Environment)
+    (expression : Expr)
+    (innerReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) expression) value →
+      ∃ sourceValue, Evaluates program env expression sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.some expression)) value) :
+    ∃ sourceValue, Evaluates program env (.some expression) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | some innerEval =>
+      obtain ⟨sourceInner, sourceEval, lowered⟩ := innerReflected innerEval
+      exact ⟨.some sourceInner, .some sourceEval, by simp [lowerValue, lowered]⟩
+
+theorem cons_evaluation_reflected (program : Definitions) (env : Environment)
+    (head tail : Expr)
+    (headReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) head) value →
+      ∃ sourceValue, Evaluates program env head sourceValue ∧ lowerValue sourceValue = value)
+    (tailReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) tail) value →
+      ∃ sourceValue, Evaluates program env tail sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.cons head tail)) value) :
+    ∃ sourceValue, Evaluates program env (.cons head tail) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | cons headEval tailEval =>
+      obtain ⟨sourceHead, headSourceEval, headLowered⟩ := headReflected headEval
+      obtain ⟨sourceTail, tailSourceEval, tailLowered⟩ := tailReflected tailEval
+      exact ⟨.cons sourceHead sourceTail, .cons headSourceEval tailSourceEval,
+        by simp [lowerValue, headLowered, tailLowered]⟩
+
+theorem arguments_evaluation_reflected (program : Definitions) (env : Environment)
+    (expressions : List Expr)
+    (expressionReflected : ∀ expression {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) expression) value →
+      ∃ sourceValue, Evaluates program env expression sourceValue ∧ lowerValue sourceValue = value)
+    (values : List PolyIR.Value)
+    (evaluated : PolyIR.ArgumentsEvaluate (lowerDefinitions program) (lowerEnv env)
+      (lowerMany (identities env) expressions) values) :
+    ∃ sourceValues, ArgumentsEvaluate program env expressions sourceValues ∧
+      lowerValues sourceValues = values := by
+  induction expressions generalizing values with
+  | nil =>
+      cases evaluated
+      exact ⟨[], .nil, rfl⟩
+  | cons expression rest ih =>
+      rw [lowerMany_eq] at evaluated
+      cases evaluated with
+      | cons headEval tailEval =>
+          obtain ⟨headValue, headSourceEval, headLowered⟩ :=
+            expressionReflected expression headEval
+          obtain ⟨tailValues, tailSourceEval, tailLowered⟩ := ih (values := _) tailEval
+          exact ⟨headValue :: tailValues, .cons headSourceEval tailSourceEval,
+            by simp_all [lowerValues]⟩
+
+private theorem irArguments_value_length {program : List PolyIR.RuntimeDefinition}
+    {env : List PolyIR.Value} {expressions : List PolyIR.Term} {values : List PolyIR.Value}
+    (evaluated : PolyIR.ArgumentsEvaluate program env expressions values) :
+    values.length = expressions.length := by
+  induction expressions generalizing values with
+  | nil => cases evaluated; rfl
+  | cons expression rest ih =>
+      cases evaluated with
+      | cons _ tailEval => simp [ih tailEval]
+
+theorem letMany_evaluation_reflected (program : Definitions) (env : Environment)
+    (ids : List Nat) (initializers : List Expr) (body : Expr)
+    (wellScoped : initializers.length = ids.length)
+    (argumentsReflected : ∀ {irValues},
+      PolyIR.ArgumentsEvaluate (lowerDefinitions program) (lowerEnv env)
+        (lowerMany (identities env) initializers) irValues →
+      ∃ sourceValues, ArgumentsEvaluate program env initializers sourceValues ∧
+        lowerValues sourceValues = irValues)
+    (bodyReflected : ∀ (sourceValues : List Value) (irValues : List PolyIR.Value),
+      sourceValues.length = ids.length → lowerValues sourceValues = irValues →
+      ∀ {value},
+        PolyIR.Evaluates (lowerDefinitions program) (irValues ++ lowerEnv env)
+          (lower (ids ++ identities env) body) value →
+        ∃ sourceValue, Evaluates program (bind ids sourceValues ++ env) body sourceValue ∧
+          lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.letMany ids initializers body)) value) :
+    ∃ sourceValue, Evaluates program env (.letMany ids initializers body) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | letMany argumentsEval bodyEval =>
+      obtain ⟨sourceValues, sourceArgumentsEval, argumentsLowered⟩ :=
+        argumentsReflected argumentsEval
+      have sourceArity : sourceValues.length = ids.length := by
+        calc
+          sourceValues.length = (lowerValues sourceValues).length := by
+            simp [lowerValues]
+          _ = _ := congrArg List.length argumentsLowered
+          _ = (lowerMany (identities env) initializers).length :=
+            irArguments_value_length argumentsEval
+          _ = initializers.length := lowerMany_length (identities env) initializers
+          _ = ids.length := wellScoped
+      obtain ⟨sourceBodyValue, sourceBodyEval, bodyLowered⟩ :=
+        bodyReflected sourceValues _ sourceArity argumentsLowered bodyEval
+      exact ⟨sourceBodyValue, .letMany sourceArgumentsEval sourceArity sourceBodyEval,
+        bodyLowered⟩
+
+theorem sequence_evaluation_reflected (program : Definitions) (env : Environment)
+    (expressions : List Expr) (sourcePrevious : Value) (irPrevious : PolyIR.Value)
+    (previousLowered : lowerValue sourcePrevious = irPrevious)
+    (expressionReflected : ∀ expression {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) expression) value →
+      ∃ sourceValue, Evaluates program env expression sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.SequenceEvaluates (lowerDefinitions program) (lowerEnv env)
+      (lowerMany (identities env) expressions) irPrevious value) :
+    ∃ sourceValue, SequenceEvaluates program env expressions sourcePrevious sourceValue ∧
+      lowerValue sourceValue = value := by
+  induction expressions generalizing sourcePrevious irPrevious value with
+  | nil =>
+      cases evaluated
+      exact ⟨sourcePrevious, .nil, previousLowered⟩
+  | cons expression rest ih =>
+      rw [lowerMany_eq] at evaluated
+      cases evaluated with
+      | cons headEval tailEval =>
+          obtain ⟨headValue, headSourceEval, headLowered⟩ :=
+            expressionReflected expression headEval
+          obtain ⟨result, restSourceEval, resultLowered⟩ :=
+            ih (sourcePrevious := headValue) (irPrevious := _) (value := value)
+              headLowered tailEval
+          exact ⟨result, .cons headSourceEval restSourceEval, resultLowered⟩
+
+theorem begin_evaluation_reflected (program : Definitions) (env : Environment)
+    (first : Expr) (rest : List Expr)
+    (firstReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) first) value →
+      ∃ sourceValue, Evaluates program env first sourceValue ∧ lowerValue sourceValue = value)
+    (restReflected : ∀ expression {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) expression) value →
+      ∃ sourceValue, Evaluates program env expression sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.begin first rest)) value) :
+    ∃ sourceValue, Evaluates program env (.begin first rest) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | begin firstEval restEval =>
+      obtain ⟨firstValue, firstSourceEval, firstLowered⟩ := firstReflected firstEval
+      obtain ⟨result, restSourceEval, resultLowered⟩ :=
+        sequence_evaluation_reflected program env rest firstValue _ firstLowered
+          restReflected value restEval
+      exact ⟨result, .begin firstSourceEval restSourceEval, resultLowered⟩
+
+def EvaluationReflection (program : Definitions) : Prop :=
+  ∀ (env : Environment) (locals : List Nat) (expression : Expr)
+    (irEnv : List PolyIR.Value) (irExpression : PolyIR.Term),
+    irEnv = lowerEnv env → locals = identities env → irExpression = lower locals expression →
+    ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) irEnv irExpression value →
+      ∃ sourceValue, Evaluates program env expression sourceValue ∧ lowerValue sourceValue = value
+
+theorem appClosure_evaluation_reflected (program : Definitions) (env : Environment)
+    (function : Expr) (arguments : List Expr) (arity : Nat) (irBody : PolyIR.Term)
+    (irCaptured irArguments : List PolyIR.Value) (value : PolyIR.Value)
+    (reflection : EvaluationReflection program)
+    (functionEval : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) function) (.closure arity irBody irCaptured))
+    (argumentsEval : PolyIR.ArgumentsEvaluate (lowerDefinitions program) (lowerEnv env)
+      (lowerMany (identities env) arguments) irArguments)
+    (argumentsArity : irArguments.length = arity)
+    (bodyEval : PolyIR.Evaluates (lowerDefinitions program) (irArguments ++ irCaptured)
+      irBody value) :
+    ∃ sourceValue, Evaluates program env (.app function arguments) sourceValue ∧
+      lowerValue sourceValue = value := by
+  obtain ⟨sourceFunction, sourceFunctionEval, sourceFunctionLowered⟩ :=
+    reflection env (identities env) function (lowerEnv env)
+      (lower (identities env) function) rfl rfl rfl functionEval
+  cases sourceFunction with
+  | closure parameters body captured =>
+      simp [lowerValue] at sourceFunctionLowered
+      rcases sourceFunctionLowered with ⟨arityEq, bodyEq, capturedEq⟩
+      have sourceArgumentsReflection : ∀ {irValues},
+          PolyIR.ArgumentsEvaluate (lowerDefinitions program) (lowerEnv env)
+            (lowerMany (identities env) arguments) irValues →
+          ∃ sourceValues, ArgumentsEvaluate program env arguments sourceValues ∧
+            lowerValues sourceValues = irValues := by
+        intro irValues argsEval
+        exact arguments_evaluation_reflected program env arguments
+          (fun expression {irValue} expressionEval =>
+            reflection env (identities env) expression (lowerEnv env)
+              (lower (identities env) expression) rfl rfl rfl expressionEval)
+          irValues argsEval
+      obtain ⟨sourceArguments, sourceArgumentsEval, argumentsLowered⟩ :=
+        sourceArgumentsReflection argumentsEval
+      have sourceArity : sourceArguments.length = parameters.length := by
+        calc
+          sourceArguments.length = (lowerValues sourceArguments).length := by
+            simp [lowerValues]
+          _ = _ := congrArg List.length argumentsLowered
+          _ = arity := argumentsArity
+          _ = parameters.length := arityEq.symm
+      have bodyEnvironmentEq :
+          lowerEnv (bind parameters sourceArguments ++ captured) =
+            irArguments ++ irCaptured := by
+        rw [lowerEnv_bind_append parameters sourceArguments captured sourceArity,
+          argumentsLowered, capturedEq]
+      have bodyLocalsEq := identities_bind_append parameters sourceArguments captured sourceArity
+      have bodyTermEq : irBody =
+          lower (identities (bind parameters sourceArguments ++ captured)) body := by
+        rw [bodyLocalsEq, ← bodyEq]
+      obtain ⟨sourceResult, sourceBodyEval, resultLowered⟩ :=
+        reflection (bind parameters sourceArguments ++ captured)
+          (identities (bind parameters sourceArguments ++ captured)) body
+          (irArguments ++ irCaptured) irBody bodyEnvironmentEq.symm rfl bodyTermEq bodyEval
+      exact ⟨sourceResult,
+        .appClosure sourceFunctionEval sourceArgumentsEval sourceArity sourceBodyEval,
+        resultLowered⟩
+  | bool _ => simp [lowerValue] at sourceFunctionLowered
+  | int _ => simp [lowerValue] at sourceFunctionLowered
+  | unit => simp [lowerValue] at sourceFunctionLowered
+  | global _ => simp [lowerValue] at sourceFunctionLowered
+  | nil => simp [lowerValue] at sourceFunctionLowered
+  | cons _ _ => simp [lowerValue] at sourceFunctionLowered
+  | none => simp [lowerValue] at sourceFunctionLowered
+  | some _ => simp [lowerValue] at sourceFunctionLowered
+
+theorem appGlobal_evaluation_reflected (program : Definitions) (env : Environment)
+    (function : Expr) (arguments : List Expr) (index : Nat)
+    (irArguments : List PolyIR.Value) (irDefinition : PolyIR.RuntimeDefinition)
+    (value : PolyIR.Value) (reflection : EvaluationReflection program)
+    (functionEval : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) function) (.global index))
+    (argumentsEval : PolyIR.ArgumentsEvaluate (lowerDefinitions program) (lowerEnv env)
+      (lowerMany (identities env) arguments) irArguments)
+    (definitionFound : (lowerDefinitions program)[index]? = some irDefinition)
+    (argumentsArity : irArguments.length = irDefinition.arity)
+    (bodyEval : PolyIR.Evaluates (lowerDefinitions program) irArguments irDefinition.body value) :
+    ∃ sourceValue, Evaluates program env (.app function arguments) sourceValue ∧
+      lowerValue sourceValue = value := by
+  obtain ⟨sourceFunction, sourceFunctionEval, sourceFunctionLowered⟩ :=
+    reflection env (identities env) function (lowerEnv env)
+      (lower (identities env) function) rfl rfl rfl functionEval
+  have sourceGlobal : sourceFunction = .global index := by
+    cases sourceFunction <;> simp_all [lowerValue]
+  subst sourceFunction
+  obtain ⟨ids, sourceBody, sourceDefinitionFound, definitionEq⟩ :=
+    definitions_lookup_reflects program index irDefinition definitionFound
+  have sourceArgumentsReflection : ∀ {irValues},
+      PolyIR.ArgumentsEvaluate (lowerDefinitions program) (lowerEnv env)
+        (lowerMany (identities env) arguments) irValues →
+      ∃ sourceValues, ArgumentsEvaluate program env arguments sourceValues ∧
+        lowerValues sourceValues = irValues := by
+    intro irValues argsEval
+    exact arguments_evaluation_reflected program env arguments
+      (fun expression {irValue} expressionEval =>
+        reflection env (identities env) expression (lowerEnv env)
+          (lower (identities env) expression) rfl rfl rfl expressionEval)
+      irValues argsEval
+  obtain ⟨sourceArguments, sourceArgumentsEval, argumentsLowered⟩ :=
+    sourceArgumentsReflection argumentsEval
+  have sourceArity : sourceArguments.length = ids.length := by
+    calc
+      sourceArguments.length = (lowerValues sourceArguments).length := by simp [lowerValues]
+      _ = _ := congrArg List.length argumentsLowered
+      _ = irDefinition.arity := argumentsArity
+      _ = ids.length := by
+        have fields := congrArg PolyIR.RuntimeDefinition.arity definitionEq
+        simpa using fields
+  have bodyEnvironmentEq :
+      lowerEnv (bind ids sourceArguments) = irArguments := by
+    rw [lowerEnv_bind ids sourceArguments sourceArity, argumentsLowered]
+  have bodyTermEq : irDefinition.body = lower (identities (bind ids sourceArguments)) sourceBody := by
+    have bodyField := congrArg PolyIR.RuntimeDefinition.body definitionEq
+    simpa [bind_identifiers ids sourceArguments sourceArity] using bodyField
+  obtain ⟨sourceResult, sourceBodyEval, resultLowered⟩ :=
+    reflection (bind ids sourceArguments) (identities (bind ids sourceArguments)) sourceBody
+      irArguments irDefinition.body bodyEnvironmentEq.symm rfl bodyTermEq bodyEval
+  exact ⟨sourceResult,
+    .appGlobal sourceFunctionEval sourceArgumentsEval sourceDefinitionFound sourceArity sourceBodyEval,
+    resultLowered⟩
+
+theorem app_evaluation_reflected (program : Definitions) (env : Environment)
+    (function : Expr) (arguments : List Expr) (value : PolyIR.Value)
+    (reflection : EvaluationReflection program)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (.app (lower (identities env) function) (lowerMany (identities env) arguments)) value) :
+    ∃ sourceValue, Evaluates program env (.app function arguments) sourceValue ∧
+      lowerValue sourceValue = value := by
+  cases evaluated with
+  | appClosure functionEval argumentsEval argumentsArity bodyEval =>
+      exact appClosure_evaluation_reflected program env function arguments _ _ _ _ value reflection
+        functionEval argumentsEval argumentsArity bodyEval
+  | appGlobal functionEval argumentsEval definitionFound argumentsArity bodyEval =>
+      exact appGlobal_evaluation_reflected program env function arguments _ _ _ value reflection
+        functionEval argumentsEval definitionFound argumentsArity bodyEval
 
 /- A general forward simulation from independent, identity-based source
 semantics. It applies to arbitrary finite recursive executions, not just to

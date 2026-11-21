@@ -10,6 +10,20 @@ private def form : CBindingWalk.Node := .list [a "defun", a "choose" 10,
   .list [.list [a "x" 13, a "Integer"], .list [a "x" 16, a "Integer"]],
   a "Integer", a "x" 19 16]
 
+private def globalOne : CBindingWalk.Node :=
+  .list [a "define", .list [a "first" 31, a "Integer"], a "40"]
+private def globalTwo : CBindingWalk.Node :=
+  .list [a "define", .list [a "second" 37, a "Boolean"], a "true"]
+
+example : (readGlobalHeader 8 2 globalOne).map
+    (fun value => (value.identity, value.type, value.order)) = some (31, .integer, 2) := by
+  decide
+
+example : (readGlobalHeaders 8 0 [globalOne, form, globalTwo]).map
+    (List.map fun value => (value.identity, value.type, value.order)) =
+      some [(31, .integer, 0), (37, .boolean, 2)] := by
+  decide
+
 -- Even same-named, same-typed binders remain distinct by identity.
 example : checkProgram 60 [form] [signature] [.var 1] = true := by decide
 example : checkProgram 60 [form] [signature] [.var 0] = false := by decide

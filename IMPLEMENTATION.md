@@ -6,17 +6,33 @@
 
 ### 2026-11-19 追補: 構文照合と束縛ID意味論
 
-`ExpansionLowering.lean` は、CBindingWalkが検査した同じ注釈付き構文と、提案されたSurfaceの各ノードを独立に照合する。シグネチャ、型注釈、束縛IDから局所添字への対応、引数順、並列let、match節、組み込み関数の固定表現を検査する。省略した型引数を持つ呼び出しは、全型変数が仮引数型に現れる場合に限る。型整合性は別途SurfaceCheckerが検査する。mainの宣言名・シグネチャと整数エントリーポイントも照合する。
+`ExpansionLowering.lean` は、CBindingWalkが検査した同じ注釈付き構文と、提案されたSurfaceの各ノードを独立に照合する。シグネチャ、型注釈、束縛IDから局所添字への対応、引数順、並列let、match節、組み込み関数の固定表現を検査する。省略した型引数を持つ呼び出しは、全型変数が仮引数型に現れる場合に限る。型整合性は別途SurfaceCheckerが検査する。mainの宣言名・シグネチャと整数エントリーポイントも照合する。`readGlobalHeader` / `readGlobalHeaders` は注釈付きdefineから型、束縛ID、初期化式と元宣言位置を読み取る。これは後続形式へまだ変換・接続していない。
 
 `NamedSemantics.lean` は、局所変数を束縛IDで参照し、環境をIDと値の対応列として扱う独立した有限評価意味論である。`NamedDecoder.lean` は元の注釈付き構文からこの操作的構文を読み取る。型注釈・型適用は操作的構文では実行しないが、元構文と型付きIRの注釈対応を上記の照合器で検査する。
 
 `NameLowering.evaluation_preserved` は任意の有限のNamed評価を、位置添字を使う実行用IRの評価へ移す一般定理である。クロージャ、共有された再帰関数表、並列let、List/Option照合を含む。poly証書は元構文の読み取り、生成IRとの型消去後の一致、`source_evaluation_preserved` を入力ごとにカーネル検査する。単に型が合う別の出力を提示しても受理されない。
 
+逆向き評価証明の基礎として `lookup_lowered_reflects` と `variable_evaluation_reflected` を追加した。lowered environmentの位置lookupが値を返すなら、元のNamed環境で同じbinder identityをlookupして対応する値を得られ、IRの変数評価導出をNamed側へ反映できる。`definitions_lookup_reflects` / `global_evaluation_reflected` は大域参照を、各リテラル反映補題は定数評価をNamed側へ戻す。`lambda_evaluation_reflected` はIRのclosure生成導出をNamedのラムダ評価へ戻し、クロージャ値のlowering一致まで示す。`add_evaluation_reflected`、`sub_evaluation_reflected`、`mul_evaluation_reflected`、`le_evaluation_reflected`、`intEq_evaluation_reflected`、`ite_evaluation_reflected`、`some_evaluation_reflected`、`cons_evaluation_reflected` は子式の反映を入力として算術・比較・分岐・Option構築・List構築の評価を合成する。さらに `arguments_evaluation_reflected` と `sequence_evaluation_reflected` は各要素の反映証明を受けて列の評価を合成し、`begin_evaluation_reflected` はその補題を使ってbegin評価を反映する。対応する構成子の例を `tests/NameLowering.lean` で検査し、モジュールのLeanビルドも成功した。これらは構成子ごとの部分結果であり、クロージャ適用や他の複合式を含む評価全体の逆向き定理は未証明。
+
+クロージャ適用の環境対応を支える補題として、`lowerEnv_bind_append` は引数をbindしたNamed環境をlowerするとIRの引数値列と捕捉環境の連結になることを示し、`identities_bind_append` と `lower_call_body` はその環境のbinder ID列および本体のloweringを `ids ++ identities env` と一致させる。具体例を `tests/NameLowering.lean` で検査した。クロージャ適用の逆向き評価証明そのものは未完了。
+
+`letMany_evaluation_reflected` は、初期値数がbinder ID数と一致する整形式条件の下で、IRの初期化列と本体評価の反映証明からNamed側のletMany評価を構成する。IRはletManyのbinder ID数を消去するため、この前提をIR評価だけから導けるとはしていない。単一binderの変数参照例を `tests/NameLowering.lean` で検査した。全式の逆向き定理やこの整形式条件を元ソース証書から得る接続は未完了。
+
+`matchList_evaluation_reflected` は、target/empty branchの反映と、cons branchに追加されたhead/tail値に対応する環境での本体反映を入力として、list match評価をNamed側へ戻す。`matchOption_evaluation_reflected` もnone/someの分岐を同じ方法で反映し、some branchではpayloadを追加した環境の本体評価を使う。各caseの具体例を `tests/NameLowering.lean` で検査した。各ケース補題を単一の一般評価反映定理へ統合する帰納証明は未完了。
+
+`EvaluationReflection` はNamed環境・binder ID列・IR環境・lowered式の対応を保つ相互帰納法のmotive候補として定義した。`appClosure_evaluation_reflected` はこのmotiveから関数、引数列、本体評価を反映し、引数bind後の環境・arity・body loweringを接続する。`appGlobal_evaluation_reflected` は大域関数lookupを逆向き定義lookupへ接続し、引数環境で本体を反映する。`app_evaluation_reflected` はIRの二つのapplication規則をこの補題へ振り分ける。これらは帰納ステップの補題であり、motive自体を成立させる全constructorの相互帰納証明はまだ完了していない。
+
+逆向き評価の無条件主張には反例がある。`letMany`のbinder IDリストはIR loweringで消えるため、ID数0・初期値1個のNamed式はIR上では評価成功するが、Named側はarity条件により評価できない。この反例を `tests/NameLowering.lean` で検査した。したがって一般定理には、デコーダ／型検査が保証するletMany arity、ソースのwell-scoped性、およびプログラム・環境に入るclosureの不変条件を入力へ明記する必要がある。これらの条件と全式反映の統合は未完了。
+
+`NamedDecoder.letParts_lengths` は成功したlet binding走査でbinderとinitializerの件数が等しいことを示し、`decodeExprs_length` は成功した式列decodeがNode件数を保つことを示す。decodeExprのlet分岐を `decodeLetMany` に集約し、`decodeLetMany_lengths` で実際のlet decode成功結果についてもbinder数とinitializer数が等しいことを証明した。さらに`letLayoutsAligned` が全式木中のlet件数を検査し、`decodeExprChecked` / `decodeFunctions` はこの条件を満たす関数本体だけを返す経路を定義する。`decodeExprChecked_spec` と `decodeExprChecked_letMany_lengths` はchecked decode結果からletのbinder/initializer長さを取り出し、`decodeFunctions_letLayoutsAligned` / `decodeProgram_letLayoutsAligned` はdecodeProgram出力の全ネストletに対する保証を述べる。`definitionsLetLayoutsAligned_mem`、`decodeProgram_member_letMany_lengths`、`decodeProgram_lookup_letMany_lengths` はその保証を出力定義の任意のletとindex lookupへ適用し、`decodeExprChecked_letMany_evaluation_reflected` はchecked decodeから `letMany_evaluation_reflected` へ長さ条件を渡す。評価反映の帰納仮定自体を構成する一般定理は未完了で、Leanビルド確認も残る。
+`definitions_lookup_reflects` と `global_evaluation_reflected` も加え、lowered定義表の要素から元の定義を復元し、IR global評価をNamed側へ反映する。テストでは一要素の関数表に対するglobal評価を確認した。これらの補題はlookupと二つの原子ケースだけを扱い、関数適用・クロージャを含む評価全体の反映は未証明。
+bool、int、unit、nil、noneの評価規則についても対応する `*_evaluation_reflected` 補題を追加し、Named側の値を構成してIR値へのlowering一致を証明した。関数適用、条件分岐、再帰データ値やクロージャを含む一般評価の反映は未証明。
+
 この定理は有限評価の前向き保存であり、逆向きの評価反映、Named意味論とC実行器の対応、新多相モデルの型安全性、検査器全体の多項式時間を追加で保証するものではない。保証範囲の `formal_semantic_preservation` は処理系全体の保証ではないためfalseを維持し、polyのkernel_checksに上記の部分保証を列挙する。
 
 名前変換は数値IDを含むsizeOfによる再帰から、構文の入れ子帰納原理へ変更した。Lean 4.8のネイティブコード生成がこの帰納原理に未対応のため、この証明用変換はnoncomputable指定だがカーネル内では簡約できる。Cの実行器と既存の実行可能な型消去関数は維持する。これは検査器全体の計算量上界の証明ではない。
 
-`TypeArguments.lean` は一方向の型引数収集アルゴリズムと証明付き結果を追加する。戻り値の期待型を入力にせず、呼び出し側の型変数を固定した構文として扱い、未決定変数や競合する制約を拒否する。成功値は型引数個数、呼び出し側での整形式性、仮引数型の具体化と実引数型の一致、一意性を保持する。`inferred_arguments_unique` は、全量化変数が仮引数型に現れるという判定の受理から、任意の二つの整合する型引数列が等しいことを証明する。一般的な完全性、Cの推論器との一般的な対応、新多相モデルの型安全性は別課題である。
+`TypeArguments.lean` は一方向の型引数収集アルゴリズムと証明付き結果を追加する。戻り値の期待型を入力にせず、呼び出し側の型変数を固定した構文として扱い、未決定変数や競合する制約を拒否する。成功値は型引数個数、呼び出し側での整形式性、仮引数型の具体化と実引数型の一致、一意性を保持する。`inferred_arguments_unique` は、全量化変数が仮引数型に現れるという判定の受理から、任意の二つの整合する型引数列が等しいことを証明する。`collectorTypeFuel` / `collectorTypesFuel` は制約走査の計算可能な構造fuelを定める。`CheckerCompleteness.inferTypeArguments_complete_from_candidate` は、整形式かつ仮引数と実引数に整合する候補について、全量化変数の出現とcollector・型検査両方の構造fuelを前提に推論器がその候補を返すことを証明する。`inferTypeArgumentsCandidateFuel` は二つの計算可能なfuel境界の最大値を返し、`inferTypeArguments_complete_at_candidate_fuel` はその上界で完全性を示す。Cの推論器との一般的な対応と、新多相モデルの型安全性は別課題である。
 
 ### 2026-11-19 追補: 多相評価器の型安全性
 
@@ -30,9 +46,19 @@
 
 C実行器で、大域値の初期化前に生成したクロージャが、後から初期化された同じ束縛を参照できない例を修正した。全大域値に未初期化の共有セルを先に確保し、ソース順に各初期化式を実行してセルを一度だけ埋める。関数・ラムダは同じセルを参照する。未初期化セルを実際に読むと、内部のunboundではなく「before its initialization」の初期化エラーを返す。局所束縛やマクロ定義位置のスコープは維持する。
 
+CとGlobalIRの状態表現には次の対応がある。Cの`RBind.value == NULL`はGlobalIRのstore slotの`none`、初期化後の`RBind.value == v`は`some v`に当たる。Cの`value_slots[i]`は各`D_VAL`宣言に対応する共有`RBind`ノードを指し、初期化ループはこの同じノードの`value`を書き換える。GlobalIRでは同じslotをstore listのindexで表し、getter定義が呼出し時のstoreから読む。Cの`Program` indexからdefine ordinalへの対応、文字列名検索とNamed binder IDの対応を保つ状態関係およびC実行ステップとのシミュレーション定理は未実装であり、この表現上の対応だけを形式証明済みとは扱わない。
+
 `tests/global_initialization.py` は、後から初期化されるセルを参照する脱出クロージャ、局所シャドーイング、初期化中の読み出し、未選択分岐、未使用でも実行する初期化式、マクロの定義位置を確認する。Cの修正と規範仕様の明確化であり、polyモードへのdefineの変換と初期化・捕捉の意味保存証明はまだ実装していない。
 
-`GlobalIR.lean` はこの変換を接続するための実行可能な基礎モデルである。大域値は未初期化/初期化済みのストアに保持し、内部の0引数getterが呼び出し時のストアを読む。クロージャの局所環境へ古い大域値を固定せず、初期化式をソース順に実行してからエントリーポイントを実行する。`initialization_length`、`initialized_prefix_unchanged`、`initialized_cells_present` により、成功した初期化はセル数を変えず、先行セルを上書きせず、処理した範囲を初期化済みにすることを証明した。`tests/GlobalIR.lean` はCと同じ脱出クロージャの例を実行する。このモデルの入力はIRであり、元ソースのdefineからの変換・型安全性・C実行器との対応を証明したとは扱わない。
+`GlobalIR.lean` はこの変換を接続するための実行可能な基礎モデルである。大域値は未初期化/初期化済みのストアに保持し、内部の0引数getterが呼び出し時のストアを読む。クロージャの局所環境へ古い大域値を固定せず、初期化式をソース順に実行してからエントリーポイントを実行する。`initialization_length`、`initialized_prefix_unchanged`、`initialized_cells_present` により、成功した初期化はセル数を変えず、先行セルを上書きせず、処理した範囲を初期化済みにすることを証明した。さらに`evaluate_lambda_store_independent`はクロージャ作成がストアに依存しないことを、`getter_call_reads_current_store`と`getter_call_reports_early_read`はgetter呼び出しが現在のストア値を返すことと未初期化時の専用エラーを証明する。`initializeValues_stops_on_error`と`initializeValues_commits_head`は、初期化式の失敗で処理を止め、成功時はその値をセルへ格納してから次へ進むことを示す。これらのgetter呼び出し定理は評価fuelを2以上とする。`tests/GlobalIR.lean` はCと同じ脱出クロージャの例を実行し、上記の定理の公理依存も出力する。このモデルの入力はIRであり、元ソースのdefineからの変換・型安全性・C実行器との対応を証明したとは扱わない。
+`StoreWellTyped` は初期化済みセルを型付きとする条件を定義し、`StoreWellTyped.set` は型付き値をセルへ書き込んでもこの条件が保たれることを示す。`initializeValues_preserves_typed` は初期storeが型付きで、各slotの型対応があり、各initializer評価が型付き値を返し、列がstore範囲内に収まるなら、成功後のstoreも型付きであることを示す。`readGlobal_preserves_type` と `getter_call_preserves_type` はその条件下でgetter読み出しの返値型を保存する。GlobalIR評価器の型安全性からinitializer評価の前提を導く証明、通常関数評価と拡張型への一般化は未完了。
+
+`GlobalProgramTyped` は明示的な `functionSources` 対応表を取り、combined runtime table indexとsource function definition indexを分けてfunction entryを元のchecked source body・signatureへ結ぶ。`functionSourcesFor` は関数prefixの同一index対応を生成し、`mem_functionSourcesFor_iff` はその範囲を特徴付ける。`functionEntries` は関数本体をeraseしてgetter参照を書き換え、`assembleProgram` はその関数列の後ろへslot getter列を連結する。`assembleGlobals` は対応するsignature列を作り、`assembled_function_source_layout` / `assembled_getter_layout` は関数・getterのruntime indexをsource signatureやslot typeへ対応づける。`AssembledSourceTyped` の仮定から `assembleProgram_typed` がこのtableの `GlobalProgramTyped` を構成する。`getterMappings` / `getterFor_getterMappings` と `lowerGlobalReads_global_value_getter` は関数prefix後のglobal value indexをgetter callへ接続する。`ExpansionLowering.globalValueIndex` / `globalValueReferenceIndex_sound` と `NamedDecoder.globalIndex_value_reference` はGlobalHeaderのbinder IDからslot index・function-prefix込みglobal indexへの対応を示す。`ExpansionLowering.readProgramHeaders` / `NamedDecoder.decodeTopLevelProgram` は混在した関数・値global列をそのindex規約でdecodeし、slot型・initializer数の一致を証明する。`GlobalIR.assembleNamedProgram` / `programOfNamed` はdecoded function bodyとinitializerをgetter付きtable・store初期化列へ変換する。`assembleNamedProgram_length` / `programOfNamed_definition_count` はruntime definition tableの全長が関数数+slot数になることを示し、`programOfNamed_getter_lookup` はcombined indexで各slotのgetter entryを特定する。`decodedProgram_layout` はdecode成功からruntime table全長・initializer数・値slot getter位置を一つの結論へまとめる。decode結果から型付きlayoutを導く型証明と、実行時のソース意味保存およびGlobalIR評価規則全体の型不変条件はまだ証明されていない。Leanビルド確認は未完了。
+`empty_store_well_typed` と `initializeValues_from_empty_preserves_typed` は初期化開始時の全slotが未初期化である実際のstore形状から同じ型不変条件を保つ。各initializer評価の型付き性は依然として前提であり、それをGlobalIR評価器から導く型安全性証明ではない。Leanビルドでの確認は未完了。
+
+`InitializerTypesAgree.slot_type_at` は、この合意条件の下でinitializer列内の各offsetから対応slot型を取り出す。これは初期化列をslot型列と照合する補題であり、initializerを実行した値の型保存を単独では証明しない。
+`lowerGlobalReads`は値定義indexとgetter定義indexの対応表を受け取り、値位置のglobal参照を零引数getter呼び出しへ書き換える。適用先がgetter対応表にある場合はgetterで値を取り出してから引数を適用し、対応表にない関数参照と局所変数は保持する。このIR上の書き換えを確認したが、source binder IDと大域表indexから対応表を構築する変換や、その意味保存は未証明である。
+`Diverges`は任意の正のfuelで評価がfuel切れになる性質として定義した。自己再帰関数の例で発散を示し、発散するinitializerが後続の初期化式へ進まないことを証明した。これはこのfuel付きGlobalIR評価器の意味であり、C評価器やソース評価との非停止対応ではない。
 
 ### 2026-11-19 追補: 整数の大きさと証明検査コスト
 
@@ -54,7 +80,7 @@ C実行器で、大域値の初期化前に生成したクロージャが、後�
 
 関数本体は型引数ごとに複製しない。型抽象はDefinitionのtypeArityに対応するシグネチャ束縛、型適用はglobalの明示的な型引数列として保持する。実行用表現だけからこれらを除く。新モデルは既存TypedExpansion.Tyとは別の型であり、両者の一般的な対応は未接続。
 
-`SurfaceChecker.lean` は全Surface構文の実行可能な型検査と証明付きIR構築を行う。`elaborateProgram` は共有された全シグネチャの下で各汎用本体を一度検査し、再帰・相互再帰・多相再帰を具体化なしに受理する。成功値自体に `HasType` の証明を保持する。明示的型引数を持つ展開後構文が入力であり、Cの一方向型引数推論の正しさはまだ接続していない。checkerの深さ予算超過と型不適合はともにnoneとなるため、noneは不適合の証明として使わない。一般的な完全性・型保存・Progressは未証明。
+`SurfaceChecker.lean` は全Surface構文の実行可能な型検査と証明付きIR構築を行う。`elaborateProgram` は共有された全シグネチャの下で各汎用本体を一度検査し、再帰・相互再帰・多相再帰を具体化なしに受理する。成功値自体に `HasType` の証明を保持する。明示的型引数を持つ展開後構文が入力であり、Cの一方向型引数推論の正しさはまだ接続していない。checkerの深さ予算超過と型不適合はともにnoneとなるため、noneは不適合の証明として使わない。C CLIでは深さ・作業予算超過を `NLISP_UNKNOWN`、型不適合を `NLISP_TYPE_ERROR` として区別する。`CheckerCompleteness.lean` の `checkerTypeFuel` / `checkerTypesFuel` は型木と関数型引数列から整形式性検査用fuelを直接計算し、`checkWF_sufficient` と `checkTypesWF_sufficient` が十分性を証明する。`checkerSignatureFuel` / `checkSignatureWF_sufficient` はシグネチャの全parameter型とresult型をこの境界で検査できることを示す。計算可能な `checkerExprFuel` / `checkerExprsFuel` は式と式列の子fuel・注釈・参照対象の全global signatureを合成し、`inference_structural_fuel` は得られた上界以上のfuelで`infer`が証明付き結果を返すことを示す。C推論器との対応と候補条件に依存しない型引数決定完全性は未完了。一般的な型保存・Progressも未証明。
 
 局所環境は先頭パラメーターが添字0。並列letの全右辺は元の環境で評価し、結果列を同時に追加する。グローバル本体の局所環境は引数だけ。`verify_lean.py --mode poly` はC展開結果から明示的型引数を持つSurfaceへ変換し、全汎用本体・mainの型検査と検査済みProgramの型消去対応をLeanで照合する。旧経路と異なり再帰本体のインライン化・型ごとの具体化は行わない。Python変換とC構文の一般的な対応定理、トップレベル初期化・捕捉の明示化、C型表現との対応は未接続。トップレベルdefineはpolyモードで明示的に拒否する。fuelは導出深さを制限し、総実行ステップ数や多項式時間保証ではない。新SurfaceモデルはBoolean/Integer/Unit/関数/List/Optionの範囲で、Float/String/Characterと残りの組み込み関数は旧TypedExpansionモデル・C実装の範囲に残る。
 
@@ -106,6 +132,10 @@ Lean 4.8.0で全モジュールとSurfaceIR/Erasure/EvaluatorCorrectness/Erasure
 
 型変数は関数ごとに異なる識別を持ち、本体の宣言型、ラムダ、コンストラクタ型引数でも有効である。List、Option、関数型の内部を再帰的に照合する。多相関数を高階関数へ渡す場合は`type-app`で単相化する。暗黙の一般化、高階ランク多相、期待戻り値型からの型引数決定は行わない。
 
+Cの`match_type`は型変数を宣言中の`Type*` identityで識別し、Leanの`collectArgument`は局所de Bruijn indexで識別する。どちらも実引数型を一度だけ記録し、再出現時は完全一致を要求して、List/Option/関数型の内部を再帰する。`collectArgument_first_variable_capture` はcaller側の `Ty.var` を再帰的に解かずそのまま格納し、`collectArgument_repeated_variable_same` / `_conflict` は同じ制約の一致・不一致をCと同様に分ける。Leanの成功結果の健全性・一意性はカーネルで証明済みだが、C側のpointer identity・monotype検査・配列代入を含む一般シミュレーション、収集器の完全性、式全体の構造的fuel上界は未証明である。比較表と条件は`RESEARCH_FORMALIZATION.md`に記録する。
+
+Cの照合ステップに対応して、`AssignmentsAgree.set` は既存制約と候補型引数列の一致を更新後も保ち、`collectArgument_first_variable_agrees` / `collectArgument_repeated_variable_agrees` は型変数の単一出現・再出現をこの不変条件へ接続する。複合型木とparameter列全体に対する帰納的collector完全性にはまだ接続していない。
+
 型適用は実行時に消去する。ラムダの仮引数情報は静的検査時に保持し、実行時に型変数を再解釈しない。
 
 使用例は`examples/polymorphism.nlisp`。Lean連携テストで具体化後のコア式を型検査する。多相型検査アルゴリズム全体の健全性・完全性を証明したものではない。
@@ -146,6 +176,8 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
+CMakeはPythonベースのテストで`PYTHONUTF8=1`を設定する。Windowsのシステムロケールが日本語でも、UTF-8のJSON・Lean証明項をCP932として読み書きしないためである。
+
 ## 実行
 
 ```text
@@ -184,11 +216,59 @@ Lean連携ツールにも同じ4つのオプションを指定できる。C処�
 
 `--verify-certificate` は埋め込まれた元ソースを一時ディレクトリに復元して `export-core` を再実行し、全過程を照合する。記録した方式の変換も再実行し、変換記録とLean本文を照合してからLean検査する。検証前にファイルサイズ・宣言された予算を検証者の上限と比較する。予算の引き上げを証明書の自己申告だけで許可しない。本文は再生成結果と一致した場合だけLeanへ渡す。再検証は元ファイルを変更しない。
 
+`ExpansionCertificate.checkWithTraversalCost` は、局所証書のコンストラクタを1件1単位として走査コストを返す。`checkWithTraversalCost_result` で通常の `check` と結果が一致し、`checkWithTraversalCost_le_nodes` でコストが証書コンストラクタ数以下であることを示す。このコストモデルは証書木の制御構造だけを扱い、macroStep内の `matchRule`・`copyWithMacros`、環境探索、型照合のコストを数えない。したがって検査器全体の上界や多項式時間保証にはならない。
+
 `--verify-certificate ... --independent` はC処理系を起動しない。元ソースと展開導出の証拠、変換記録から本文を再構成し、読み取り・正規化・局所展開・束縛対応をLeanカーネルで検査する。存在しない `--nlisp` を指定して数学マクロの実証書を検査する統合確認に成功した。通常の再実行方式も残す。
 
 JSON内の重複キー、不正なBase64、ダイジェスト不一致、別のLean環境、再現できない入力・規則適用・変換・本文はエラーとする。暗号署名はなく、保証範囲のフィールドにもその旨を明記する。検査器全体の正しさと多項式時間上界の一般証明は残る。証書のassurance内のprocess欄は生成時の記録方式であり、再検査にCを起動したかは選択した検査モードによる。
 
 元ソース・証明書の読み込みとC過程出力の取り込みにも証明書のバイト上限を適用し、上限を超えた出力をメモリへ無制限に取り込まない。上限超過時は自分が起動したC子プロセスを終了して回収し、Unknownを返す。証明書自体の改行はLFに固定し、同梱する元ソースの改行・UTF-8バイト列はそのまま保持する。
+
+### 入力サイズと計算量の範囲
+
+独立検査器の入力サイズを、検査する単一証明書の実ファイル長 `B` バイトに対する `N = 8B` ビットと定義する。証明書には元ソース、構文、型、識別子、数値、過程記録、Lean本文がそれぞれの実際の符号化で含まれるため、Base64・JSON・10進整数・Lean本文の表記長も `N` に数える。元ソースを証明書外から別途渡す方式を測る場合は、そのファイル長も加算する。
+
+証明書形式は構文木をJSON配列の木として直列化し、参照共有をポインタやDAG参照として符号化しない。C側でマクロ引数の構文を共有しても、証明書では出現ごとに直列化される。再検査時は各出現を個別に検査し、ノード間の結果キャッシュは使わない。したがって `N` は展開で複製された構文と証明本文のサイズも含むが、Lean本文の生成・精緻化・カーネル検査の計算量上界は別途証明が必要である。
+
+Lean側では `checkWithTraversalCost` が局所証書コンストラクタ走査を1ノード1単位で上から数え、`checkWithTraversalCost_le_nodes` が証書ノード数以下を示す。`freshIntervalCount_le_nodes` はfresh区間数も同じノード数で抑え、`intervalPairComparisonCost_le_square` は重複検査の区間pair比較回数を区間数の二乗以下に抑える。`checkFreshStructuralCost_polynomial` は両工程を合成し、ノード数を `n` とした部分コストが `n + n²` 以下と示す。これはpair述語の呼び出し回数であり、任意精度Natの比較に必要なビット演算は数えない。また `macroStep` 内の規則探索・構文照合・`copyWithMacros`、型検査とLeanカーネルのコストも含まないため、独立検査器全体の多項式上界を示すものではない。
+
+`CMacroCopy.lookupWithCost` は連想リストのlookupで検査したキーごとに1単位を数え、結果が通常の `lookup` と一致し、費用が環境リスト長以下となる構造モデルを定義する。失敗lookupは全キーを検査するため、`lookupWithCost_miss_scans_all` で費用が環境長と等しいことを示す。`binderWithLookupCost` はbinder処理のlookup部分へこの計数を接続し、lookupを含む結果の一致と同じ長さ上界を置く。`copyParametersWithLookupCost`、`copyPatternWithLookupCost`、`copyBindingsWithBinderLookupCost` は列走査とhole lookup費用を合成し、通常の各copy操作との結果一致および列長×(hole環境長+1)+1の上界を示す。最新のWSL Lean 4.8ビルドで`NLisp.CMacroCopy`は`Built`となり、これらの定理を含むファイルのコンパイルを確認した（unused-variable警告あり）。これは文字列比較を1単位とみなすモデルであり、文字列長に応じた比較コスト、fresh token文字列生成、Nat演算、initializer内部やcopy全体の構文走査・型照合は含まない。
+
+`copyParametersWithLookupCost` はparameter-binder列の各要素に1単位、実行したhole lookupのキー比較ごとに1単位を課し、通常の`copyParameters`との結果一致と「列長×(hole環境長+1)+1」の上界を与える。WSL Lean 4.8ビルドで確認済み。型payload検査やlambda全体の他のcopy処理は含まない。
+
+`copyPatternWithLookupCost` は任意マクロ集合のmatch pattern binder列にも同じ走査・lookup費用を与え、`copyPatternWithMacros`との結果一致と同じ列長上界を定義する。WSL Lean 4.8ビルドで確認済み。patternの構造検査とcase body copyはこの部分モデルの対象外である。
+
+`copyBindingsWithBinderLookupCost` はlet binding列の各binder lookupと行走査を計量し、`copyBindingsWithMacros`との結果一致と列長上界を与える。WSL Lean 4.8ビルドで確認済み。initializerの通常copyを呼び出すが、その内部費用は明示的に計量対象外とするため、let全体のcopy費用ではない。
+
+`CExpansion.holeEntriesWithCost` は、マクロ呼び出しの仮引数と実引数の対応付けに対し、各対応要素と終端または形状不一致を1単位として数える。通常の `holeEntries` と同じ結果で、費用は仮引数列の長さに1を足した値以下となる。これは `matchRule` の浅い形状・名前比較、文字列長依存の比較、リスト割当、後続の `copyWithMacros` を含まないため、局所的な引数対応付けの上界である。Leanビルドでの確認は未完了。
+
+最新のWSL `lake build` では `NLisp.CMacroCopy` はwarningのみでビルド成功した。`NLisp.CExpansion.holeEntriesWithCost_result` はOption mapとdo記法のbindの一致で失敗し、修正を追加した。`NLisp.ExpansionLowering.globalValueIndex_lookup_sound` ではslot indexの等式方向とcons後のlist lookup条件で失敗し、両方を補題で明示する修正を加えた。これらの修正は次回ビルドでの確認待ちである。
+
+`matchRuleWithCost` はこの対応付けモデルに浅い規則・呼び出し形状とhead名の判定を1単位で加え、通常の `matchRule` と同じ結果および仮引数数+2の上界を定義する。文字列比較のbitコストや固定形状パターンマッチ内の各constructor検査を個別には数えない。このモデルも証明書の `macroStep` 全体や `copyWithMacros` の計算量上界ではない。Leanビルドでの確認は未完了。
+
+`ExpansionCertificate.membershipWithCost` は規則一覧の所属探索で実際に調べた各要素を1単位として数え、比較回数が一覧長以下であることを示す。`checkStepWithMatchCost` はこの探索費と規則照合費を局所証書stepへ接続し、通常の `checkStep` と同じ真偽値を返す。その上界は仮引数数 + 規則一覧長 + 2 である。`copyWithMacros` の判定は実行するが内部費用はこのモデルから除外するため、検査step全体の上界を与えるものではない。Leanビルドでの確認は未完了。
+
+`checkWithMatchTraversalCost` はこの局所費用を `refl` / `congList` / `macroStep` / `trans` に再帰的に合成し、`trans` の接続点等値判定呼び出しとその左endpointの構文node比較費を数える。`checkWithMatchTraversalCost_result` は通常の `check` と判定が一致すること、`checkWithMatchTraversalCost_le_bound` は `certificateMatchCostBound rules` 以下となることを示す。各macroStepの上界は埋め込みruleの仮引数数 + 規則一覧長 + 2 である。`certificateMatchCostBound_eq_components` の費用成分には証書node数、仮引数総数、macroStep数×(規則一覧長+1)、trans数、endpoint比較node数の合計を含む。`treeNodeCount` は構文木のconstructor数を数え、`treeEqWithWorstCaseCost` は左endpoint全体を課金する保守的な費用を返す。証書内の構文payloadを含む入力バイト長への上界、atom payloadのbit費用、copy本体の費用はまだ示しておらず、全検査器の多項式時間保証ではない。変更後のLeanビルド確認は未完了。
+
+`CMacroCopy.treeNodeCount` はatom payloadの大きさに依存せず構文木のconstructor数を数える。`treeEqWithWorstCaseCost` は等値判定の結果を保ち、左operandの全constructor数を課金する保守的な比較費用を返す。`certificateTransComparisonCost` はこの比較費を証書のtransノードすべてに合成する。証書byte長への上界接続とatom名・整数tokenなどpayloadのbit費用は対象外で、Leanビルド確認も未完了。
+
+`separatedManyWithCost` と `disjointIntervalsWithCost` は、fresh区間検査における端点検査と区間pair比較を短絡評価に合わせて計量し、通常の `disjointIntervals` と同じ結果を返す設計である。`checkFreshWithMatchCost` はこの費用と規則照合費を合成する。証書ノード数を `n` とすると、部分費用の上界は `certificateMatchCostBound rules + n² + n` となる。copy本体、構文payload、Nat比較のbit費用は除外する。Leanビルドでの確認は未完了。
+
+`certificateMatchCostBound_eq_components` は、照合・接続点判定とendpoint比較の累積境界を証書node数、各macroStep規則の仮引数数の合計、macroStep数×(規則一覧長+1)、trans数、endpoint比較node総数へ分解する。これは部分モデルの費用内訳であり、構文payload上のbit費用やcopy本体を含む実際の実行時間の主張ではない。費用式変更後のLeanビルド確認は未完了。
+
+`certificateMacroStepCount_le_nodes` と `certificateTransCount_le_nodes` によりmacroStep数・trans数は証書node数以下となる。`certificateTransComparisonCost_le_count_mul_max` は比較node総数をtrans数×最大endpoint構文node数に抑え、`certificateMatchCostBound_le_endpoint_polynomial` と `checkFreshWithMatchCost_le_endpoint_polynomial` は照合・endpoint比較・freshness費用を証書node数、規則一覧長、仮引数総数、最大endpoint構文node数の多項式で抑える。最大endpointサイズを証書byte長へ抑える証明は未完了のため、証書byte長に対する計算量保証はまだ主張しない。copy本体・atom payload bit操作も対象外で、Leanビルド確認は未完了。
+
+`certificateEndpointPayloadNodes` は、各証書nodeのsource/target endpoint、trans接続点の左endpoint、およびその子証書のendpoint syntax nodeを合計する。`certificateMaxEndpointNodes_le_payload` と `checkFreshWithMatchCost_le_payload_polynomial` により、最大endpoint構文node数をこの集計値で置き換えた構造サイズ上界を追加した。この値を実際のJSON/Lean証書byte長へ結ぶ符号化定理はまだなく、byte-size計算量保証ではない。Leanビルド確認も未完了。
+
+2026-11-20の探索的比較を `tools/benchmark_certificates.py` で行った。各例1回、Windows上で、証明書なしの `run`、証明書生成、C再実行付き再検査、Cを使わない独立再検査を計測した。展開結果サイズは `nlisp expand` の出力バイト数、証明書サイズは最終Leanファイルのバイト数である。メモリは親子プロセスのRSSを10ms間隔でサンプルしたピーク値であり、厳密な最大値ではない。
+
+| 例 | 入力 / 展開 / 証明書 bytes | 実行 秒 / MiB | 生成 秒 / MiB | 再実行検査 秒 / MiB | 独立検査 秒 / MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| factorial | 141 / 122 / 82,082 | 0.026 / 2.0 | 10.14 / 476 | 9.78 / 475 | 9.78 / 475 |
+| macros | 963 / 302 / 225,248 | 0.024 / 2.0 | 23.52 / 555 | 23.80 / 558 | 23.88 / 557 |
+| polymorphism | 611 / 463 / 186,505 | 0.024 / 2.0 | 35.52 / 551 | 34.89 / 552 | 35.44 / 551 |
+
+これは統計的な性能評価ではなく、各条件1回の観測である。使用した既存C実行ファイルは基準コミット `9a0f9f8` 相当で、現HEADに含まれる後続の大域初期化修正と今回のID上限ガードを含まない。対象例での目安に限り、現HEADの再ビルドを使った再計測が残る。生成・検査時間はLean検査が主で、これらの例では再実行と独立検査の差は小さかった。この観測から漸近計算量の主張は導かない。
 
 
 ## 束縛環境の形式モデル
@@ -200,7 +280,7 @@ C処理系は一意化した内部名、定義位置の環境スナップショ�
 
 ## 2026-11-18追加: C展開とスコープの証明書検査
 
-識別子IDは組み込みが `3*(index+1)`、元の字句が `3*(tokenIndex+1)+1`、生成した束縛名が `3*freshCounter+2` である。名前の文字列比較による実際の探索境界で、要求名・選択した束縛・環境・定義位置を観測する。型タグはCの型オブジェクトの識別用であり、型意味論の証明済み符号化とは扱わない。
+識別子IDは組み込みが `3*(index+1)`、元の字句が `3*(tokenIndex+1)+1`、生成した束縛名が `3*freshCounter+2` である。Cのfresh counterはこのIDを`size_t`で表現できる範囲に制限し、範囲を使い切ると `Unknown` を返す。名前の文字列比較による実際の探索境界で、要求名・選択した束縛・環境・定義位置を観測する。型タグはCの型オブジェクトの識別用であり、型意味論の証明済み符号化とは扱わない。
 
 `CNameResolution.findName_sound` は環境の先頭側にある同名束縛を選ぶ関係との対応を示す。観測値は同じ環境ごとにまとめて閉じた計算で検査し、`observations_correspond` により型付きの `ScopedSyntax.Var` と同じ束縛IDを持つことへ接続する。
 
@@ -285,6 +365,12 @@ Gitの初期化・ステージ・コミット・pushなどのコマンドは実�
 
 `NLisp.ExpansionCertificate` に明示的な局所証書データ型とBoolean検査器を追加した。証書はソース・結果、マクロ規則の定義位置、コピーfuel、新規束縛カウンター範囲、リスト文脈、連続する中間結果を保持する。マクロの規則所属、穴の照合、衛生的コピー結果は元の規則集合と入力から検査する。`check_sound` は証書受理から有限の `CExpansion.Expands` 関係を導く。`checkFresh` はさらに全記録区間の非重複を要求し、`checkFresh_sound` と `checkFresh_intervals` が展開関係と区間条件をそれぞれ導く。`checkFresh_separates_interval_counters` は別々の区間内にあるカウンタ値が一致しないことを導く。`CMacroCopy.binder_success_counter` と `sequential_binders_have_distinct_tokens` は、成功した連続binder呼び出しがcounterを1ずつ進め異なるtoken identityを作ることを証明する。
 
+## 2026-11-20 追加作業: WindowsビルドとGlobalIR
+
+UCRT64 GCCのCMakeビルドではコンパイラ子プロセス`cc1.exe`が起動できず、変更したCソースが再コンパイルされないことを確認した。Visual Studio同梱Ninja、MSYS2 Clang、静的GMPを明示してCMakeを構成し直し、`nlisp.exe`を再生成した。生成物を`build-ucrt/nlisp.exe`、`build/Debug/nlisp.exe`、`build/Release/nlisp.exe`へ反映し、factorialが120を返すことと組み込み・構文・大域初期化のCテストを確認した。
+
+全体CTestで日本語Windowsの既定文字コードによりPythonがUTF-8証明データをCP932として扱う問題を再現したため、CMakeのPythonテストに`PYTHONUTF8=1`を設定した。これによりlean_bridge、macro_termination、source_reader、poly_bridgeをそれぞれ再実行し、修正済みの停止性期待とマクロ宣言専用例の対象範囲を反映して成功を確認した。GlobalIRには正の全fuelでfuel切れとなる`Diverges`定義、再帰関数の例、および発散initializerが後続初期化を止める定理を加え、`tests/GlobalIR.lean`でカーネル検査した。これらの作業は残るマクロ全体の終了性、ソースからGlobalIRへの意味保存、CとLeanの一般シミュレーションを完了するものではない。
+
 `tools/verify_lean.py` はC展開履歴からこの証書データを構成し、生成証明書の `program_expands` はfreshness付き汎用 `checkFresh` の健全性定理から導く。証明項を全体に対して一度に `decide` するとLeanの再帰スタックに達したため、各局所検査と推移合成を個別補題で作る方式にした。`examples/macros.nlisp` の過程付き証明書がLean検査・公理監査に通った。
 
 これでRESEARCH_FORMALIZATION.mdのPhase 1は完了した。連続binder呼び出しと異なる区間内カウンタ値の非衝突までは証明したが、copy群全体でこの性質を合成し、出力中の全生成識別子についてcounter区間所属を示す一般補題、入力識別子との非衝突、非捕捉・表層型保存を同時に導く主定理、型付き抽象展開との一般対応、局所変更時の増分検査とビットサイズ計算量は未完了である。CTestは実行していない。
@@ -317,7 +403,9 @@ Gitの初期化・ステージ・コミット・pushなどのコマンドは実�
 
 `CounterPreservingTrees` と `copyManyWithMacros_preserving_counter` は、各子要素のcounter不変性から任意の子リスト走査のcounter不変性を合成する。走査部分はリスト長や木形状に依存せず再利用できるが、各子要素が前提を満たす証明は別途必要である。
 
-任意のマクロ集合に対する `MacroCounterSafeInitializer` / `MacroCounterSafeBindingInputs` は、atom、atom一個・二個listに加えて、先頭が`match`でない任意長のatom-only listを表す。`atomList` constructorのcounter保存は `copyWithMacros_atomTrees_keeps_counter` で示す。短い各形状と任意長のatom-only形状のcounter保存証明を `CounterPreservingBindings` に変換でき、一般定理からbinder token列の一意性、source-token分離、fresh区間所属を導く。`checkFresh_separates_macro_counter_safe_binding_tokens` はその出力を別証書区間間の非衝突へ接続する。ネストした式、binderを含むinitializer、および先頭が`match`である長いatom-only listはこの構成的条件に含まない。
+任意のマクロ集合に対する `MacroCounterSafeInitializer` / `MacroCounterSafeBindingInputs` は、atom、atom一個・二個listに加えて、先頭が`match`でない任意長のatom-only listを表す。`atomList` constructorのcounter保存は `copyWithMacros_atomTrees_keeps_counter` で示す。さらに `singletonWrapped` constructor と `copyWithMacros_singleton_child_preserves_counter` により、同条件を満たす子を単一要素listで包んだinitializerを任意の深さで構成できる。`pairChild` / `copyWithMacros_pair_child_preserves_counter` はatom headの二要素listにもcounter-preservingな子を許す。`tripleChildren` / `copyWithMacros_triple_children_preserves_counter` はheadが`match`・`let`でなく、第2要素がatomの場合に第3要素へcounter-preservingな子を許す。`quadrupleChildren` / `copyWithMacros_quadruple_children_preserves_counter` はheadが`match`でない4要素listの第4要素へ同条件の子を許す。さらに `CounterNeutralTree` / `counterNeutralTree_preserving` は、全てのリストheadがマクロ名および `match` / `let` / `lambda` 以外である任意深さのネスト木を構造帰納法で扱う。このconstructorは `MacroCounterSafeInitializer.neutralTree` としてbinding列のfreshness合成へ接続されている。いずれの条件もbinder特殊形式やマクロ展開を含む任意initializerを網羅しない。counter保存証明を `CounterPreservingBindings` に変換でき、一般定理からbinder token列の一意性、source-token分離、fresh区間所属を導く。`checkFresh_separates_macro_counter_safe_binding_tokens` はその出力を別証書区間間の非衝突へ接続する。
+
+`tests/CMacroCopy.lean` は、三段のsingleton wrapper、atom headの二要素list、制限付き三要素listを含むinitializer、およびbinding列への合成をLeanで検査する。
 
 `CounterPreservingCases` は、match case列の各bodyがcounterを保持する前提を表す。`copyCasesWithMacros_preserving_counter` はpattern中のbinder数だけcounterが進み、それ以外のbody/tail走査はその前提の下でcounterを追加消費しないことを証明する。`copyCasesWithMacros_preserving_token_sequence` は各出力pattern binder tokenを連続counter列に同定し、派生補題が一意性・source-token分離・区間所属を導く。`checkFresh_separates_case_copy_tokens` は別々の証書区間間の非衝突を示す。これらはcase bodyのcounter保存を前提とし、C実装との対応は未証明。
 
@@ -331,8 +419,43 @@ Gitの初期化・ステージ・コミット・pushなどのコマンドは実�
 
 `AtomicTrees` と `copyMany_atomic_counter` は空マクロ集合で、atomだけからなる子リストを順にコピーしてもcounterが変わらないことを証明する。`copy_single_atom_list_keeps_counter`、`copy_two_atom_list_keeps_counter`、`copy_three_atom_list_keeps_counter`、`copy_four_atom_list_keeps_counter` は、記載した制約内の短いlist構文全体でもcounter保存を示す。任意長リストのマクロ集合付き結果は `MacroCounterSafeInitializer` の節を参照。
 
-`call_extraction_complete` は、有限fuelの`calls`/`callsMany`が成功すれば、構文木中の任意の深さにある直接呼び出しと穴頭位置の候補呼び出しが抽出結果に含まれることを帰納法で示す。`graphRows_static_call_edge` はその抽出結果が行の辺として保存されることを導き、`GraphCall` と `graphRows_contains_static_calls` は全規則行を走査したグラフにも各行の辺が残ることを示す。`ProcessCertificate.source_static_calls_decrease` はこの結果を一般の受理済み停止性証書から取り出す定理であり、生成証明書の `every_static_rule_call_decreases` も同じ接続を確認する。root呼び出し補題`calls_direct_macro_complete`と行保存補題`graphRows_dependency_edge`は構成要素である。テンプレート構文の呼び出し候補抽出と辺生成は網羅するが、実際の置換・引数複製・各macroStepがこの関係上の辺に対応することや、C展開器全体の停止性は未証明である。
+`call_extraction_complete` は、有限fuelの`calls`/`callsMany`が成功すれば、構文木中の任意の深さにある直接呼び出しと穴頭位置の候補呼び出しが抽出結果に含まれることを帰納法で示す。`graphRows_static_call_edge` はその抽出結果が行の辺として保存されることを導き、`GraphCall` と `graphRows_contains_static_calls` は全規則行を走査したグラフにも各行の辺が残ることを示す。`ProcessCertificate.source_static_calls_decrease` はこの結果を一般の受理済み停止性証書から取り出す定理であり、生成証明書の `every_static_rule_call_decreases` も同じ接続を確認する。root呼び出し補題`calls_direct_macro_complete`と行保存補題`graphRows_dependency_edge`は構成要素である。さらに `MacroTermination.macroStep_has_static_call` は実行redexを名前・arity候補へ結ぶが、展開中の親規則templateからそのredexへの文脈・置換を追跡しておらず、実際に隣接するmacroStep間の順位減少は未証明である。
+
+`CMacroCopy.copyWithMacros_preserves_zero_arg_macro_call` は、template中のリテラル0引数マクロ呼び出しについて、headがholeで置換されない場合にコピー後も同じマクロheadが残ることを示す。`copied_zero_arg_template_call_preserves_static_candidate` はコピーの結果とこの局所補題を組み合わせ、templateにあった同じ `StaticCall` 候補をコピー結果にも保存する。これはtemplate callsiteからコピー済みredexへの限定的な接続である。候補先と実際に選ばれた子ruleの同一性、引数を持つ呼び出し、穴置換、任意の入れ子文脈を扱う一般補題や、そこから展開全体の終了性を導く証明は未完了。
+
+`zero_arg_template_call_to_next_macro_step` はコピー結果に続く実際のrule matchから候補先を取り出し、template上の同じ0引数呼び出しへ戻す。`zero_arg_next_macro_step_rank_decreases` はその候補を受理済みgraph rowへ結び、親rowから順位が下がることを証明する。この接続はrootのリテラル0引数呼び出しに限り、一般の引数、穴置換、入れ子文脈、展開列全体の停止性は未証明。
+
+`copyManyWithMacros_preserves_length` と `copyWithMacros_preserves_root_macro_call` により、リテラルmacro headが置換されないroot呼び出しでは、任意個数の引数をコピーしてもarityとhead名が保たれる。`root_template_call_to_next_macro_step` はそのコピー結果で実際の次macroStepが成功する場合にtemplate上の同じ候補を導き、`root_next_macro_step_rank_decreases` は受理済み親rowから順位が下がることを示す。穴headと任意の入れ子template文脈を扱う展開全体のシミュレーションは未完了。
+
+`copyWithMacros_substituted_head_uses_copyMany` は、特殊フォームheadを除いたhead-holeの通常コピー分岐について、`copyWithMacros` の成功からwhole-list `copyMany` の成功を抽出する。`lookup_isSome_of_mem_keys` がtemplate parameter名とcopy hole名の対応を接続する。これらを使う `substituted_head_template_call_to_next_macro_step` と `substituted_head_next_macro_step_rank_decreases` は、実際の次rule matchのarityを元template引数数へ結び、`targetsOfArity` の全候補辺からrank減少を得る。特殊フォームとして解釈されるhead holeと入れ子文脈で子を追跡する証明は未完了。
+
+`copyManyWithMacros_cons_parts` と `copyWithMacros_root_macro_call_parts` を合成した `nested_literal_call_to_next_macro_step` は、通常のコピー対象リストの先頭要素にあるリテラルmacro callを、1段のリスト文脈越しに実際の次stepへ接続する。この結果も任意深さの文脈、穴headの文脈、複数step列の順位減少には一般化されていない。
+
+`copyManyWithMacros_extract_element` は、先行要素数に応じたfuelを明示して、成功した `copyMany` から任意位置の要素copyと後続走査を抽出する。`literal_call_at_list_index_to_next_macro_step` はこれを使い、兄弟要素を持つ通常リスト内のリテラルhead callについて、実際に次ruleがそのコピー済みcallへmatchする条件の下で元templateの `StaticCall` を得る。先行要素が進めたfresh counterも対象callの開始値として引き継ぐ。これでも任意深さに積み重なるリスト文脈、特殊フォームの専用copy経路、穴head、各macroStep遷移から展開全体の順位減少を合成する証明は含まない。
+
+`list_index_next_macro_step_rank_decreases` は、この一段の兄弟位置対応に受理済み親template行の順位減少を合成する。子引数の再コピー結果が次のruleにmatchすることを前提とする。全深さの構文文脈にわたるシミュレーションや、これらの局所順位減少を展開実行列全体へ持ち上げる定理は未証明である。
+
+`nested_literal_call_at_two_list_indices_to_next_macro_step` は、外側リストの任意要素を抽出し、そこから内側リストの任意要素を抽出する二段のcopy走査を合成する。通常の内側リスト（headがマクロ名でも `match` / `let` / `lambda` でもない）中のリテラルhead callについて、コピー後に実際の子ruleがmatchする条件下で、元templateの同じ `StaticCall` 候補を得る。`nested_two_indices_next_macro_step_rank_decreases` は受理済み親rowの順位減少へ接続する。三段以上の任意深さ、binder等の特殊フォーム、穴headの文脈、macroStep列全体の順位減少は未証明である。
+
+`nested_literal_call_at_three_list_indices_to_next_macro_step` は、その二段対応を一段外側へ合成する。三つの選択位置はそれぞれ任意の前後兄弟を持てる。二つの中間リストheadが通常copy経路を使う中立性条件の下で、copy結果の実matchから元template callsiteを構成する。`nested_three_indices_next_macro_step_rank_decreases` はこれを受理済み親rowの順位減少へ接続する。四段以上、特殊フォームheadやhole headを含む任意文脈、実行macroStep列全体の停止性は未証明である。
+
+`nested_literal_call_at_four_list_indices_to_next_macro_step` は三段の証明結果を外側の通常リストで包み、四段の選択位置で同じcopy/matchから `StaticCall` を構成する。全中間リストでhead中立性を要求し、`nested_four_indices_next_macro_step_rank_decreases` が受理済み親rowの順位減少を示す。五段以上の一般深さや展開列全体への合成は未証明である。
+
+任意段数を扱うため、`LiteralCallSite` は通常リストの選択位置を帰納的に記述し、各段の前置兄弟数とlist copy overheadから必要fuelを定める。`literal_call_site_to_next_macro_step` はlist copyを `copyMany` へ分解して経路を帰納的にたどり、実際の子rule matchを前提として元template上の同一 `StaticCall` を得る。`literal_call_site_rank_decreases` は受理済み親rowの順位減少へ合成する。この一般化は各中間list headがcounter-neutralで、call headがテンプレート穴に置換されないリテラルatomである場合に限る。特殊フォーム経路、穴headの任意文脈、複数の展開step全体のシミュレーション・停止性は未証明である。
+
+`literal_call_at_list_index_to_next_macro_step` とLiteralCallSite系の再帰定理は、copyのrename環境を空に固定せず任意の `Renames` を受け取る。`copyWithMacros_lambda_parts` は、macro名・hole名に衝突せずparameter列が有効なlambdaの成功copyから、parameter copy、freshened rename環境、次counter、body copyの結果を分解する。`lambda_copy_body_call_site_to_next_macro_step` はこの分解結果を使い、counter-neutralなbody list内で子ruleがmatchするcallsiteをlambda template内の同じ `StaticCall` へ接続し、`lambda_copy_body_call_site_rank_decreases` がwhole-lambda copyから順位減少を導く。`copyWithMacros_let_parts` と `let_copy_body_call_site_to_next_macro_step` / `let_copy_body_call_site_rank_decreases` は有効なbinding列を持つ通常let branchのbodyを同様に接続する。さらに `copyBindingsWithMacros_cons_parts` は各binding scan headをbinder・initializer・tail operationへ分解し、`BindingRows` / `copyBindingsWithMacros_extract_initializer` は形状が有効なprefixを帰納的に走査して、選択したinitializerの実rename環境とcounterを取り出す。`let_initializer_call_to_next_macro_step` / `let_initializer_call_rank_decreases` は、その任意initializer内にあるcounter-neutralなlist callをtemplate edgeと順位減少へ接続する。`copyCasesWithMacros_default_parts` / `copyWithMacros_match_default_parts` は空pattern case bodyのcopyを分解する。`copyCasesWithMacros_pattern_parts` は非空pattern caseのpattern freshening、freshened renameでのbody copy、tail scanを分解し、`match_pattern_body_call_site_to_next_macro_step` / `match_pattern_body_call_site_rank_decreases` がそのbody callをtemplate edgeと順位減少へ接続する。複数caseの一般走査、特殊フォームとして解釈される穴head、複数step全体のシミュレーションは未証明である。
+
+置換head用に `SubstitutedHeadCallSite` と `substituted_head_call_site_to_next_macro_step` / `substituted_head_call_site_rank_decreases` も定義した。parameter名とcopy hole名の一致、置換headが `lambda` / `let` / `match` 以外、中間リストheadのcounter-neutral性を条件として、任意深さの通常リスト文脈で、実matchから元template callsiteの順位減少を導く。特殊フォームheadがコピー時に専用処理へ分岐する場合と、macroStep列全体のシミュレーション・停止性は未証明である。
 
 この追加後に `examples/math_macros.nlisp` の `--mode termination` 証明書を生成し、Lean検査した。これは既存のグラフ再計算・順位検査の確認であり、新しい局所補題を使った実展開シミュレーションではない。
 
-2026-11-20追補: `MacroCounterSafeInitializer.atomList` と `copyWithMacros_atomTrees_keeps_counter` により、任意長で先頭atomが`match`でないatom-only list initializerのcounter保存を任意マクロ集合で証明し、binding列・case bodyのfreshness合成へ接続した。Lean 4.8.0の `lake build` 成功後、`examples/macros.nlisp` のcore証明書と `examples/dynamic_macro_head.nlisp` の停止性証明書を現行ソースから生成し、どちらも独立再検証に成功した。候補解析の作業予算診断に試行量・上限値を加え、小さな直接呼び出しで上限12の13操作目がUnknownになることを確認した。実CLIの上限0では34ノードの入力が証明書なしのUnknownになることも確認した。CMakeの `nlisp_core` と `nlisp` もビルド成功。対象外はネストしたinitializer、binderを含むinitializer、先頭`match`の任意長list、およびC `copy_template`との一般シミュレーションである。CTestはこの追補では実行していない。
+2026-11-20追補: `MacroCounterSafeInitializer.atomList` と `copyWithMacros_atomTrees_keeps_counter` により、任意長で先頭atomが`match`でないatom-only list initializerのcounter保存を任意マクロ集合で証明し、binding列・case bodyのfreshness合成へ接続した。`singletonWrapped` はcounter-preserving initializerの単一要素list wrapperを任意の深さまで合成し、`pairChild` は二要素listの第2要素、`tripleChildren` はheadが`match`・`let`でなく第2要素がatomの場合の三要素listの第3要素にcounter-preserving initializerを置けるようにした。Lean 4.8.0同梱の `lake build` と `tests/CMacroCopy.lean` の検査に成功した。`examples/macros.nlisp` のcore証明書と `examples/dynamic_macro_head.nlisp` の停止性証明書を現行ソースから生成し、どちらも独立再検証に成功した。候補解析の作業予算診断に試行量・上限値を加え、小さな直接呼び出しで上限12の13操作目がUnknownになることを確認した。実CLIの上限0では34ノードの入力が証明書なしのUnknownになることも確認した。CMakeの `nlisp_core` と `nlisp` もビルド成功。対象外はより一般的な複数要素のネストinitializer、binderを含むinitializer、先頭`match`の任意長list、およびC `copy_template`との一般シミュレーションである。CTestはこの追補では実行していない。
+
+2026-11-21追補: `MacroCounterSafeInitializer.quadrupleChildren` と `copyWithMacros_quadruple_children_preserves_counter` を追加した。先頭が`match`でない4要素の通常listに限り、第4要素へcounter-preservingな子initializerを置ける。この条件は `macroCounterSafeInitializer_preserving` で既存の`CounterPreservingInitializer`へ変換されるため、`MacroCounterSafeBindingInputs`・`CounterPreservingBindings`の一般合成からbinder tokenの一意性、source-token分離、counter区間所属へつながる。Leanファイル単体の検査は成功。binder initializer一般やcopy全体のFreshnessは未完了。
+2026-11-21追補: `CounterNeutralTree` と `counterNeutralTree_preserving` を追加し、binder特殊headやマクロ呼び出しを含まない任意のネスト木についてcounter保持を構造帰納法で証明した。`MacroCounterSafeInitializer.neutralTree` を通してbinding列のtoken freshness合成へ渡せる。Lean 4.8.0で `NLisp/CMacroCopy.lean` の直接検査に成功。binderを含む任意initializerや全体`copy`のfreshnessは引き続き未完了。
+
+2026-11-21追補: CaseRows と copyCasesWithMacros_extract_default / copyCasesWithMacros_extract_pattern により、有効なcase prefix後の任意位置からcase body copyと開始counterを抽出する。copyWithMacros_match_cases_parts は2件以上のcase走査を分解し、match_default_body_call_site_at_index_to_next_macro_step / match_default_body_call_site_at_index_rank_decreases と match_pattern_body_call_site_at_index_to_next_macro_step / match_pattern_body_call_site_at_index_rank_decreases は有効なprefix後の任意default/pattern case bodyのcounter-neutral callを、元matchのtemplate StaticCall と受理済み順位減少へ接続する。match_scrutinee_call_site_at_index_to_next_macro_step / match_scrutinee_call_site_at_index_rank_decreases も複数case matchのscrutinee callを接続する。 match_scrutinee_call_site_to_next_macro_step / match_scrutinee_call_site_rank_decreases は単一case形式も扱う。特殊フォームとして解釈される穴headと展開step列全体の停止性は未証明。Lean全体の lake build に成功。
+
+2026-11-21ビルド追記: WSL Lean 4.8の再ビルドでは`CMacroCopy`がリプレイ成功し、`CExpansion.holeEntriesWithCost_result`と`ExpansionLowering.globalValueIndex_lookup_sound`の証明で失敗した。前者はOptionのmap/bind補題適用前に再帰定義`holeEntries`を明示簡約し、後者は`getElem?`の定義展開を避けてリストcons/successorの簡約を使うように修正した。これらはログ後の作業ツリー変更であり、再ビルド確認待ち。こちらのWindows実行環境からは`wsl.exe -l -v`が終了コード1でディストリビューションを検出できず、WSL検証は利用者側のログに依存する。
+
+2026-11-21ビルド追記2: 利用者の次のWSL `lake build` では`CExpansion`の失敗が解消し、失敗対象は`ExpansionLowering`と`ExpansionCertificate`のみになった。これを根拠に`holeEntriesWithCost`と`matchRuleWithCost`の項目はLean 4.8で検証済みに更新した。新たに確認された問題は、global slot lookup結果を`getElem?`へ移す式の簡約と、証書費用モデルの等価性・構造上界証明である。`ExpansionLowering`では有効範囲を明示して添字簡約する形へ変更し、`ExpansionCertificate`では非計算可能な構文node countを参照する測度を非計算可能定義にし、membership・cost accumulator・区間走査の証明をログの失敗点に沿って修正した。後者はまだ再ビルド未確認。

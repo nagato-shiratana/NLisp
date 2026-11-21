@@ -75,6 +75,13 @@ class LeanBridge(unittest.TestCase):
                     result = self.run_bundle_verifier(path)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
+    def test_overlapping_fresh_counter_intervals_are_rejected(self):
+        result = self.lean('''import NLisp.CExpansion
+example : NLisp.CExpansion.disjointIntervals [(2, 4), (3, 5)] = false := by decide
+example : NLisp.CExpansion.disjointIntervals [(1, 2), (2, 3)] = true := by decide
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_bundle_resource_policy_is_unknown(self):
         source = ROOT / 'examples/recursive_expansion.nlisp'
         document = self.document(source)
@@ -257,6 +264,10 @@ class LeanBridge(unittest.TestCase):
 
     def test_full_type_certificates_for_existing_examples(self):
         for path in sorted((ROOT / 'examples').glob('*.nlisp')):
+            # This file intentionally contains only macro declarations; the
+            # source reader test covers it without requiring an executable main.
+            if path.name == 'dynamic_macro_head.nlisp':
+                continue
             with self.subTest(source=path.name):
                 document = self.document(path)
                 if path.name == 'polymorphic_recursion.nlisp':
