@@ -7,7 +7,7 @@ namespace NLisp.Surface
 type variables use indices local to the enclosing generic definition.
 Parameter zero is the first source parameter, including parallel let. -/
 inductive Ty where
-  | boolean | integer | unit
+  | boolean | integer | float | string | character | unit
   | var : Nat → Ty
   | fn : List Ty → Ty → Ty
   | list : Ty → Ty
@@ -47,6 +47,10 @@ structure Signature where
   result : Ty
   deriving Repr
 
+inductive FloatBinOp where
+  | add | sub | mul | div
+  deriving Repr, DecidableEq
+
 def Signature.wellFormed (s : Signature) : Prop :=
   (∀ t ∈ s.parameters, t.wellFormed s.typeArity) ∧ s.result.wellFormed s.typeArity
 
@@ -55,6 +59,9 @@ inductive Expr where
   | global : Nat → List Ty → Expr
   | bool : Bool → Expr
   | int : Int → Expr
+  | float : Float → Expr
+  | string : String → Expr
+  | character : Char → Expr
   | unit : Expr
   | lam : List Ty → Ty → Expr → Expr
   | app : Expr → List Expr → Expr
@@ -72,6 +79,7 @@ inductive Expr where
   | some : Ty → Expr → Expr
   | matchList : Expr → Expr → Expr → Expr
   | matchOption : Expr → Expr → Expr → Expr
+  | floatBin : FloatBinOp → Expr → Expr → Expr
   deriving Repr
 
 /- Global function bodies are checked with only their parameters in the
@@ -88,6 +96,12 @@ mutual
             (signature.result.instantiate arguments))
     | bool : HasType globals typeCount Γ (.bool b) .boolean
     | int : HasType globals typeCount Γ (.int n) .integer
+    | float : HasType globals typeCount Γ (.float x) .float
+    | string : HasType globals typeCount Γ (.string value) .string
+    | character : HasType globals typeCount Γ (.character value) .character
+    | floatBin : HasType globals typeCount Γ left .float →
+        HasType globals typeCount Γ right .float →
+        HasType globals typeCount Γ (.floatBin op left right) .float
     | unit : HasType globals typeCount Γ .unit .unit
     | lam : (∀ t ∈ parameters, t.wellFormed typeCount) → result.wellFormed typeCount →
         HasType globals typeCount (parameters ++ Γ) body result →

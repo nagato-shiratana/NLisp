@@ -42,7 +42,7 @@ theorem interpret_instantiate (type : Ty) (assignment : Nat → Ty) (arguments :
     (valid : type.wellFormed arguments.length) :
     interpret assignment (type.instantiate arguments) = interpret (specialize assignment arguments) type := by
   cases type with
-  | boolean | integer | unit => simp [Ty.instantiate, interpret]
+  | boolean | integer | float | string | character | unit => simp [Ty.instantiate, interpret]
   | var index =>
     have bound : index < arguments.length := by simpa [Ty.wellFormed] using valid
     simp [Ty.instantiate, interpret, specialize, getElem?_def, bound]
@@ -92,6 +92,9 @@ mutual
 inductive ValueTyped (globals : List Signature) : Value → Ty → Prop where
   | bool : ValueTyped globals (.bool b) .boolean
   | int : ValueTyped globals (.int n) .integer
+  | float : ValueTyped globals (.float x) .float
+  | string : ValueTyped globals (.string value) .string
+  | character : ValueTyped globals (.character value) .character
   | unit : ValueTyped globals .unit .unit
   | closure : HasType globals count (parameters ++ context) body result →
       ValuesTyped globals captured (interpretTypes assignment context) →
@@ -226,6 +229,21 @@ theorem evaluator_type_safe (wellTyped : ProgramTyped globals definitions) (fuel
           (generic_global_typed (assignment := assignment) found arity valid)
       | bool => simp only [erase, evaluate, interpret]; exact .ok .bool
       | int => simp only [erase, evaluate, interpret]; exact .ok .int
+      | float => simp only [erase, evaluate, interpret]; exact .ok .float
+      | string => simp only [erase, evaluate, interpret]; exact .ok .string
+      | character => simp only [erase, evaluate, interpret]; exact .ok .character
+      | floatBin leftTyped rightTyped =>
+        simp only [erase, evaluate]
+        apply OutcomeTyped.bind (exprSafe assignment leftTyped environment)
+        intro leftValue leftValueTyped
+        apply OutcomeTyped.bind (exprSafe assignment rightTyped environment)
+        intro rightValue rightValueTyped
+        cases leftValueTyped with
+        | float =>
+          cases rightValueTyped with
+          | float =>
+            simp only [interpret]
+            exact .ok .float
       | unit => simp only [erase, evaluate, interpret]; exact .ok .unit
       | lam _ _ bodyTyped =>
         simp only [erase, evaluate, interpret]
@@ -413,6 +431,25 @@ inductive BodiesHaveTypes (globals : List Signature) : List Signature → List E
   | cons : signature.wellFormed → HasType globals signature.typeArity signature.parameters body signature.result →
       BodiesHaveTypes globals signatures bodies → BodiesHaveTypes globals (signature :: signatures) (body :: bodies)
 
+theorem BodiesHaveTypes.length_eq (typed : BodiesHaveTypes globals signatures bodies) :
+    signatures.length = bodies.length := by
+  induction typed <;> simp_all
+
+theorem BodiesHaveTypes.signature_valid_at
+    (typed : BodiesHaveTypes globals signatures bodies) (index : Nat)
+    (signature : Signature) (found : signatures[index]? = some signature) :
+    signature.wellFormed := by
+  induction typed generalizing index with
+  | nil => simp [getElem?_def, Nat.not_lt_zero] at found
+  | @cons head signatures bodies body valid bodyTyped rest ih =>
+      cases index with
+      | zero =>
+          have same : body = signature := by simpa [getElem?_def] using found
+          cases same
+          exact valid
+      | succ index =>
+          exact ih index (by simpa [getElem?_def, Nat.succ_lt_succ_iff] using found)
+
 theorem elaborateDefinitions_typed
     (success : (elaborateDefinitions fuel globals signatures bodies).isSome = true) :
     BodiesHaveTypes globals signatures bodies := by
@@ -460,6 +497,27 @@ theorem BodiesHaveTypes.lookup {index : Nat} {signature : Signature}
       obtain ⟨body, entry, type⟩ := ih (index := index)
         (by simpa [getElem?_def, Nat.succ_lt_succ_iff] using found)
       exact ⟨body, by simpa [getElem?_def, Nat.succ_lt_succ_iff] using entry, type⟩
+
+theorem BodiesHaveTypes.lookupDefinition {index : Nat} {signature : Signature}
+    {body : Expr} (typed : BodiesHaveTypes globals signatures bodies)
+    (found : (signatures.zip bodies)[index]? = some (signature, body)) :
+    signature.wellFormed ∧ HasType globals signature.typeArity signature.parameters body signature.result := by
+  induction typed generalizing index with
+  | nil =>
+      have impossible : ¬ index < ([] : List (Signature × Expr)).length := by simp
+      simp only [getElem?_def, dif_neg impossible] at found
+      cases found
+  | @cons head signatures bodies sig headValid headTyped tailTyped ih =>
+      cases index with
+      | zero =>
+          have same : (sig, head) = (signature, body) := by
+            simpa [getElem?_def] using found
+          cases same
+          exact ⟨headValid, headTyped⟩
+      | succ index =>
+          have tailFound : (signatures.zip bodies)[index]? = some (signature, body) := by
+            simpa [getElem?_def, Nat.succ_lt_succ_iff] using found
+          exact ih tailFound
 
 theorem elaborateProgram_programTyped
     (success : (elaborateProgram fuel signatures bodies).isSome = true) :

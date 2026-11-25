@@ -81,6 +81,7 @@ theorem evaluation_eventually (h : Evaluates program env term value) :
   | succ fuel =>
     use_bounds_at fuel
     simp_all [evaluate, evaluateArgs, evaluateSequence, bind, Except.bind, pure, Except.pure]
+    all_goals rfl
 
 theorem evaluate_complete (h : Evaluates program env term value) :
     ∃ fuel, evaluate program fuel env term = .ok value := by

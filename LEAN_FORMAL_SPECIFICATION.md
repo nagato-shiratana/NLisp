@@ -1,5 +1,17 @@
 # nagato-Lisp Lean 形式仕様書
 
+## 2026-11-23追補: process証書・局所評価・限定binder counter
+
+`ProcessCertificate.CheckedExpansion` は一つのレコード内に元ソースの読取・正規化証拠、入力と出力に結び付いた `checkFresh` 局所証書、scope correspondenceを保持する。`source_expands_with_scopes_and_freshness` は有限展開と区間非重複も含めてそれらを合成する。`CheckedStaticTermination` からは `source_static_call_chain_length_bounded` と `source_static_call_chain_terminates` を導き、受理済み静的候補グラフ上のchain上界・無限鎖不存在を示す。実macroStep列がこの候補relationに従うシミュレーションは未完了。
+
+`verify_lean.py --mode poly` の生成器は、process証書の `source_expands_with_scopes_and_freshness` を明示した結論型付き定理として出力する。`examples/polymorphism.nlisp` で生成からLean検査まで再実行し、生成証書が受理されることを確認した。これはこの入力の生成・検査経路の確認であり、全sourceやC展開履歴との一般対応を示すものではない。
+
+`copyParameters_counter_with_macros` は、任意のマクロ集合を使うparameter binder走査でcounterがparameter数だけ増えることを証明する。`copyWithMacros_lambda_counter_preserving_body` は、bodyのcopyがcounterを保存するという `CounterPreservingInitializer` 前提の下で、lambda copyがparameter数だけcounterを進めることを示す。`copyWithMacros_lambda_atom_body_counter` はatom bodyを持つ具体例である。前提を構造的に導けない任意のbinder bodyや全copy構文へのfreshness合成は対象外である。
+
+`GlobalProgramEntry.TypedInitializerRows` は、ソース順のfunction/value entry列に対し、各value initializerのSurface `HasType` 証明とslot/type lookupを保持する。`globalIR_types_agree` はこの前提から `GlobalIR.InitializerTypesAgree` を構成するため、`initializeValues_preserves_typed` が要求するslot型列の整合条件へ渡せる。Cからこの行証明を生成する経路、およびinitializer評価結果の型付けを導くGlobalIR評価器の一般preservation定理は未接続である。
+
+`TypedInitializerRows.toRuntimeProgram_initialization_preserves_store_arithmetic` は、整数算術initializerに制限したうえで、entry列から生成した`toRuntimeProgram`のdefinition/initializer列を実際に初期化した成功結果に対し、`StoreWellTyped`を導く。`toRuntimeProgram_initialization_supports_typed_getter_call_arithmetic` はこれを同じruntime definition列のtyped getter呼び出しへ接続する。これは全体のpoly証書経路や任意initializerの型保存を示す定理ではない。
+
 ## 2026-11-19 追補: 束縛IDを持つ展開後構文から実行用IR
 
 `NamedSemantics` は束縛IDを使う独立した大ステップ意味論、`NameLowering` はID参照を位置添字へ変換する関数とその前向きシミュレーションを定義する。
@@ -18,11 +30,15 @@ Named.Evaluates definitions environment expression value
 
 これにより、元の有限展開証書で検査した構文のNamed評価から、型検査済みProgramの実行用IRへの前向き保存を、入力ごとの `source_evaluation_preserved` として得る。型が合う無関係な出力、引数順の変更、束縛IDと添字の変更は対応検査で拒否する。Namedモデルからの終了反映・エラー/発散の対応、C実行器との一般的な対応、新多相モデルの型安全性は引き続き未証明。以下の2026-11-18記録の未接続範囲は、この前向き保存と構文対応の範囲について更新された。
 
+`ProcessCertificate.CheckedExpansion` はこのparse/normalize記録に、同じnormalized source formsとexpanded outputへ結び付いた `checkFresh` 証書、およびscope correspondencesを保持する。`source_expands_with_scopes_and_freshness` はそのレコードからソース読取、有限展開、区間非重複、scope対応を同時に取り出す。実際の配布artifactとの接続、binder freshness・非捕捉・型保存はこの定理に含まれない。
+
 `tests/NameLowering.lean` はクロージャ・並列let・コンストラクタ照合の導出と、導出から十分なfuelでIR評価器が成功することを確認する。`tests/ExpansionLowering.lean` は同じ型・名前でも異なる束縛IDの参照、計算や引数順のすり替えを拒否する。`tests/poly_bridge.py` は実際の証書を使い、型の合う加算から減算への変更をカーネルが拒否することも確認する。
 
 `TypeArguments.inferred_arguments_unique` は、`inferrable` が受理するシグネチャについて、同じ仮引数型列を同じ実引数型列へ具体化する二つの型引数列が等しいことを示す。証明は、型変数の出現位置を辿ればその型引数の成分が一致するという補題と、量化変数すべての被覆からなる。これは呼び出し側の型変数を解く単一化ではなく、固定された実引数型に対する一方向照合である。
 
 `inferTypeArguments` は制約の収集後、具体化の全体一致と呼び出し側の整形式性を再検査し、`TypeArgumentSolution` として一致・一意性の証明を返す。期待される戻り値型を参照しない。`tests/TypeArguments.lean` は高階関数型、競合、未決定変数、TからList Tへの多相再帰の具体化、呼び出し側のスコープ違反を確認する。noneは深さ予算超過も表し、完全性や不適合の証明ではない。Cの推論アルゴリズムの一般的な正しさをこの結果だけで主張しない。
+
+`collectArgument_sound` / `collectArguments_sound` は、成功した制約収集後のslotが候補置換に一致するなら、型木・引数列を置換した結果が実引数型と一致することを示す。caller側の型変数を含む関数型/Option型のネスト例を`tests/TypeArguments.lean`で検証する。この定理はLean側collectorの一般的な制約→置換の意味対応を補うが、Cの`Type*`ポインタidentityや配列状態をこのモデルへ対応付ける証明ではない。
 
 ### 多相IR評価器の型保存と型エラー排除
 
@@ -46,7 +62,14 @@ ProgramTyped globals definitions
 
 `GlobalIR` は明示的な大域ストアとgetterを持つ追加の実行モデルである。ユーザー関数は共通の型消去済み本体と元の引数個数を保持し、大域値を読むgetterだけが現在のストアへアクセスする。初期化前の読み出しは `beforeInitialization` として型エラーと分ける。局所クロージャは大域ストアのスナップショットを捕捉しない。
 
-成功した初期化について、セル数の保存、先行するセルの不変性、初期化対象範囲の各セルに値が存在することを証明した。ソースからGlobalIRへの変換、GlobalIRに対する型安全性、Cの共有セルとの一般的な対応は後続課題である。旧PolyIRの型安全性定理を、この追加モデルの証明として流用しない。
+成功した初期化について、セル数の保存、先行するセルの不変性、初期化対象範囲の各セルに値が存在することを証明した。混在したfunction/value宣言表では、値宣言添字からdense slot ordinal、compiled getter位置、runtime definition位置へ対応を辿れる。限定されたinitializer decoderが値参照を返す場合、そのgetterが現在のstore値を返し、未初期化時は `beforeInitialization` を報告することを証明した。型付きstoreとlayoutの対応を仮定した単一readの型保存もある。`lowerAndReplaceValuesCertified` のtraceは、成功時の宣言列・識別子列・compiled/runtime layout・initializer slot数の保存を記録する。これらは単一参照・単一readおよび構造的不変条件の結果であり、initializer列全体の意味保存やGlobalIR評価器の型安全性ではない。ソースからGlobalIRへの一般変換、Cの共有セルとの一般的な対応は未完了である。旧PolyIRの型安全性定理を、この追加モデルの証明として流用しない。
+
+`GlobalIR.evaluate_add_of_children`、`evaluate_sub_of_children`、`evaluate_mul_of_children`、`evaluate_le_of_children`、`evaluate_intEq_of_children` は、fuelを1増やした演算項の評価を、左右の整数評価仮定から導く。これらは演算規則の局所計算補題であり、部分式の評価可能性を導いたり、型検査器・全組み込み関数との対応を示すものではない。
+
+`NameLowering` には各構文規則、引数列、let/begin列、閉包適用、大域関数適用について逆向き評価反映の局所補題がある。`NamedDecoder.evaluation_preserves_valueWellScoped` は、整形式なNamed program・環境・let layoutの下で評価結果（closureを含む）もwell-scopedになることを証明する。`decodeProgram_body_evaluation_preserves_valueWellScoped`と`decodeTopLevel_initializer_evaluation_preserves_valueWellScoped`は、decoder成功から関数本体またはinitializerを選び、その有限評価結果へ不変条件を伝える。`program_lookup_body_wellScoped` はwell-scoped programのlookup済み定義本体の整形式性を取り出し、`closureApplication_environment_wellScoped` はclosure本体と適用時environmentの不変条件を合成する。閉包本体の反映補題はまだ `EvaluationReflection` を仮定しており、任意のsource expressionに対する一般反映定理がこれらを一つに結合するところまでは到達していない。binder identityの有効性とlet initializer/binder数一致を含むwell-scoped条件をdecoder・型検査の出力から一般導出する必要がある。
+
+`GlobalSourceLowering.readClosedInitializer_{true,false,unit}_typed_evaluates` は、トップレベルinitializer用decoderの真偽値・unit atomをSurface `HasType`、erase後のGlobalIR評価、対応する `PolyIR.ValueTyped` に接続する。`readClosedInitializer_integerLiteral` と `_evaluates` は、字句的に有効な整数atomを同じ整数のSurface literalに読み取り、erase後のGlobalIR整数項が1 fuelで同じ整数値を返すことを示す。`readClosedInitializer_add_evaluates`、`_sub_evaluates`、`_mul_evaluates`、`_le_evaluates`、`_intEq_evaluates` はdecoderが生成した演算について、二つのerase済み子項が整数へ評価される仮定から親結果を導き、`ArithmeticSurfaceExpr` と `Surface.HasType` の両方を返す。子項の意味対応は前提であり、複合initializerやinitializer列全体の意味保存を含まない。
+`initializerRow_of_typed_evaluation` は表signatureの一致と一つのSurface型導出から `TypedInitializer` と `TypedInitializerRows` のvalue行を構成する。`arithmeticInitializerRow_of_evaluation`は証明済み算術fragmentの任意の式についてSurface型とGlobalIR評価を使い両行不変条件を構成する。`readClosedInitializer_{true,false,unit}_builds_typed_row`は対応するraw atomを、`readClosedInitializer_integerLiteral_builds_typed_row`は有効な整数atomを、decode・型付け・GlobalIR評価を伴う行へつなぐ。`readClosedInitializer_{true,false,unit,integerLiteral}_initializes_store_typed`はraw基本値atomで構成した行とtail行から生成`toRuntimeProgram`を実行し、成功時の`StoreWellTyped`を導く。poly exporterによる全initializer行生成とsource-to-GlobalIR意味保存は未接続である。`ArithmeticInitializerRows`による初期化後store型安全性およびtyped getter呼出しの定理は、構成済みの行列に対して適用できる。
 
 `PolyIR.erase` の終了性の尺度は、数値リテラルや添字の数値を数えない構文ノード数に変更した。数値の大きさは入力のビット長と異なるため、既定のsizeOfをそのまま検査コストと見なしてはならない。新尺度は証明用であり、消去関数自体はネイティブ実行できる。大きな整数の回帰例を追加したが、全検査手続き・Leanカーネルの計算量の多項式上界は依然として未証明である。
 
@@ -274,7 +297,7 @@ Floatはbinary64の64bitパターン、StringとCharacterはLeanのUnicode文字
 
 `CExpansion.Expands` は、元の規則に属すること、呼び出し名・引数個数の一致、衛生的置換の一致を前提とする展開ステップと、その反射・文脈・推移閉包である。`program_expands` は正規化済み宣言から今回の最終宣言までの有限導出を示す。変換器が無関係な型の合う式を出力した場合は、この導出を作れない。
 
-外部証書形式 `ExpansionCertificate.Certificate` は `refl`、リスト文脈の単一要素変更 `congList`、元ルールを参照する `macroStep`、連続性を検査する `trans` からなる。`ExpansionCertificate.check` はルール所属、パターン照合、`copyWithMacros` の結果をBooleanで再計算し、`check_sound` は受理から `CExpansion.Expands` を導く。追加の `checkFresh` は証書に記録されたfresh counter区間の非重複も検査し、`checkFresh_sound` は展開関係を、`checkFresh_intervals` は区間条件を導く。`checkFresh_separates_interval_counters` により、異なる受理済み区間の境界内カウンタ値は異なる。`CMacroCopy.sequential_binders_have_distinct_tokens` は連続して成功するbinder呼び出しのtoken identityが異なることを導く。`tools/verify_lean.py` はCの履歴から証書データを生成し、生成証書に対して `checkFresh` を受理条件として用いる。各局所検査と合成を補題で分け、全プログラムを一度に深く簡約する方式を避ける。
+外部証書形式 `ExpansionCertificate.Certificate` は `refl`、リスト文脈の単一要素変更 `congList`、元ルールを参照する `macroStep`、連続性を検査する `trans` からなる。`ExpansionCertificate.check` はルール所属、パターン照合、`copyWithMacros` の結果をBooleanで再計算し、`check_sound` は受理から `CExpansion.Expands` を導く。追加の `checkFresh` は証書に記録されたfresh counter区間の非重複も検査する。`checkFresh_sound_with_intervals` は一つの受理判定から有限展開導出と記録区間のpairwise分離を同時に導く。`checkFresh_separates_interval_counters` により、異なる受理済み区間の境界内カウンタ値は異なる。`CMacroCopy.sequential_binders_have_distinct_tokens` は連続して成功するbinder呼び出しのtoken identityが異なることを導く。`tools/verify_lean.py` はCの履歴から証書データを生成し、生成証書に対して `checkFresh` を受理条件として用いる。binder非捕捉・型保存との合成、およびC展開履歴との一般的対応は未完了であり、各局所検査の結果を全体健全性として扱わない。
 
 `CBindingWalk` は最終構文から関数・トップレベル値・局所束縛の環境を導出する。各変数について、実効位置で選んだ束縛IDとCの参照IDの一致、両環境のIDの妥当性、選んだ束縛が呼び出し時点の環境にも存在することを確認する。同名の局所変数による遮蔽があっても、定義位置の参照は同じIDを保つ。検査用構文の消去結果と展開導出の出力の一致もLeanで検査する。
 
@@ -324,7 +347,7 @@ Floatはbinary64の64bitパターン、StringとCharacterはLeanのUnicode文字
 
 ### 3.9 静的なマクロ呼び出し関係の整礎性
 
-`--mode termination` は展開を行わず、名前と引数個数で区別した呼び出し先の全一致規則と、穴頭位置に対する同arity候補辺をLeanで再計算する。Pythonが合成した自然数の順位について、各辺で厳密に減少することを検査する。`MacroTermination.accessible` は `termination_by rank ranks node` によりアクセシビリティを構成し、`ranked_graph_wellFounded` が保守的な候補関係の整礎性を、`path_length_bounded` が呼び出し鎖の長さの上限を示す。
+`--mode termination` は展開を行わず、名前と引数個数で区別した呼び出し先の全一致規則と、穴頭位置に対する同arity候補辺をLeanで再計算する。Pythonが合成した自然数の順位について、各辺で厳密に減少することを検査する。`MacroTermination.accessible` は `termination_by rank ranks node` によりアクセシビリティを構成し、`ranked_graph_wellFounded` が保守的な候補関係の整礎性、`path_length_bounded` と `call_chain_length_bounded` が任意の有限call chain長の上界、`no_infinite_call_chain` が無限の辺列の不存在を示す。これらは静的候補graph上の結果で、実際のmacroStep列からその辺列を構成するシミュレーションが未完了のため、展開器全体の停止定理ではない。
 
 `MacroTermination.call_extraction_complete` は、成功した有限fuel走査結果が構文木内の全`StaticCall`を含むことを証明する。構文穴が呼び出し先の位置にある場合は、その引数個数に一致する全規則を候補として走査し、名前付き呼び出しでは名前・arity一致の全規則を含める。`findRule_mem_targetsOfArity` と `findRule_mem_targetsOfSignature` は既存の名前検索先も候補集合に含まれることを示す。`graphRows_dependency_edge` は各抽出済み依存先を行の辺に保持し、`graphRows_static_call_edge` はこの二つを合成する。`GraphCall` と `graphRows_contains_static_calls` は規則行リスト全体について辺の保存を帰納的に示す。`ProcessCertificate.source_static_calls_decrease` は受理済みの一般証書から各抽出辺の順位減少を取り出し、停止性証明書の `every_static_rule_call_decreases` もこれを個別に確認する。候補の過近似を含むテンプレート構文の解析であり、C展開器が実際に実行するmacroStepとのシミュレーションや展開処理全体の終了性を証明したものではない。
 

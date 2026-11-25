@@ -1,4 +1,5 @@
 import NLisp.CMacroCopy
+import NLisp.TypedExpansion
 
 namespace NLisp.CBindingWalk
 
@@ -34,6 +35,104 @@ def builtinEnvironment : Environment :=
     "float>", "float>=", "float=", "to-float", "float-truncate", "string=",
     "string-append", "character="].enum.map
       (fun (index, name) => (⟨name, 3 * (index + 1), 3 * (index + 1)⟩ : Entry))).reverse
+
+theorem builtinEnvironment_floatArithmetic_ids :
+    findName builtinEnvironment "float+" = some ⟨"float+", 39, 39⟩ ∧
+    findName builtinEnvironment "float-" = some ⟨"float-", 42, 42⟩ ∧
+    findName builtinEnvironment "float*" = some ⟨"float*", 45, 45⟩ ∧
+    findName builtinEnvironment "float/" = some ⟨"float/", 48, 48⟩ := by
+  decide
+
+/-- The 26 entries in C's builtin table are assigned the same stable
+three-step identities used by name resolution. This pins every C builtin
+spelling to the identity consumed by the Lean annotated-tree walk. -/
+theorem builtinEnvironment_all_ids :
+    findName builtinEnvironment "+" = some ⟨"+", 3, 3⟩ ∧
+    findName builtinEnvironment "-" = some ⟨"-", 6, 6⟩ ∧
+    findName builtinEnvironment "*" = some ⟨"*", 9, 9⟩ ∧
+    findName builtinEnvironment "<" = some ⟨"<", 12, 12⟩ ∧
+    findName builtinEnvironment "<=" = some ⟨"<=", 15, 15⟩ ∧
+    findName builtinEnvironment ">" = some ⟨">", 18, 18⟩ ∧
+    findName builtinEnvironment ">=" = some ⟨">=", 21, 21⟩ ∧
+    findName builtinEnvironment "integer=" = some ⟨"integer=", 24, 24⟩ ∧
+    findName builtinEnvironment "quotient" = some ⟨"quotient", 27, 27⟩ ∧
+    findName builtinEnvironment "remainder" = some ⟨"remainder", 30, 30⟩ ∧
+    findName builtinEnvironment "boolean=" = some ⟨"boolean=", 33, 33⟩ ∧
+    findName builtinEnvironment "not" = some ⟨"not", 36, 36⟩ ∧
+    findName builtinEnvironment "float+" = some ⟨"float+", 39, 39⟩ ∧
+    findName builtinEnvironment "float-" = some ⟨"float-", 42, 42⟩ ∧
+    findName builtinEnvironment "float*" = some ⟨"float*", 45, 45⟩ ∧
+    findName builtinEnvironment "float/" = some ⟨"float/", 48, 48⟩ ∧
+    findName builtinEnvironment "float<" = some ⟨"float<", 51, 51⟩ ∧
+    findName builtinEnvironment "float<=" = some ⟨"float<=", 54, 54⟩ ∧
+    findName builtinEnvironment "float>" = some ⟨"float>", 57, 57⟩ ∧
+    findName builtinEnvironment "float>=" = some ⟨"float>=", 60, 60⟩ ∧
+    findName builtinEnvironment "float=" = some ⟨"float=", 63, 63⟩ ∧
+    findName builtinEnvironment "to-float" = some ⟨"to-float", 66, 66⟩ ∧
+    findName builtinEnvironment "float-truncate" = some ⟨"float-truncate", 69, 69⟩ ∧
+    findName builtinEnvironment "string=" = some ⟨"string=", 72, 72⟩ ∧
+    findName builtinEnvironment "string-append" = some ⟨"string-append", 75, 75⟩ ∧
+    findName builtinEnvironment "character=" = some ⟨"character=", 78, 78⟩ := by
+  decide
+
+/-- Primitive identities used by the independently typed expansion model.
+The order is the C `builtin_specs` order, which is also the order used when
+assigning stable identities above. -/
+def builtinPrimitive : String → Option TypedExpansion.Primitive
+  | "+" => some .add | "-" => some .sub | "*" => some .mul
+  | "<" => some .lt | "<=" => some .le | ">" => some .gt | ">=" => some .ge
+  | "integer=" => some .intEq | "quotient" => some .quotient
+  | "remainder" => some .remainder | "boolean=" => some .boolEq | "not" => some .not
+  | "float+" => some .fadd | "float-" => some .fsub | "float*" => some .fmul
+  | "float/" => some .fdiv | "float<" => some .flt | "float<=" => some .fle
+  | "float>" => some .fgt | "float>=" => some .fge | "float=" => some .floatEq
+  | "to-float" => some .toFloat | "float-truncate" => some .truncate
+  | "string=" => some .stringEq | "string-append" => some .append
+  | "character=" => some .charEq | _ => none
+
+theorem builtinEnvironment_primitiveRows :
+    (builtinEnvironment.reverse.map (fun entry => (entry.identity,
+      builtinPrimitive entry.name))) =
+    [(3, some .add), (6, some .sub), (9, some .mul), (12, some .lt),
+     (15, some .le), (18, some .gt), (21, some .ge), (24, some .intEq),
+     (27, some .quotient), (30, some .remainder), (33, some .boolEq),
+     (36, some .not), (39, some .fadd), (42, some .fsub), (45, some .fmul),
+     (48, some .fdiv), (51, some .flt), (54, some .fle), (57, some .fgt),
+     (60, some .fge), (63, some .floatEq), (66, some .toFloat),
+     (69, some .truncate), (72, some .stringEq), (75, some .append),
+     (78, some .charEq)] := by
+  decide
+
+theorem builtinEnvironment_primitiveTypeRows :
+    (builtinEnvironment.reverse.map (fun entry => (entry.identity,
+      (builtinPrimitive entry.name).map TypedExpansion.Primitive.type))) =
+    [(3, some (.fn .integer (.fn .integer .integer))),
+     (6, some (.fn .integer (.fn .integer .integer))),
+     (9, some (.fn .integer (.fn .integer .integer))),
+     (12, some (.fn .integer (.fn .integer .boolean))),
+     (15, some (.fn .integer (.fn .integer .boolean))),
+     (18, some (.fn .integer (.fn .integer .boolean))),
+     (21, some (.fn .integer (.fn .integer .boolean))),
+     (24, some (.fn .integer (.fn .integer .boolean))),
+     (27, some (.fn .integer (.fn .integer (.option .integer)))),
+     (30, some (.fn .integer (.fn .integer (.option .integer)))),
+     (33, some (.fn .boolean (.fn .boolean .boolean))),
+     (36, some (.fn .boolean .boolean)),
+     (39, some (.fn .floating (.fn .floating .floating))),
+     (42, some (.fn .floating (.fn .floating .floating))),
+     (45, some (.fn .floating (.fn .floating .floating))),
+     (48, some (.fn .floating (.fn .floating .floating))),
+     (51, some (.fn .floating (.fn .floating .boolean))),
+     (54, some (.fn .floating (.fn .floating .boolean))),
+     (57, some (.fn .floating (.fn .floating .boolean))),
+     (60, some (.fn .floating (.fn .floating .boolean))),
+     (63, some (.fn .floating (.fn .floating .boolean))),
+     (66, some (.fn .integer .floating)),
+     (69, some (.fn .floating (.option .integer))),
+     (72, some (.fn .string (.fn .string .boolean))),
+     (75, some (.fn .string (.fn .string .string))),
+     (78, some (.fn .character (.fn .character .boolean)))] := by
+  decide
 
 def entry : Node → Option Entry
   | .atom a _ => if Lexical.identifier a.name then some ⟨a.name, a.token, a.token⟩ else none
@@ -191,10 +290,64 @@ def accepts (site : Site) : Bool :=
       ScopedSyntax.uniqueIds (scope (fun _ => .unit) site.environment) &&
       ScopedSyntax.uniqueIds (scope (fun _ => .unit) site.caller)
 
+theorem accepts_selected_identity_in_caller (site : Site) (accepted : accepts site = true) :
+    ∃ binding, binding ∈ site.caller ∧ binding.identity = site.selected := by
+  unfold accepts at accepted
+  cases found : findName site.environment site.name with
+  | none => simp [found] at accepted
+  | some binding =>
+      simp only [found, Bool.and_eq_true] at accepted
+      have facts : site.selected = binding.identity ∧ binding ∈ site.caller :=
+        of_decide_eq_true accepted.1.1
+      exact ⟨binding, facts.2, facts.1.symm⟩
+
+/- Cost only the linked-environment name lookup performed by `accepts`.
+Structural checks for membership and unique scope identifiers are deliberately
+outside this partial cost model. -/
+def acceptsWithLookupCost (site : Site) : Bool × Nat :=
+  let (found, cost) := findNameWithByteCost site.environment site.name
+  let accepted := match found with
+    | none => false
+    | some binding =>
+        decide (site.selected = binding.identity ∧ binding ∈ site.caller) &&
+          ScopedSyntax.uniqueIds (scope (fun _ => .unit) site.environment) &&
+          ScopedSyntax.uniqueIds (scope (fun _ => .unit) site.caller)
+  (accepted, 8 * cost)
+
+theorem acceptsWithLookupCost_result (site : Site) :
+    (acceptsWithLookupCost site).1 = accepts site := by
+  simp [acceptsWithLookupCost, accepts, findNameWithByteCost_result]
+
+def checkSitesWithLookupCost : List Site → Bool × Nat
+  | [] => (true, 0)
+  | site :: rest =>
+      let (tailAccepted, tailCost) := checkSitesWithLookupCost rest
+      let (siteAccepted, siteCost) := acceptsWithLookupCost site
+      (siteAccepted && tailAccepted, siteCost + tailCost)
+
+theorem checkSitesWithLookupCost_result (sites : List Site) :
+    (checkSitesWithLookupCost sites).1 = sites.all accepts := by
+  induction sites with
+  | nil => rfl
+  | cons site rest ih =>
+      simp [checkSitesWithLookupCost, acceptsWithLookupCost_result, ih]
+
 def check (fuel : Nat) (forms : List Node) (builtins : Environment) : Bool :=
   match references fuel forms builtins with
   | none => false
   | some sites => sites.all accepts
+
+def checkWithLookupCost (fuel : Nat) (forms : List Node) (builtins : Environment) :
+    Bool × Nat :=
+  match references fuel forms builtins with
+  | none => (false, 0)
+  | some sites => checkSitesWithLookupCost sites
+
+theorem checkWithLookupCost_result (fuel : Nat) (forms : List Node)
+    (builtins : Environment) :
+    (checkWithLookupCost fuel forms builtins).1 = check fuel forms builtins := by
+  unfold checkWithLookupCost check
+  cases references fuel forms builtins <;> simp [checkSitesWithLookupCost_result]
 
 def Corresponds (site : Site) : Prop :=
   ∀ interpret : Nat → ScopedSyntax.Ty,
@@ -243,5 +396,22 @@ theorem check_sound (fuel : Nat) (forms : List Node) (builtins : Environment)
       have all : sites.all accepts = true := by simpa [result] using accepted
       intro site member
       exact accepts_sound site (List.all_eq_true.mp all site member)
+
+theorem check_selected_identities_in_caller (fuel : Nat) (forms : List Node)
+    (builtins : Environment) (accepted : check fuel forms builtins = true) :
+    ∃ sites, references fuel forms builtins = some sites ∧
+      ∀ site ∈ sites, accepts site = true ∧
+        site.selected ∈ site.caller.map (fun entry => entry.identity) := by
+  unfold check at accepted
+  cases result : references fuel forms builtins with
+  | none => simp [result] at accepted
+  | some sites =>
+      have allAccepted : sites.all accepts = true := by simpa [result] using accepted
+      refine ⟨sites, rfl, ?_⟩
+      intro site member
+      have siteAccepted := List.all_eq_true.mp allAccepted site member
+      obtain ⟨binding, bindingMember, selected⟩ :=
+        accepts_selected_identity_in_caller site siteAccepted
+      exact ⟨siteAccepted, List.mem_map.mpr ⟨binding, bindingMember, selected⟩⟩
 
 end NLisp.CBindingWalk

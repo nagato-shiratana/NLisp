@@ -8,7 +8,7 @@ open ExpansionLowering
 node and each element of a function-parameter list consumes one unit. -/
 mutual
 def checkerTypeFuel : Ty → Nat
-  | .boolean | .integer | .unit | .var _ => 1
+  | .boolean | .integer | .float | .string | .character | .unit | .var _ => 1
   | .fn parameters result => max (checkerTypesFuel parameters) (checkerTypeFuel result) + 1
   | .list element | .option element => checkerTypeFuel element + 1
 
@@ -29,6 +29,15 @@ theorem checkWF_sufficient (type : Ty) (count fuel : Nat)
       refine ⟨⟨True.intro⟩, ?_⟩
       simp [checkWF]
     | integer =>
+      refine ⟨⟨True.intro⟩, ?_⟩
+      simp [checkWF]
+    | float =>
+      refine ⟨⟨True.intro⟩, ?_⟩
+      simp [checkWF]
+    | string =>
+      refine ⟨⟨True.intro⟩, ?_⟩
+      simp [checkWF]
+    | character =>
       refine ⟨⟨True.intro⟩, ?_⟩
       simp [checkWF]
     | unit =>
@@ -235,7 +244,7 @@ theorem checkerSignatureFuel_le_of_lookup {signatures : List Signature} {index :
 mutual
 def checkerExprFuel (globals : List Signature) (expression : Expr) : Nat :=
   match expression with
-  | .var _ | .bool _ | .int _ | .unit => 1
+  | .var _ | .bool _ | .int _ | .float _ | .string _ | .character _ | .unit => 1
   | .global _ typeArguments => checkerTypesFuel typeArguments + checkerSignaturesFuel globals + 1
   | .lam parameters result body =>
       checkerTypesFuel parameters + checkerTypeFuel result + checkerExprFuel globals body + 1
@@ -243,7 +252,8 @@ def checkerExprFuel (globals : List Signature) (expression : Expr) : Nat :=
       checkerExprFuel globals function + checkerExprsFuel globals arguments + 1
   | .ite condition yes no =>
       checkerExprFuel globals condition + checkerExprFuel globals yes + checkerExprFuel globals no + 1
-  | .add left right | .sub left right | .mul left right | .le left right | .intEq left right =>
+  | .add left right | .sub left right | .mul left right | .le left right | .intEq left right
+  | .floatBin _ left right =>
       checkerExprFuel globals left + checkerExprFuel globals right + 1
   | .letMany types initializers body =>
       checkerTypesFuel types + checkerExprsFuel globals initializers + checkerExprFuel globals body + 1
@@ -305,7 +315,7 @@ mutual
 theorem checkWF_complete (type : Ty) (count : Nat) (valid : type.wellFormed count) :
     ∃ bound, ∀ fuel, bound ≤ fuel → checkWF fuel count type = some ⟨valid⟩ := by
   cases type with
-  | boolean | integer | unit =>
+  | boolean | integer | float | string | character | unit =>
     refine ⟨1, ?_⟩
     intro fuel bound
     cases fuel with
@@ -408,24 +418,16 @@ theorem inferTypeArguments_complete_from_candidate (fuel callerCount : Nat)
     intro t mem
     rw [candidateArity]
     exact parametersValid t mem
-  obtain ⟨assignments, collected, _, assignmentsLength, captures⟩ :=
-    collectArguments_complete fuel (header.parameters.map Prod.snd) actuals candidate initial
-      initialLength initialAgree parametersValidCandidate candidateMatches collectorEnough
-  have assignmentsCandidateLength : assignments.length = candidate.length :=
-    assignmentsLength.trans initialLength
-  have assignmentsEq : assignments = candidate.map some := by
-    apply List.ext_get (by simp [assignmentsCandidateLength, candidateArity])
-    intro index assignmentsBound candidateBound
-    have indexBound : index < candidate.length := by
-      simpa using candidateBound
-    have occursHere : occursMany fuel index (header.parameters.map Prod.snd) = true := by
-      have indexInRange : index ∈ List.range header.variables.length :=
-        below_member_range (by omega)
-      exact List.all_eq_true.mp (by simpa [inferrable] using covered) index indexInRange
-    have candidateAtIndex : candidate[index]? = some (candidate[index]'indexBound) := by
-      simp [getElem?_def, indexBound]
-    have captured := captures index occursHere (candidate[index]'indexBound) candidateAtIndex
-    simpa [getElem?_def, assignmentsBound, candidateBound] using captured
+  have everyCandidateOccurs : ∀ index, index < candidate.length →
+      occursMany fuel index (header.parameters.map Prod.snd) = true := by
+    intro index indexBound
+    have indexInRange : index ∈ List.range header.variables.length :=
+      below_member_range (by omega)
+    exact List.all_eq_true.mp (by simpa [inferrable] using covered) index indexInRange
+  obtain ⟨assignments, collected, assignmentsEq⟩ :=
+    collectArguments_complete_assignments_eq_candidate fuel
+      (header.parameters.map Prod.snd) actuals candidate initial initialLength initialAgree
+      parametersValidCandidate candidateMatches collectorEnough everyCandidateOccurs
   have collectedCandidate :
       collectArguments fuel (header.parameters.map Prod.snd) actuals initial =
         some (candidate.map some) := by
@@ -607,6 +609,15 @@ theorem inference_eventually (typing : HasType globals count context expression 
     all_goals subst_vars
     all_goals try simp_all
     all_goals solve_by_elim [lookup_unique]
+
+theorem elaborate_eventually (typing : HasType globals count context expression type) :
+    ∃ bound, ∀ fuel, bound ≤ fuel →
+      (elaborate fuel globals count context expression type).isSome = true := by
+  obtain ⟨bound, eventually⟩ := inference_eventually typing
+  refine ⟨bound + 1, ?_⟩
+  intro fuel enough
+  have inferred := eventually fuel (by omega)
+  simp [elaborate, inferred, Inferred.expect]
 
 /-- The computable expression bound is sufficient fuel for accepted typing
 derivations. -/

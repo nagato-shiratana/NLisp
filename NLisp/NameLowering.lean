@@ -10,6 +10,34 @@ def position (id : Nat) : List Nat → Nat
   | [] => 0
   | key :: tail => if key = id then 0 else position id tail + 1
 
+theorem position_eq_length_of_not_mem (id : Nat) (locals : List Nat)
+    (absent : id ∉ locals) : position id locals = locals.length := by
+  induction locals with
+  | nil => rfl
+  | cons key tail ih =>
+      have different : key ≠ id := by
+        intro same
+        subst key
+        exact absent (by simp)
+      have tailAbsent : id ∉ tail := by
+        intro member
+        exact absent (by simp [member])
+      simp [position, different, ih tailAbsent]
+
+theorem position_lt_length_of_mem (id : Nat) (locals : List Nat)
+    (present : id ∈ locals) : position id locals < locals.length := by
+  induction locals with
+  | nil => simp at present
+  | cons key tail ih =>
+      rcases List.mem_cons.mp present with same | member
+      · subst key
+        simp [position]
+      · by_cases different : key = id
+        · simp [position, different]
+        · have tailBound := ih member
+          simp [position, different]
+          omega
+
 /- Nested structural recursion avoids reducing a sizeOf measure containing
 the numeric values of source identities or arbitrary-precision literals. -/
 macro "lower_using " recursor:term : term => `(
@@ -18,7 +46,8 @@ macro "lower_using " recursor:term : term => `(
     (motive_2 := fun _ => List Nat → List PolyIR.Term)
     (fun id locals => .var (position id locals))
     (fun index _ => .global index)
-    (fun b _ => .bool b) (fun n _ => .int n) (fun _ => .unit)
+    (fun b _ => .bool b) (fun n _ => .int n) (fun x _ => .float x)
+    (fun s _ => .string s) (fun c _ => .character c) (fun _ => .unit)
     (fun ps _ body locals => .lam ps.length (body (ps ++ locals)))
     (fun _ _ f args locals => .app (f locals) (args locals))
     (fun _ _ _ c y n locals => .ite (c locals) (y locals) (n locals))
@@ -27,6 +56,7 @@ macro "lower_using " recursor:term : term => `(
     (fun _ _ a b locals => .mul (a locals) (b locals))
     (fun _ _ a b locals => .le (a locals) (b locals))
     (fun _ _ a b locals => .intEq (a locals) (b locals))
+    (fun op _ _ left right locals => .floatBin op (left locals) (right locals))
     (fun ps _ _ values body locals => .letMany (values locals) (body (ps ++ locals)))
     (fun _ _ first rest locals => .begin (first locals) (rest locals))
     (fun _ => .nil) (fun _ _ h t locals => .cons (h locals) (t locals))
@@ -49,6 +79,9 @@ theorem lower_eq (locals : List Nat) (expression : Expr) :
     | .global i => .global i
     | .bool b => .bool b
     | .int n => .int n
+    | .float x => .float x
+    | .string s => .string s
+    | .character c => .character c
     | .unit => .unit
     | .lam ps body => .lam ps.length (lower (ps ++ locals) body)
     | .app f args => .app (lower locals f) (lowerMany locals args)
@@ -67,7 +100,8 @@ theorem lower_eq (locals : List Nat) (expression : Expr) :
     | .matchList target empty h t full =>
       .matchList (lower locals target) (lower locals empty) (lower (h :: t :: locals) full)
     | .matchOption target empty id full =>
-      .matchOption (lower locals target) (lower locals empty) (lower (id :: locals) full) := by
+      .matchOption (lower locals target) (lower locals empty) (lower (id :: locals) full)
+    | .floatBin op left right => .floatBin op (lower locals left) (lower locals right) := by
   cases expression <;> rfl
 
 theorem lowerMany_eq (locals : List Nat) (expressions : List Expr) :
@@ -95,6 +129,9 @@ def lowerValue (value : Value) : PolyIR.Value :=
   match value with
   | .bool b => .bool b
   | .int n => .int n
+  | .float x => .float x
+  | .string s => .string s
+  | .character c => .character c
   | .unit => .unit
   | .closure ps body env => .closure ps.length (lower (ps ++ identities env) body) (lowerEnv env)
   | .global i => .global i
@@ -277,6 +314,57 @@ theorem integer_evaluation_reflected (program : Definitions) (env : Environment)
   | int =>
       refine ⟨Value.int n, Evaluates.int, ?_⟩
       simp [lowerValue]
+
+theorem float_evaluation_reflected (program : Definitions) (env : Environment) (x : Float)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) (.float x) value) :
+    ∃ sourceValue, Evaluates program env (.float x) sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | float => exact ⟨Value.float x, Evaluates.float, rfl⟩
+
+theorem string_evaluation_reflected (program : Definitions) (env : Environment) (s : String)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) (.string s) value) :
+    ∃ sourceValue, Evaluates program env (.string s) sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | string => exact ⟨Value.string s, Evaluates.string, by simp [lowerValue]⟩
+
+theorem character_evaluation_reflected (program : Definitions) (env : Environment) (c : Char)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env) (.character c) value) :
+    ∃ sourceValue, Evaluates program env (.character c) sourceValue ∧ lowerValue sourceValue = value := by
+  cases evaluated with
+  | character => exact ⟨Value.character c, Evaluates.character, by simp [lowerValue]⟩
+
+theorem floatBin_evaluation_reflected (program : Definitions) (env : Environment)
+    (op : Surface.FloatBinOp) (left right : Expr)
+    (leftReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) left) value →
+      ∃ sourceValue, Evaluates program env left sourceValue ∧ lowerValue sourceValue = value)
+    (rightReflected : ∀ {value},
+      PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+        (lower (identities env) right) value →
+      ∃ sourceValue, Evaluates program env right sourceValue ∧ lowerValue sourceValue = value)
+    (value : PolyIR.Value)
+    (evaluated : PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+      (lower (identities env) (.floatBin op left right)) value) :
+    ∃ sourceValue, Evaluates program env (.floatBin op left right) sourceValue ∧
+      lowerValue sourceValue = value := by
+  rw [lower_eq] at evaluated
+  cases evaluated with
+  | floatBin leftEval rightEval =>
+      rename_i leftFloat rightFloat
+      obtain ⟨sourceLeft, sourceLeftEval, leftLowered⟩ := leftReflected leftEval
+      obtain ⟨sourceRight, sourceRightEval, rightLowered⟩ := rightReflected rightEval
+      cases sourceLeft <;> simp_all [lowerValue]
+      cases sourceRight <;> simp_all [lowerValue]
+      cases leftLowered
+      cases rightLowered
+      exact ⟨.float (match op with
+        | .add => leftFloat.add rightFloat | .sub => leftFloat.sub rightFloat
+        | .mul => leftFloat.mul rightFloat | .div => leftFloat.div rightFloat),
+        .floatBin sourceLeftEval sourceRightEval, by cases op <;> rfl⟩
 
 theorem unit_evaluation_reflected (program : Definitions) (env : Environment)
     (value : PolyIR.Value)
@@ -511,6 +599,9 @@ theorem matchList_evaluation_reflected (program : Definitions) (env : Environmen
           exact ⟨sourceBody, .matchCons sourceTargetEval sourceBodyEval, bodyLowered⟩
       | bool _ => simp [lowerValue] at targetLowered
       | int _ => simp [lowerValue] at targetLowered
+      | float _ => simp [lowerValue] at targetLowered
+      | string _ => simp [lowerValue] at targetLowered
+      | character _ => simp [lowerValue] at targetLowered
       | unit => simp [lowerValue] at targetLowered
       | closure _ _ _ => simp [lowerValue] at targetLowered
       | global _ => simp [lowerValue] at targetLowered
@@ -560,6 +651,9 @@ theorem matchOption_evaluation_reflected (program : Definitions) (env : Environm
           exact ⟨sourceBody, .matchSome sourceTargetEval sourceBodyEval, bodyLowered⟩
       | bool _ => simp [lowerValue] at targetLowered
       | int _ => simp [lowerValue] at targetLowered
+      | float _ => simp [lowerValue] at targetLowered
+      | string _ => simp [lowerValue] at targetLowered
+      | character _ => simp [lowerValue] at targetLowered
       | unit => simp [lowerValue] at targetLowered
       | closure _ _ _ => simp [lowerValue] at targetLowered
       | global _ => simp [lowerValue] at targetLowered
@@ -798,6 +892,9 @@ theorem appClosure_evaluation_reflected (program : Definitions) (env : Environme
         resultLowered⟩
   | bool _ => simp [lowerValue] at sourceFunctionLowered
   | int _ => simp [lowerValue] at sourceFunctionLowered
+  | float _ => simp [lowerValue] at sourceFunctionLowered
+  | string _ => simp [lowerValue] at sourceFunctionLowered
+  | character _ => simp [lowerValue] at sourceFunctionLowered
   | unit => simp [lowerValue] at sourceFunctionLowered
   | global _ => simp [lowerValue] at sourceFunctionLowered
   | nil => simp [lowerValue] at sourceFunctionLowered
@@ -899,7 +996,8 @@ theorem evaluation_preserved (h : Evaluates program env expression value) :
     exact PolyIR.Evaluates.appGlobal ihf iha (definitions_lookup program found)
       (by simpa using arity) ihb
   all_goals solve_by_elim (config := { maxDepth := 8 }) [PolyIR.Evaluates.var, PolyIR.Evaluates.global,
-    PolyIR.Evaluates.bool, PolyIR.Evaluates.int, PolyIR.Evaluates.unit, PolyIR.Evaluates.lam,
+    PolyIR.Evaluates.bool, PolyIR.Evaluates.int, PolyIR.Evaluates.floatBin,
+    PolyIR.Evaluates.string, PolyIR.Evaluates.character, PolyIR.Evaluates.unit, PolyIR.Evaluates.lam,
     PolyIR.Evaluates.appClosure, PolyIR.Evaluates.appGlobal, PolyIR.Evaluates.ifTrue, PolyIR.Evaluates.ifFalse,
     PolyIR.Evaluates.add, PolyIR.Evaluates.sub, PolyIR.Evaluates.mul, PolyIR.Evaluates.le, PolyIR.Evaluates.intEq,
     PolyIR.Evaluates.letMany, PolyIR.Evaluates.begin, PolyIR.Evaluates.nil, PolyIR.Evaluates.cons,
@@ -907,6 +1005,48 @@ theorem evaluation_preserved (h : Evaluates program env expression value) :
     PolyIR.Evaluates.matchNone, PolyIR.Evaluates.matchSome, PolyIR.ArgumentsEvaluate.nil,
     PolyIR.ArgumentsEvaluate.cons, PolyIR.SequenceEvaluates.nil, PolyIR.SequenceEvaluates.cons,
     lookup_lowered, definitions_lookup, lowered_arity]
+
+/-- Termination in the independent identity-based source semantics means that
+there is a finite big-step derivation. Divergence is the absence of every such
+finite result; it is not fuel exhaustion in an evaluator. -/
+def SourceTerminates (program : Definitions) (env : Environment) (expression : Expr) : Prop :=
+  ∃ value, Evaluates program env expression value
+
+def SourceDiverges (program : Definitions) (env : Environment) (expression : Expr) : Prop :=
+  ¬ SourceTerminates program env expression
+
+def LoweredTerminates (program : Definitions) (env : Environment) (expression : Expr) : Prop :=
+  ∃ value, PolyIR.Evaluates (lowerDefinitions program) (lowerEnv env)
+    (lower (identities env) expression) value
+
+def LoweredDiverges (program : Definitions) (env : Environment) (expression : Expr) : Prop :=
+  ¬ LoweredTerminates program env expression
+
+/-- Finite source termination always yields finite lowered termination. The
+reverse direction is exactly the general evaluation-reflection obligation. -/
+theorem termination_preserved_and_reflected (program : Definitions) (env : Environment)
+    (expression : Expr) (reflection : EvaluationReflection program) :
+    SourceTerminates program env expression ↔ LoweredTerminates program env expression := by
+  constructor
+  · rintro ⟨value, evaluated⟩
+    exact ⟨lowerValue value, evaluation_preserved evaluated⟩
+  · rintro ⟨value, evaluated⟩
+    obtain ⟨sourceValue, sourceEval, _⟩ := reflection env (identities env) expression
+      (lowerEnv env) (lower (identities env) expression) rfl rfl rfl evaluated
+    exact ⟨sourceValue, sourceEval⟩
+
+/-- Under the same evaluation-reflection premise, the finite-derivation
+definition of divergence is preserved and reflected exactly. -/
+theorem divergence_preserved_and_reflected (program : Definitions) (env : Environment)
+    (expression : Expr) (reflection : EvaluationReflection program) :
+    SourceDiverges program env expression ↔ LoweredDiverges program env expression := by
+  constructor
+  · intro sourceDiverges loweredTerminates
+    exact sourceDiverges ((termination_preserved_and_reflected program env expression
+      reflection).2 loweredTerminates)
+  · intro loweredDiverges sourceTerminates
+    exact loweredDiverges ((termination_preserved_and_reflected program env expression
+      reflection).1 sourceTerminates)
 
 end
 end NLisp.Named

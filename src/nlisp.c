@@ -627,6 +627,9 @@ typedef struct {
 typedef struct { char *name; Type *type; SExpr *init; Span span; } ValDef;
 typedef enum { D_FUN, D_VAL } DeclKind;
 typedef struct { DeclKind kind; union { FunDef fun; ValDef val; } as; } Decl;
+/* `Program.data` has one index space for the original, mixed source order.
+   Runtime value slots are indexed by that same declaration index; GlobalIR's
+   store instead uses a dense ordinal over only D_VAL entries. */
 typedef struct { Decl *data; size_t count; } Program;
 
 static bool parse_params(Arena *a, const SExpr *x, Param **out, size_t *count, Error *e) {
@@ -2034,6 +2037,9 @@ static RBind *runtime_builtins(Runtime *r) {
 static Value *run_program(Arena *a, Program *p, Error *e) {
     Runtime r = {a, e}; RBind *env = runtime_builtins(&r);
     Value **closures = (Value **)aalloc(a, p->count * sizeof(*closures));
+    /* Like Program.data, value_slots is indexed by mixed declaration index.
+       Each element points to the actual RBind cell inserted into env, not to
+       a copy of its Value. This is the shared cell captured by closures. */
     RBind **value_slots = (RBind **)aalloc(a, p->count * sizeof(*value_slots));
     size_t count = 0U, i; Value *main_value;
     for (i = 0U; i < p->count; i++) if (p->data[i].kind == D_FUN) {

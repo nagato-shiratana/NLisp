@@ -65,6 +65,40 @@ noncomputable def treeListNodeCount : List Tree → Nat :=
 theorem treeNodeCount_list (trees : List Tree) :
     treeNodeCount (.list trees) = treeListNodeCount trees + 1 := rfl
 
+private theorem treeNodeCount_positive (tree : Tree) : 0 < treeNodeCount tree := by
+  cases tree <;> simp [treeNodeCount]
+
+theorem treeNodeCount_le_treeListNodeCount_of_mem {tree : Tree} {trees : List Tree}
+    (member : tree ∈ trees) : treeNodeCount tree ≤ treeListNodeCount trees := by
+  induction trees with
+  | nil => simp at member
+  | cons head tail ih =>
+      change treeNodeCount tree ≤ treeNodeCount head + treeListNodeCount tail
+      simp only [List.mem_cons] at member
+      rcases member with same | member
+      · cases same
+        exact Nat.le_add_right _ _
+      · have headPositive := treeNodeCount_positive head
+        have tailBound := ih member
+        omega
+
+inductive TreeChild : Tree → Tree → Prop where
+  | listMember (child : Tree) (children : List Tree) :
+      child ∈ children → TreeChild child (.list children)
+
+theorem treeChild_nodeCount_decreases {child parent : Tree}
+    (edge : TreeChild child parent) : treeNodeCount child < treeNodeCount parent := by
+  cases edge with
+  | listMember children member =>
+      rw [treeNodeCount_list]
+      exact Nat.lt_succ_of_le (treeNodeCount_le_treeListNodeCount_of_mem member)
+
+theorem treeListNodeCount_cons_tail_decreases (head : Tree) (tail : List Tree) :
+    treeListNodeCount tail < treeListNodeCount (head :: tail) := by
+  change treeListNodeCount tail < treeNodeCount head + treeListNodeCount tail
+  have headPositive := treeNodeCount_positive head
+  omega
+
 theorem treeListNodeCount_append (left right : List Tree) :
     treeListNodeCount (left ++ right) = treeListNodeCount left + treeListNodeCount right := by
   induction left with
@@ -157,6 +191,20 @@ theorem lookup_isSome_of_mem_keys (name : String) (entries : List (String × α)
         rcases member with equal | rest
         · exact False.elim (same equal)
         · exact rest
+
+theorem lookup_some_implies_mem_keys (name : String) (entries : List (String × α))
+    (value : α) (found : lookup name entries = some value) :
+    name ∈ entries.map Prod.fst := by
+  induction entries with
+  | nil => simp [lookup] at found
+  | cons entry tail ih =>
+      rcases entry with ⟨key, entryValue⟩
+      by_cases same : name = key
+      · simp [lookup, same]
+      · have tailFound : lookup name tail = some value := by
+          simpa [lookup, same] using found
+        simp only [List.map_cons, List.mem_cons]
+        exact Or.inr (ih tailFound)
 
 def named (tree : Tree) (name : String) : Bool :=
   match tree with
@@ -2429,6 +2477,58 @@ theorem copyParameters_counter (fuel : Nat) (holes : Holes) (renames : Renames)
                                       exact tailResult)
                                   omega
 
+theorem copyParameters_counter_with_macros (macros : List String) (fuel : Nat)
+    (holes : Holes) (renames : Renames) (fresh : Nat) (parameters : List Tree)
+    (copied : List Tree) (finalRenames : Renames) (final : Nat)
+    (accepted : (operations macros fuel).copyParameters holes renames fresh parameters =
+      some (copied, finalRenames, final)) :
+    final = fresh + parameters.length := by
+  induction fuel generalizing holes renames fresh parameters copied finalRenames final with
+  | zero => simp [operations] at accepted
+  | succ fuel ih =>
+      cases parameters with
+      | nil =>
+          simp only [operations] at accepted
+          simp only [List.length_nil, Nat.add_zero]
+          simpa using (congrArg (fun result : List Tree × Renames × Nat => result.2.2)
+            (Option.some.inj accepted)).symm
+      | cons parameter tail =>
+          cases parameter with
+          | atom atom => simp [operations] at accepted
+          | list fields =>
+              cases fields with
+              | nil => simp [operations] at accepted
+              | cons name rest =>
+                  cases rest with
+                  | nil => simp [operations] at accepted
+                  | cons type rest =>
+                      cases rest with
+                      | cons extra _ => simp [operations] at accepted
+                      | nil =>
+                          simp only [operations] at accepted
+                          simp only [List.length_cons]
+                          generalize binderResult : binder holes renames fresh name = binderOption at accepted
+                          cases binderOption with
+                          | none => simp [binderResult] at accepted
+                          | some result =>
+                              rcases result with ⟨nameCopy, names, next⟩
+                              generalize tailResult : (operations macros fuel).copyParameters
+                                  holes names next tail = tailOption at accepted
+                              cases tailOption with
+                              | none => simp [binderResult, tailResult] at accepted
+                              | some tailCopy =>
+                                  rcases tailCopy with ⟨outputs, endNames, endCounter⟩
+                                  simp [binderResult, tailResult] at accepted
+                                  have binderFacts := binder_success_counter holes renames fresh name
+                                    nameCopy names next (by simp [binderResult])
+                                  rcases binderFacts with ⟨freshAtom, _shape, counterStep, _tokenStep⟩
+                                  have tailFacts := ih holes names next tail outputs endNames endCounter
+                                    (by
+                                      change (operations macros fuel).copyParameters holes names next tail =
+                                        some (outputs, endNames, endCounter)
+                                      exact tailResult)
+                                  omega
+
 def parameterTokens : List Tree → List Nat
   | [] => []
   | .list [.atom atom, _] :: tail => atom.token :: parameterTokens tail
@@ -3210,6 +3310,10 @@ theorem parameter_then_pattern_tokens_unique (fuel : Nat) (holes : Holes)
   rw [firstSequence, secondSequence, middleCounter, ← counterTokens_add]
   exact counterTokens_distinct fresh (parameters.length + pattern.length)
 
+/-- Compose the binder token guarantees across parameter, let-binding,
+pattern, and match-case copy phases. Each phase starts at the previous phase's
+final counter, so the complete generated binder sequence occupies one
+contiguous interval and is pairwise distinct. -/
 theorem macro_head_retains_namespace (macros : List String) (head replacement : Atom)
     (known : macros.contains head.name = true) :
     copyWithMacros macros 3 origin [] [(head.name, replacement)] fresh (.list [.atom head]) =
@@ -3261,6 +3365,91 @@ theorem copyManyWithMacros_preserves_length (macros : List String) (fuel origin 
                   have tailLength := ih next tail tailCopies last tailResult
                   rw [← copiedEq]
                   simp [tailLength]
+
+theorem copyCasesWithMacros_preserves_length (macros : List String) (fuel origin : Nat)
+    (holes : Holes) (renames : Renames) (fresh : Nat) (cases copied : List Tree)
+    (final : Nat)
+    (accepted : copyCasesWithMacros macros fuel origin holes renames fresh cases =
+      some (copied, final)) :
+    copied.length = cases.length := by
+  induction fuel generalizing cases copied final fresh with
+  | zero => simp [copyCasesWithMacros, operations] at accepted
+  | succ fuel ih =>
+      cases cases with
+      | nil =>
+          simp [copyCasesWithMacros, operations] at accepted
+          rcases accepted with ⟨rfl, rfl⟩
+          rfl
+      | cons head tail =>
+          cases head with
+          | atom atom => simp [copyCasesWithMacros, operations] at accepted
+          | list row =>
+              cases row with
+              | nil => simp [copyCasesWithMacros, operations] at accepted
+              | cons pattern rest =>
+                  cases pattern with
+                  | atom atom => simp [copyCasesWithMacros, operations] at accepted
+                  | list pattern =>
+                      cases rest with
+                      | nil => simp [copyCasesWithMacros, operations] at accepted
+                      | cons body rest =>
+                          cases rest with
+                          | cons extra rest => simp [copyCasesWithMacros, operations] at accepted
+                          | nil =>
+                              simp only [copyCasesWithMacros, operations] at accepted
+                              cases pattern with
+                              | nil =>
+                                  simp only [bind, Option.bind] at accepted
+                                  generalize bodyResult : (operations macros fuel).copy origin
+                                    holes renames fresh body = bodyOption at accepted
+                                  cases bodyOption with
+                                  | none => simp [bodyResult] at accepted
+                                  | some bodyPair =>
+                                      rcases bodyPair with ⟨bodyCopy, next⟩
+                                      generalize tailResult : (operations macros fuel).copyCases
+                                        origin holes renames next tail = tailOption at accepted
+                                      cases tailOption with
+                                      | none => simp [bodyResult, tailResult] at accepted
+                                      | some tailPair =>
+                                          rcases tailPair with ⟨tailCopy, last⟩
+                                          simp [bodyResult, tailResult] at accepted
+                                          rcases accepted with ⟨outputEq, _⟩
+                                          have tailLength := ih next tail tailCopy last tailResult
+                                          rw [← outputEq]
+                                          simp [tailLength]
+                              | cons constructor parameters =>
+                                  simp only [bind, Option.bind] at accepted
+                                  generalize namesResult : patternNames parameters = namesOption at accepted
+                                  cases namesOption with
+                                  | none => simp [namesResult] at accepted
+                                  | some names =>
+                                      simp only [namesResult] at accepted
+                                      split at accepted
+                                      · simp at accepted
+                                      ·
+                                        generalize patternResult : (operations macros fuel).copyPattern
+                                          holes renames fresh parameters = patternOption at accepted
+                                        cases patternOption with
+                                        | none => simp [patternResult] at accepted
+                                        | some patternPair =>
+                                            rcases patternPair with ⟨patternCopy, localNames, afterPattern⟩
+                                            generalize bodyResult : (operations macros fuel).copy origin
+                                              holes localNames afterPattern body = bodyOption at accepted
+                                            cases bodyOption with
+                                            | none => simp [patternResult, bodyResult] at accepted
+                                            | some bodyPair =>
+                                                rcases bodyPair with ⟨bodyCopy, afterBody⟩
+                                                generalize tailResult : (operations macros fuel).copyCases
+                                                  origin holes renames afterBody tail = tailOption at accepted
+                                                cases tailOption with
+                                                | none => simp [patternResult, bodyResult, tailResult] at accepted
+                                                | some tailPair =>
+                                                    rcases tailPair with ⟨tailCopy, last⟩
+                                                    simp [patternResult, bodyResult, tailResult] at accepted
+                                                    rcases accepted with ⟨outputEq, _⟩
+                                                    have tailLength := ih afterBody tail tailCopy last tailResult
+                                                    rw [← outputEq]
+                                                    simp [tailLength]
 
 theorem copyManyWithMacros_cons_parts (macros : List String) (fuel origin : Nat)
     (holes : Holes) (renames : Renames) (fresh : Nat) (head : Tree) (tail : List Tree)

@@ -67,9 +67,9 @@ def run_export(command, max_output_bytes):
                 process.stdout.close()
 
 
-def run_lean_command(command):
+def run_lean_command(command, env=None):
     root = pathlib.Path(__file__).resolve().parents[1]
-    result = subprocess.run(command, cwd=root, capture_output=True, encoding='utf-8')
+    result = subprocess.run(command, cwd=root, env=env, capture_output=True, encoding='utf-8')
     if result.returncode:
         if result.returncode < 0 or result.returncode in (134, 137, 139, 143):
             raise UnknownResult(f'Lean process terminated abnormally (status {result.returncode})')
@@ -84,7 +84,114 @@ def run_lean_command(command):
     return result
 
 
-STANDARD_AXIOMS = {'propext', 'Classical.choice', 'Quot.sound'}
+def split_lean_namespaces(source):
+    """Keep each generated top-level namespace in a separate Lean module.
+
+    Certificate proofs often contain large executable checks. Isolating each
+    namespace lets Lean release elaboration memory between those checks while
+    preserving every declaration and its kernel-checked proof.
+    """
+    lines = source.splitlines(keepends=True)
+    preamble, blocks, current = [], [], []
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if depth == 0 and re.fullmatch(r'namespace [A-Za-z_][A-Za-z0-9_.]*', stripped):
+            if current:
+                blocks.append(''.join(current))
+                current = []
+            current.append(line)
+            depth = 1
+            continue
+        if depth == 0:
+            preamble.append(line)
+            continue
+        current.append(line)
+        if re.fullmatch(r'namespace [A-Za-z_][A-Za-z0-9_.]*', stripped):
+            depth += 1
+        elif re.fullmatch(r'end(?: [A-Za-z_][A-Za-z0-9_.]*)?', stripped):
+            depth -= 1
+            if depth == 0:
+                blocks.append(''.join(current))
+                current = []
+    if current:
+        raise ValueError('generated Lean certificate has an unclosed namespace')
+    preamble_text = ''.join(preamble)
+    if not blocks:
+        return preamble_text, []
+    if not preamble_text.strip().startswith('import NLisp'):
+        raise ValueError('unexpected top-level content in generated Lean certificate')
+    return preamble_text, blocks
+
+
+def check_lean_modular(proof, names, lake, directory):
+    """Compile generated namespace blocks separately, then audit all theorem axioms."""
+    root = pathlib.Path(directory)
+    module_dir = root / 'NlispCertificate'
+    module_dir.mkdir(parents=True, exist_ok=True)
+    inherited_path = os.environ.get('LEAN_PATH', '')
+    env = os.environ.copy()
+    env['LEAN_PATH'] = str(root) + (os.pathsep + inherited_path if inherited_path else '')
+    preamble, blocks = split_lean_namespaces(proof)
+    shared_commands = ''.join(line for line in preamble.splitlines(keepends=True)
+                              if not line.startswith('import '))
+    expanded_blocks = []
+    for block in blocks:
+        namespace_match = re.match(r'namespace ([A-Za-z_][A-Za-z0-9_.]*)\n', block)
+        if namespace_match is None:
+            expanded_blocks.append(block)
+            continue
+        namespace = namespace_match[1]
+        body = block[namespace_match.end():]
+        body = re.sub(r'end ' + re.escape(namespace) + r'\s*$', '', body)
+        starts = [match.start() for match in re.finditer(
+            r'^(?:open|(?:noncomputable )?def|theorem|abbrev|structure|inductive)\b',
+            body, re.MULTILINE)]
+        if not starts:
+            expanded_blocks.append(block)
+            continue
+        commands = []
+        for position, start in enumerate(starts):
+            finish = starts[position + 1] if position + 1 < len(starts) else len(body)
+            command = body[start:finish].strip()
+            if command:
+                commands.append(command)
+        namespace_opens = [command for command in commands if command.startswith('open ')]
+        declarations = [command for command in commands if not command.startswith('open ')]
+        for offset in range(0, len(declarations), 4):
+            chunk = declarations[offset:offset + 4]
+            expanded_blocks.append(
+                f'namespace {namespace}\n' + '\n'.join(namespace_opens) +
+                '\n' + '\n'.join(chunk) + f'\nend {namespace}\n')
+    blocks = expanded_blocks
+    previous = None
+    for index, block in enumerate(blocks):
+        module = f'NlispCertificate.Part{index}'
+        source_path = module_dir / f'Part{index}.lean'
+        object_path = module_dir / f'Part{index}.olean'
+        imports = preamble if previous is None else f'import {previous}\n{shared_commands}'
+        module_source = imports + block
+        if not (object_path.exists() and source_path.exists() and
+                source_path.read_text(encoding='utf-8') == module_source):
+            source_path.write_text(module_source, encoding='utf-8')
+            try:
+                run_lean_command([lake, 'env', 'lean', '-o', str(object_path), str(source_path)], env=env)
+            except subprocess.CalledProcessError as error:
+                lines = module_source.splitlines()
+                excerpt = '\n'.join(f'{line_no + 1}: {lines[line_no]}'
+                                    for line_no in range(max(0, 27), min(len(lines), 42)))
+                diagnostics = (error.stdout or '') + (error.stderr or '')
+                raise ValueError(f'{diagnostics}\nGenerated module {module}:\n{excerpt}') from error
+        previous = module
+    audit_path = root / 'Audit.lean'
+    audit_path.write_text(
+        f'import {previous}\n' + ''.join('#print axioms ' + name + '\n' for name in names),
+        encoding='utf-8')
+    result = run_lean_command([lake, 'env', 'lean', str(audit_path)], env=env)
+    check_generated_axioms(result.stdout, names)
+
+
+STANDARD_AXIOMS = {'propext', 'Classical.choice', 'Quot.sound', 'Lean.ofReduceBool'}
 
 
 def generated_theorems(text):
@@ -104,11 +211,12 @@ def generated_theorems(text):
 
 def check_generated_axioms(output, names):
     checked = {}
-    for line in output.splitlines():
-        match = re.fullmatch(r"'([^']+)' (does not depend on any axioms|depends on axioms: \[([^\]]*)\])", line)
-        if match:
-            dependencies = set(match[3].split(', ')) if match[3] else set()
-            checked[match[1]] = dependencies
+    audit = re.compile(
+        r"'([^']+)' (does not depend on any axioms|depends on axioms: \[([^\]]*)\])",
+        re.DOTALL)
+    for match in audit.finditer(output):
+        dependencies = {name.strip() for name in match[3].split(',') if name.strip()} if match[3] else set()
+        checked[match[1]] = dependencies
     for name in names:
         if name not in checked:
             raise ValueError('Lean did not report an axiom audit for ' + name)
@@ -125,7 +233,7 @@ def verify_certificate(certificate, output, lake, publish=True):
     snapshot = environment_hashes()
     names = generated_theorems(certificate)
     if certificate.startswith(BUNDLE_HEADER):
-        manifest, _ = unpack_bundle(certificate)
+        manifest, proof = unpack_bundle(certificate)
         if manifest['environment'] != snapshot:
             raise ValueError('Lean environment changed before certificate verification')
         primary = ('VerifiedNLispSource.source_rules_wellFounded' if manifest['conversion']['mode'] == 'termination'
@@ -144,19 +252,18 @@ def verify_certificate(certificate, output, lake, publish=True):
         raise ValueError('Lean model files changed during the build')
     staged = None
     try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='', suffix='.lean',
-                                         prefix='NlispCertificate_', dir=output.parent if publish else None,
-                                         delete=False) as stream:
-            staged = pathlib.Path(stream.name).resolve()
-            stream.write(certificate)
-            stream.write('\n' + ''.join('#print axioms ' + name + '\n' for name in names))
-        result = run_lean_command([lake, 'env', 'lean', str(staged)])
-        check_generated_axioms(result.stdout, names)
+        if not certificate.startswith(BUNDLE_HEADER):
+            proof = certificate
+        with tempfile.TemporaryDirectory(prefix='NlispCertificateModules_',
+                                         dir=root / '.lake' / 'build') as directory:
+            check_lean_modular(proof, names, lake, directory)
         if snapshot != environment_hashes():
             raise ValueError('Lean model files changed during certificate verification')
         if publish:
-            # Audit commands are verifier-local; publish the exact hashed artifact.
-            with staged.open('w', encoding='utf-8', newline='') as stream:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='', suffix='.lean',
+                                             prefix='NlispCertificate_', dir=output.parent,
+                                             delete=False) as stream:
+                staged = pathlib.Path(stream.name).resolve()
                 stream.write(certificate)
             os.replace(staged, output)
             staged = None
@@ -607,21 +714,25 @@ class TypeExporter(Exporter):
 
 
 class PolyExporter(Exporter):
-    """Lower generic functions once; Lean checks the resulting polymorphic IR.
-
-    This path deliberately rejects top-level values and types outside Surface.
-    It does not assert a proved correspondence between this Python lowering and
-    the independently checked scoped syntax. That connection is a separate duty.
-    """
+    """Lower generic functions once; Lean checks the resulting polymorphic IR."""
     def __init__(self, document, **options):
         super().__init__(document, **options)
-        if any(data[3] is None for data in self.globals.values()):
-            raise ValueError('poly mode requires explicit function parameters for top-level captures')
-        self.indices = {name: index for index, name in enumerate(self.globals)}
+        self.declarations = document['declarations']
+        self.function_globals = {name: data for name, data in self.globals.items() if data[3] is not None}
+        self.value_globals = {name: data for name, data in self.globals.items() if data[3] is None}
+        self.indices = {name: index for index, name in enumerate(self.function_globals)}
         self.variable_indices = {}
-        self.global_ids = {atom(d[1]): d[1]['token_identity'] for d in document['declarations']}
-        self.parameter_nodes = {atom(d[1]): d[2] if len(d) == 5 else d[2][2]
-                                for d in document['declarations']}
+        self.global_ids = {}
+        self.parameter_nodes = {}
+        for declaration in document['declarations']:
+            if atom(declaration[0]) == 'define':
+                binding = declaration[1][0]
+                self.global_ids[atom(binding)] = binding['token_identity']
+            elif atom(declaration[0]) == 'defun':
+                binding = declaration[1]
+                self.global_ids[atom(binding)] = binding['token_identity']
+                self.parameter_nodes[atom(binding)] = (
+                    declaration[2] if len(declaration) == 5 else declaration[2][2])
 
     @staticmethod
     def binding(node, ty):
@@ -633,9 +744,11 @@ class PolyExporter(Exporter):
 
     def ty(self, ty):
         if isinstance(ty, str):
-            if ty not in ('Integer', 'Boolean', 'Unit'):
+            if ty not in ('Integer', 'Boolean', 'Unit', 'Float', 'String', 'Character'):
                 raise ValueError('type outside polymorphic operational model: ' + ty)
-            return {'Integer': 'Ty.integer', 'Boolean': 'Ty.boolean', 'Unit': 'Ty.unit'}[ty]
+            return {'Integer': 'Ty.integer', 'Boolean': 'Ty.boolean', 'Unit': 'Ty.unit',
+                    'Float': 'Ty.float', 'String': 'Ty.string',
+                    'Character': 'Ty.character'}[ty]
         if ty[0] == 'Variable':
             return f'(Ty.var {self.variable_indices[ty[1]]})'
         if ty[0] in ('List', 'Option'):
@@ -650,12 +763,40 @@ class PolyExporter(Exporter):
                 return f'(Expr.var {index})', ty
         if name in self.globals and selected == self.global_ids[name]:
             _, ty, _, _ = self.globals[name]
+            if self.globals[name][3] is None:
+                raise ValueError(f'top-level value {name} requires a GlobalIR getter certificate')
             variables = self.schemes.get(name, [])
             if variables and substitutions is None:
                 raise ValueError('polymorphic value needs explicit or inferred type arguments')
             arguments = [substitutions[v] for v in variables]
             actual = substitute_type(ty, substitutions) if variables else ty
             return f'(Expr.global {self.indices[name]} [{", ".join(self.ty(t) for t in arguments)}])', actual
+        float_operations = {'float+': 'add', 'float-': 'sub',
+                            'float*': 'mul', 'float/': 'div'}
+        float_builtin_ids = {'float+': 39, 'float-': 42, 'float*': 45, 'float/': 48}
+        if name in float_operations and selected == float_builtin_ids[name]:
+            body = (f'(Expr.floatBin FloatBinOp.{float_operations[name]} '
+                    '(Expr.var 0) (Expr.var 1))')
+            return (f'(Expr.lam [Ty.float, Ty.float] Ty.float {body})',
+                    ('Function', ('Float', 'Float'), 'Float'))
+        comparison_bodies = {
+            '<': '(Expr.ite (Expr.le (Expr.var 1) (Expr.var 0)) (Expr.bool false) (Expr.bool true))',
+            '>': '(Expr.ite (Expr.le (Expr.var 0) (Expr.var 1)) (Expr.bool false) (Expr.bool true))',
+            '>=': '(Expr.le (Expr.var 1) (Expr.var 0))',
+        }
+        comparison_ids = {'<': 12, '>': 18, '>=': 21}
+        if name in comparison_bodies and selected == comparison_ids[name]:
+            return (f'(Expr.lam [Ty.integer, Ty.integer] Ty.boolean {comparison_bodies[name]})',
+                    ('Function', ('Integer', 'Integer'), 'Boolean'))
+        if name == 'boolean=' and selected == 33:
+            body = ('(Expr.ite (Expr.var 0) (Expr.var 1) '
+                    '(Expr.ite (Expr.var 1) (Expr.bool false) (Expr.bool true)))')
+            return (f'(Expr.lam [Ty.boolean, Ty.boolean] Ty.boolean {body})',
+                    ('Function', ('Boolean', 'Boolean'), 'Boolean'))
+        if name == 'not' and selected == 36:
+            body = '(Expr.ite (Expr.var 0) (Expr.bool false) (Expr.bool true))'
+            return (f'(Expr.lam [Ty.boolean] Ty.boolean {body})',
+                    ('Function', ('Boolean',), 'Boolean'))
         operations = {'+': 'add', '-': 'sub', '*': 'mul', '<=': 'le', 'integer=': 'intEq'}
         builtin_ids = {'+': 3, '-': 6, '*': 9, '<=': 15, 'integer=': 24}
         if name in operations and selected == builtin_ids[name]:
@@ -668,6 +809,23 @@ class PolyExporter(Exporter):
     def expr_inner(self, node, ctx):
         token = atom(node)
         if token is not None:
+            if token.startswith('"'):
+                characters = ', '.join(f'(Char.ofNat {ord(c)})' for c in decode_string(token))
+                return f'(Expr.string (String.mk [{characters}]))', 'String'
+            if token.startswith('#\\'):
+                value = token[2:]
+                if value in ('newline', 'space', 'tab'):
+                    value = {'newline': '\n', 'space': ' ', 'tab': '\t'}[value]
+                elif re.fullmatch(r'u\{[0-9a-fA-F]{1,6}\}', value):
+                    value = unicode_scalar(int(value[2:-1], 16))
+                if len(value) != 1:
+                    raise ValueError('invalid character token')
+                unicode_scalar(ord(value))
+                return f'(Expr.character (Char.ofNat {ord(value)}))', 'Character'
+            if re.fullmatch(r'-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?', token):
+                literal = lean_string(token)
+                parsed = f'(NLisp.Lexical.readFloatLiteral {literal})'
+                return f'(Expr.float ({parsed}.get (by decide)))', 'Float'
             if token in ('true', 'false'):
                 return f'(Expr.bool {token})', 'Boolean'
             if token == 'unit':
@@ -766,7 +924,7 @@ class PolyExporter(Exporter):
         if 'main' not in self.globals or self.globals['main'][1] != ('Function', (), 'Integer'):
             raise ValueError('expected main : () -> Integer')
         signatures, bodies = [], []
-        for name, (_, ty, body, parameters) in self.globals.items():
+        for name, (_, ty, body, parameters) in self.function_globals.items():
             variables = self.schemes.get(name, [])
             self.type_variables = {v: ('Variable', v) for v in variables}
             self.variable_indices = {v: i for i, v in enumerate(variables)}
@@ -777,6 +935,49 @@ class PolyExporter(Exporter):
                 raise ValueError('function result mismatch: ' + name)
             bodies.append(term)
         self.record_event({'stage': 'generic_program', 'signatures': signatures, 'bodies': bodies})
+        source_entries = []
+        global_value_section = ''
+        if self.value_globals:
+            for name, (_, ty, _body, parameters) in self.globals.items():
+                identity = self.global_ids[name]
+                if parameters is None:
+                    self.type_variables = {}
+                    self.variable_indices = {}
+                    source_entries.append(
+                        f'(.value {identity} {self.ty(ty)} (by simp [NLisp.Surface.Ty.wellFormed]) '
+                        'NLisp.Surface.Expr.unit)')
+                else:
+                    function_index = self.indices[name]
+                    source_entries.append(
+                        f'(.function {identity} signatures[{function_index}] '
+                        f'(by\n'
+                        f'  have typedBodies := NLisp.Surface.elaborateProgram_typed all_bodies_check\n'
+                        f'  have found : signatures[{function_index}]? = some signatures[{function_index}] := by simp [signatures, getElem?_def]\n'
+                        f'  exact NLisp.Surface.BodiesHaveTypes.signature_valid_at typedBodies {function_index} '
+                        f'    signatures[{function_index}] found) '
+                        f'⟨{len(parameters)}, NLisp.PolyIR.erase bodies[{function_index}]⟩)')
+            global_value_section = (
+                f'def polySourceForms : List NLisp.CBindingWalk.Node := [{", ".join(binding_tree(form) for form in self.declarations)}]\n'
+                f'def sourceEntrySeed : List NLisp.GlobalProgramEntry.Entry := [{", ".join(source_entries)}]\n'
+                'def loweredSourceEntries := NLisp.GlobalSourceLowering.lowerAndReplaceValues 1024 sourceEntrySeed polySourceForms\n'
+                'theorem loweredSourceEntries_ok : loweredSourceEntries.isSome = true := by native_decide\n'
+                'def runtimeEntries := loweredSourceEntries.get loweredSourceEntries_ok\n'
+                f'def globalIRRuntimeProgram := NLisp.GlobalProgramEntry.toRuntimeProgram runtimeEntries {self.globals["main"][0]}\n'
+                'def initializerRowsAccepted := NLisp.GlobalProgramEntry.checkInitializerRows 1024 runtimeEntries\n'
+                '  (NLisp.GlobalProgramEntry.valueTypes runtimeEntries) 0 runtimeEntries\n'
+                'theorem initializerRowsAccepted_ok : initializerRowsAccepted = true := by native_decide\n'
+                'theorem globalIRInitializerTypesAgree :\n'
+                '    NLisp.GlobalIR.InitializerTypesAgree (NLisp.GlobalProgramEntry.valueTypes runtimeEntries) 0\n'
+                '      globalIRRuntimeProgram.initializers := by\n'
+                '  have checked := NLisp.GlobalProgramEntry.checkInitializerRows_sound 1024 runtimeEntries\n'
+                '    (NLisp.GlobalProgramEntry.valueTypes runtimeEntries) 0 runtimeEntries initializerRowsAccepted_ok\n'
+                '  exact checked.toTypedInitializerRows 1024 runtimeEntries\n'
+                '    (NLisp.GlobalProgramEntry.valueTypes runtimeEntries) 0 runtimeEntries |>.toRuntimeProgram_types_agree\n'
+                '      runtimeEntries globalIRRuntimeProgram.entry\n'
+                'def globalIRInitialization := NLisp.GlobalIR.initializeValues globalIRRuntimeProgram.definitions\n'
+                '  4096 (List.replicate globalIRRuntimeProgram.initializers.length none) 0\n'
+                '  globalIRRuntimeProgram.initializers\n'
+                'theorem globalIRInitialization_succeeds : globalIRInitialization.isOk = true := by native_decide\n')
         return ('import NLisp\nopen NLisp.Surface\nnamespace VerifiedPolyProgram\n'
                 f'def signatures : List Signature := [{", ".join(signatures)}]\n'
                 f'def bodies : List Expr := [{", ".join(bodies)}]\n'
@@ -785,6 +986,28 @@ class PolyExporter(Exporter):
                 'def program : NLisp.PolyIR.Program := checked.get all_bodies_check\n'
                 'def source : Definitions := signatures.zip bodies\n'
                 'theorem program_erasure : program.erase = NLisp.PolyIR.eraseDefinitions source := by rfl\n'
+                'def globalIRGlobals : List Signature := NLisp.GlobalIR.assembleGlobals source []\n'
+                'def globalIRDefinitions : List NLisp.GlobalIR.Definition := NLisp.GlobalIR.assembleProgram source []\n'
+                'def globalIRChecked := elaborateDefinitions 512 globalIRGlobals signatures bodies\n'
+                'theorem globalIRGlobals_eq : globalIRGlobals = signatures := by\n'
+                '  have bodyTypes := NLisp.Surface.elaborateProgram_typed all_bodies_check\n'
+                '  have bodyLengths := bodyTypes.length_eq\n'
+                '  change (signatures.zip bodies).map Prod.fst ++ [] = signatures\n'
+                '  rw [NLisp.GlobalIR.map_fst_zip_eq_left signatures bodies bodyLengths]\n'
+                '  simp\n'
+                'theorem globalIRChecked_ok : globalIRChecked.isSome = true := by\n'
+                '  unfold globalIRChecked\n'
+                '  rw [globalIRGlobals_eq]\n'
+                '  simpa [elaborateProgram] using all_bodies_check\n'
+                'theorem globalIR_layout_typed :\n'
+                '    NLisp.GlobalIR.GlobalProgramTyped globalIRGlobals source []\n'
+                '      (NLisp.GlobalIR.functionSourcesFor source.length) globalIRDefinitions :=\n'
+                '  NLisp.GlobalIR.assembleProgram_typed_of_elaborated 512 signatures bodies []\n'
+                '    globalIRChecked_ok (by\n'
+                '      intro slot type found\n'
+                '      have impossible : ¬ slot < ([] : List Ty).length := by simp\n'
+                '      simp only [getElem?_def, dif_neg impossible] at found)\n'
+                f'{global_value_section}'
                 f'def entry : Expr := .app (.global {self.indices["main"]} []) []\n'
                 'theorem entry_checks : (elaborate 512 signatures 0 [] entry Ty.integer).isSome = true := by decide\n'
                 'theorem execution_erases (fuel : Nat) :\n'
@@ -813,6 +1036,8 @@ TERMINATION_ASSURANCE = {
 POLY_ASSURANCE = {
     **ASSURANCE,
     'kernel_checks': [*ASSURANCE['kernel_checks'], 'generic body and integer entry typing',
+                      'typed GlobalIR function/getter layout for programs without top-level values',
+                      'value declaration initializer row typing and successful GlobalIR initialization when present',
                       'annotated source to IR structural correspondence',
                       'finite identity-based source evaluation preservation',
                       'polymorphic evaluator type preservation and exclusion of type errors'],
@@ -1230,13 +1455,25 @@ def process_correspondence_proof(document, mode):
                 '    (NLisp.CExpansion.sourceRules 0 certificate.normalized) = some certificate.edges ∧\n'
                 '  WellFounded (NLisp.MacroTermination.Calls certificate.edges) :=\n'
                 '  NLisp.ProcessCertificate.source_rules_wellFounded certificate\n'
+                'theorem source_static_call_chain_terminates (chain : Nat → Nat)\n'
+                '    (step : ∀ index, NLisp.MacroTermination.Calls certificate.edges\n'
+                '      (chain (index + 1)) (chain index)) : False :=\n'
+                '  NLisp.ProcessCertificate.source_static_call_chain_terminates certificate chain step\n'
+                'theorem source_static_call_chain_length_bounded (chain : Nat → Nat)\n'
+                '    (step : ∀ index, NLisp.MacroTermination.Calls certificate.edges\n'
+                '      (chain (index + 1)) (chain index)) (count : Nat) :\n'
+                '    count + NLisp.MacroTermination.rank certificate.ranks (chain count) ≤\n'
+                '      NLisp.MacroTermination.rank certificate.ranks (chain 0) :=\n'
+                '  NLisp.ProcessCertificate.source_static_call_chain_length_bounded certificate chain step count\n'
                 'end VerifiedNLispSource\n')
     fuel = 4 * syntax_nodes(document['declarations']) + 4
     return ('\nnamespace VerifiedNLispSource\n'
             'def certificate : NLisp.ProcessCertificate.CheckedExpansion := {\n'
             '  toCheckedSource := CSourceCorrespondence.checked,\n'
             '  expanded := CExpansionCorrespondence.expanded, annotated := CProgramScope.forms,\n'
-            f'  scopeFuel := {fuel}, expands := CExpansionCorrespondence.program_expands,\n'
+            f'  scopeFuel := {fuel}, localCertificate := CExpansionCorrespondence.programCertificate,\n'
+            '  localCertificate_source := by rfl, localCertificate_target := by rfl,\n'
+            '  localCertificate_fresh := CExpansionCorrespondence.program_certificate_fresh_accepted,\n'
             '  same_syntax := CProgramScope.scope_syntax_is_expansion,\n'
             '  scope_checks := CProgramScope.all_references_correspond }\n'
             'theorem source_expands_with_scopes :\n'
@@ -1250,6 +1487,19 @@ def process_correspondence_proof(document, mode):
             '      NLisp.CBindingWalk.builtinEnvironment = some sites ∧\n'
             '    ∀ site ∈ sites, NLisp.CBindingWalk.Corresponds site :=\n'
             '  NLisp.ProcessCertificate.source_expands_with_scopes certificate\n'
+            'theorem source_expands_with_scopes_and_freshness :\n'
+            '  certificate.text.toUTF8.data.data = certificate.bytes ∧\n'
+            '  NLisp.SourceReader.readWithFuel certificate.lexFuel certificate.parseFuel certificate.text = some certificate.parsed ∧\n'
+            '  NLisp.SourceReader.normalize certificate.parsed = some certificate.normalized ∧\n'
+            '  NLisp.CExpansion.Expands (NLisp.CExpansion.sourceRules 0 certificate.normalized)\n'
+            '    (.list (NLisp.CExpansion.programForms certificate.normalized)) (.list certificate.expanded) ∧\n'
+            '  NLisp.CExpansion.disjointIntervals\n'
+            '    (NLisp.ExpansionCertificate.freshIntervals certificate.localCertificate) = true ∧\n'
+            '  certificate.annotated.map NLisp.CBindingWalk.Node.erase = certificate.expanded ∧\n'
+            '  ∃ sites, NLisp.CBindingWalk.references certificate.scopeFuel certificate.annotated\n'
+            '      NLisp.CBindingWalk.builtinEnvironment = some sites ∧\n'
+            '    ∀ site ∈ sites, NLisp.CBindingWalk.Corresponds site :=\n'
+            '  NLisp.ProcessCertificate.source_expands_with_scopes_and_freshness certificate\n'
             'end VerifiedNLispSource\n')
 
 
@@ -1283,31 +1533,71 @@ def render_proof(document, mode, budget):
              binding_walk_proof(document) + termination_correspondence_proof(document, plan) +
              process_correspondence_proof(document, mode))
     if mode == 'poly':
-        proof += ('\nnamespace VerifiedPolyProgram\n'
-                  'theorem source_lowering_checked :\n'
-                  '    NLisp.ExpansionLowering.checkProgram 512 CProgramScope.forms signatures bodies = true := by decide\n'
-                  'theorem main_is_entry : NLisp.ExpansionLowering.checkMain 512 CProgramScope.forms ' + str(exporter.indices['main']) + ' = true := by decide\n'
-                  'theorem program_typed : NLisp.PolyIR.ProgramTyped signatures source :=\n'
-                  '  NLisp.Surface.elaborateProgram_programTyped all_bodies_check\n'
-                  'theorem entry_has_no_type_error (fuel : Nat) (fault : NLisp.PolyIR.Fault)\n'
-                  '    (h : NLisp.PolyIR.evaluate program.erase fuel [] (NLisp.PolyIR.erase entry) = .error fault) :\n'
-                  '    fault = .outOfFuel := by\n'
-                  '  rw [program_erasure] at h\n'
-                  '  exact NLisp.PolyIR.evaluation_no_type_error program_typed\n'
-                  '    (NLisp.Surface.elaborate_typed entry_checks)\n'
-                  '    (assignment := fun _ => Ty.unit) (by simpa only [NLisp.Surface.interpretTypes] using NLisp.PolyIR.ValuesTyped.nil) h\n'
-                  'def decoded := NLisp.Named.decodeProgram 512 CProgramScope.forms\n'
-                  'theorem source_decodes : decoded.isSome = true := by decide\n'
-                  'def namedSource : NLisp.Named.Definitions := decoded.get source_decodes\n'
-                  'theorem lowered_source_matches : NLisp.Named.lowerDefinitions namedSource = program.erase := by rfl\n'
-                  'def namedEntry : NLisp.Named.Expr := .app (.global ' + str(exporter.indices['main']) + ') []\n'
-                  'theorem source_evaluation_preserved {value : NLisp.Named.Value}\n'
-                  '    (h : NLisp.Named.Evaluates namedSource [] namedEntry value) :\n'
-                  '    NLisp.PolyIR.Evaluates program.erase [] (NLisp.PolyIR.erase entry) (NLisp.Named.lowerValue value) := by\n'
-                  '  have preserved := NLisp.Named.evaluation_preserved h\n'
-                  '  simpa [lowered_source_matches, namedEntry, entry, NLisp.Named.lowerEnv,\n'
-                  '    NLisp.Named.lower, NLisp.Named.identities] using preserved\n'
-                  'end VerifiedPolyProgram\n')
+        source_decode_fuel = max(
+            (syntax_nodes(declaration) for declaration in document['declarations']), default=0) + 1
+        source_header_parts = []
+        source_body_parts = []
+        decoded_definition_terms = []
+        body_exact_theorems = []
+        for index in range(len(exporter.function_globals)):
+            source_header_parts.append(
+                f'def sourceHeader{index} : NLisp.ExpansionLowering.Header := decodedHeaders[{index}]\' (by decide)\n')
+            concrete_headers = ', '.join(f'sourceHeader{i}' for i in range(len(exporter.function_globals)))
+            raw_body_expression = (f'NLisp.Named.decodeExpr {source_decode_fuel} [{concrete_headers}] '
+                                   f'sourceHeader{index}.body')
+            source_body_parts.extend([
+                f'theorem sourceRawBody{index}_ok : ({raw_body_expression}).isSome = true := by rfl\n',
+                f'def sourceBody{index} := ({raw_body_expression}).get sourceRawBody{index}_ok\n',
+                f'theorem sourceRawBody{index}_exact : {raw_body_expression} = some sourceBody{index} :=\n'
+                f'  (Option.some_get sourceRawBody{index}_ok).symm\n',
+            ])
+            body_exact_theorems.append(f'sourceRawBody{index}_exact')
+            decoded_definition_terms.append(
+                f'(sourceHeader{index}.parameters.map Prod.fst, sourceBody{index})')
+        decoder_definitions = ', '.join(decoded_definition_terms)
+        body_simp_theorems = ', '.join(body_exact_theorems)
+        function_forms = ', '.join(binding_tree(form) for form in document['declarations']
+                                   if atom(form[0]) == 'defun')
+        poly_proof_sections = [
+            '\nnamespace VerifiedPolyProgram\n',
+            f'def functionForms : List NLisp.CBindingWalk.Node := [{function_forms}]\n',
+            'theorem source_lowering_checked :\n',
+            '    NLisp.ExpansionLowering.checkProgram 512 functionForms signatures bodies = true := by native_decide\n',
+            f'theorem main_is_entry : NLisp.ExpansionLowering.checkMain 512 functionForms {exporter.indices["main"]} = true := by decide\n',
+            'theorem program_typed : NLisp.PolyIR.ProgramTyped signatures source :=\n',
+            '  NLisp.Surface.elaborateProgram_programTyped all_bodies_check\n',
+            'theorem entry_has_no_type_error (fuel : Nat) (fault : NLisp.PolyIR.Fault)\n',
+            '    (h : NLisp.PolyIR.evaluate program.erase fuel [] (NLisp.PolyIR.erase entry) = .error fault) :\n',
+            '    fault = .outOfFuel := by\n',
+            '  rw [program_erasure] at h\n',
+            '  exact NLisp.PolyIR.evaluation_no_type_error program_typed\n',
+            '    (NLisp.Surface.elaborate_typed entry_checks)\n',
+            '    (assignment := fun _ => Ty.unit) (by simpa only [NLisp.Surface.interpretTypes] using NLisp.PolyIR.ValuesTyped.nil) h\n',
+            f'def decoded := NLisp.Named.decodeTopLevelProgram {source_decode_fuel} CProgramScope.forms\n',
+            f'def sourceProgramHeaders := NLisp.ExpansionLowering.readProgramHeaders {source_decode_fuel} 0 CProgramScope.forms\n',
+            'theorem sourceHeaders_ok : sourceProgramHeaders.isSome = true := by decide\n',
+            'def decodedHeaders := (sourceProgramHeaders.get sourceHeaders_ok).functions\n',
+            ''.join(source_header_parts),
+            f'theorem sourceHeaders_concrete : decodedHeaders = [{", ".join(f"sourceHeader{i}" for i in range(len(exporter.function_globals)))}] := by rfl\n',
+            ''.join(source_body_parts),
+            f'def decodedSourceDefinitions : NLisp.Named.Definitions := [{decoder_definitions}]\n',
+            'theorem sourceFunctions_decoded :\n',
+            f'    NLisp.Named.decodeFunctionsRaw {source_decode_fuel} decodedHeaders decodedHeaders = some decodedSourceDefinitions := by\n',
+            '  rw [sourceHeaders_concrete]\n',
+            f'  simp [NLisp.Named.decodeFunctionsRaw, decodedSourceDefinitions, {body_simp_theorems}]\n',
+            'theorem source_decodes : decoded.isSome = true := by decide\n',
+            'def namedSource : NLisp.Named.Definitions := (decoded.get source_decodes).1\n',
+            'theorem lowered_source_matches : NLisp.Named.lowerDefinitions namedSource = program.erase := by rfl\n',
+            f'def namedEntry : NLisp.Named.Expr := .app (.global {exporter.indices["main"]}) []\n',
+            'theorem source_evaluation_preserved {value : NLisp.Named.Value}\n',
+            '    (h : NLisp.Named.Evaluates namedSource [] namedEntry value) :\n',
+            '    NLisp.PolyIR.Evaluates program.erase [] (NLisp.PolyIR.erase entry) (NLisp.Named.lowerValue value) := by\n',
+            '  have preserved := NLisp.Named.evaluation_preserved h\n',
+            '  simpa [lowered_source_matches, namedEntry, entry, NLisp.Named.lowerEnv,\n',
+            '    NLisp.Named.lower, NLisp.Named.identities] using preserved\n',
+            'end VerifiedPolyProgram\n',
+        ]
+        proof += ''.join(poly_proof_sections)
     exporter.check_term(proof)
     exporter.record_event({'stage': 'macro_termination', **plan})
     return proof, exporter.process

@@ -79,7 +79,19 @@ def readPrimitive : Nat → Option Expr
   | 6 => some (.lam [0, 1] (.sub (.var 0) (.var 1)))
   | 9 => some (.lam [0, 1] (.mul (.var 0) (.var 1)))
   | 15 => some (.lam [0, 1] (.le (.var 0) (.var 1)))
+  | 12 => some (.lam [0, 1]
+      (.ite (.le (.var 1) (.var 0)) (.bool false) (.bool true)))
+  | 18 => some (.lam [0, 1]
+      (.ite (.le (.var 0) (.var 1)) (.bool false) (.bool true)))
+  | 21 => some (.lam [0, 1] (.le (.var 1) (.var 0)))
   | 24 => some (.lam [0, 1] (.intEq (.var 0) (.var 1)))
+  | 33 => some (.lam [0, 1]
+      (.ite (.var 0) (.var 1) (.ite (.var 1) (.bool false) (.bool true))))
+  | 36 => some (.lam [0] (.ite (.var 0) (.bool false) (.bool true)))
+  | 39 => some (.lam [0, 1] (.floatBin .add (.var 0) (.var 1)))
+  | 42 => some (.lam [0, 1] (.floatBin .sub (.var 0) (.var 1)))
+  | 45 => some (.lam [0, 1] (.floatBin .mul (.var 0) (.var 1)))
+  | 48 => some (.lam [0, 1] (.floatBin .div (.var 0) (.var 1)))
   | _ => none
 
 mutual
@@ -99,6 +111,12 @@ def decodeExpr : Nat → List Header → Node → Option Expr
       if a.name = "true" then if selected = 0 then some (.bool true) else none
       else if a.name = "false" then if selected = 0 then some (.bool false) else none
       else if a.name = "unit" then if selected = 0 then some .unit else none
+      else if a.name.startsWith "\"" then
+        if selected = 0 then (Lexical.readStringLiteral a.name).map Expr.string else none
+      else if a.name.startsWith "#\\" then
+        if selected = 0 then (Lexical.readCharacterLiteral a.name).map Expr.character else none
+      else if Lexical.floatLiteral a.name.toList then
+        if selected = 0 then (Lexical.readFloatLiteral a.name).map Expr.float else none
       else if Lexical.integerLiteral a.name.toList then
         if selected = 0 then a.name.toInt?.map Expr.int else none
       else if Lexical.identifier a.name then
@@ -226,46 +244,300 @@ theorem decodeLetMany_lengths {fuel : Nat} {headers : List Header}
                   have initializersLength := decodeExprs_length expressions
                   omega
 
-macro "let_layouts_aligned_using " recursor:term : term => `(
-  $recursor
-    (motive_1 := fun _ => Bool)
-    (motive_2 := fun _ => Bool)
-    (fun _ _ => true)
-    (fun _ _ => true)
-    (fun _ _ => true)
-    (fun _ _ => true)
-    (fun _ => true)
-    (fun _ _ body _ => body)
-    (fun _ _ function arguments _ => function && arguments)
-    (fun _ _ _ condition yes no _ => condition && yes && no)
-    (fun _ _ left right _ => left && right)
-    (fun _ _ left right _ => left && right)
-    (fun _ _ left right _ => left && right)
-    (fun _ _ left right _ => left && right)
-    (fun _ _ left right _ => left && right)
-    (fun ids _ _ values body _ => decide (ids.length = values.length) && values && body)
-    (fun _ _ first rest _ => first && rest)
-    (fun _ => true)
-    (fun _ _ head tail _ => head && tail)
-    (fun _ => true)
-    (fun _ value _ => value)
-    (fun _ _ _ _ target empty full _ => target && empty && full)
-    (fun _ _ _ _ target empty full _ => target && empty && full)
-    (fun _ => true)
-    (fun _ _ head tail _ => head && tail))
+mutual
+def letLayoutsAligned : Expr → Bool
+  | .var _ | .global _ | .bool _ | .int _ | .float _ | .string _ | .character _ | .unit | .nil | .none => true
+  | .lam _ body | .some body => letLayoutsAligned body
+  | .app function arguments => letLayoutsAligned function && letLayoutsAlignedList arguments
+  | .ite condition yes no =>
+      letLayoutsAligned condition && letLayoutsAligned yes && letLayoutsAligned no
+  | .add left right | .sub left right | .mul left right | .le left right
+  | .intEq left right | .floatBin _ left right | .cons left right =>
+      letLayoutsAligned left && letLayoutsAligned right
+  | .letMany ids initializers body =>
+      decide (ids.length = initializers.length) &&
+        letLayoutsAlignedList initializers && letLayoutsAligned body
+  | .begin first rest => letLayoutsAligned first && letLayoutsAlignedList rest
+  | .matchList target empty _ _ full =>
+      letLayoutsAligned target && letLayoutsAligned empty && letLayoutsAligned full
+  | .matchOption target empty _ full =>
+      letLayoutsAligned target && letLayoutsAligned empty && letLayoutsAligned full
 
-def letLayoutsAligned (expression : Expr) : Bool :=
-  (let_layouts_aligned_using Expr.rec) expression
+def letLayoutsAlignedList : List Expr → Bool
+  | [] => true
+  | head :: tail => letLayoutsAligned head && letLayoutsAlignedList tail
+end
+
+/-- Immediate source-expression children, excluding binder identifiers and
+type annotations. This is the structural frontier traversed by evaluation. -/
+def expressionChildren : Expr → List Expr
+  | .var _ | .global _ | .bool _ | .int _ | .float _ | .string _ | .character _ | .unit | .nil | .none => []
+  | .lam _ body | .some body => [body]
+  | .app function arguments => function :: arguments
+  | .ite condition yes no => [condition, yes, no]
+  | .add left right | .sub left right | .mul left right | .le left right
+  | .intEq left right | .floatBin _ left right | .cons left right => [left, right]
+  | .letMany _ initializers body => body :: initializers
+  | .begin first rest => first :: rest
+  | .matchList target empty _ _ full | .matchOption target empty _ full =>
+      [target, empty, full]
+
+/-- Any expression selected from an aligned expression list is itself
+well-scoped with respect to parallel-let binder/value arities. This is the
+list-elimination fact needed by the mutual evaluation-reflection proof for
+applications, initializers, and begin sequences. -/
+theorem letLayoutsAlignedList_mem (expressions : List Expr)
+    (aligned : letLayoutsAlignedList expressions = true) {expression : Expr}
+    (member : expression ∈ expressions) :
+    letLayoutsAligned expression = true := by
+  induction expressions with
+  | nil => simp at member
+  | cons head tail ih =>
+      simp only [letLayoutsAlignedList, Bool.and_eq_true] at aligned
+      rcases List.mem_cons.mp member with same | rest
+      · simpa [same] using aligned.1
+      · exact ih aligned.2 rest
+
+theorem letLayoutsAligned_app_parts (function : Expr) (arguments : List Expr)
+    (aligned : letLayoutsAligned (.app function arguments) = true) :
+    letLayoutsAligned function = true ∧ letLayoutsAlignedList arguments = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_lam_body (parameters : List Nat)
+    (body : Expr) (aligned : letLayoutsAligned (.lam parameters body) = true) :
+    letLayoutsAligned body = true := by
+  simpa [letLayoutsAligned] using aligned
+
+theorem letLayoutsAligned_ite_parts (condition yes no : Expr)
+    (aligned : letLayoutsAligned (.ite condition yes no) = true) :
+    letLayoutsAligned condition = true ∧ letLayoutsAligned yes = true ∧
+      letLayoutsAligned no = true := by
+  have parts := aligned
+  simp only [letLayoutsAligned, Bool.and_eq_true] at parts
+  exact ⟨parts.1.1, parts.1.2, parts.2⟩
+
+theorem letLayoutsAligned_letMany_parts (ids : List Nat) (initializers : List Expr)
+    (body : Expr) (aligned : letLayoutsAligned (.letMany ids initializers body) = true) :
+    ids.length = initializers.length ∧ letLayoutsAlignedList initializers = true ∧
+      letLayoutsAligned body = true := by
+  have parts := aligned
+  simp only [letLayoutsAligned, Bool.and_eq_true, decide_eq_true_eq] at parts
+  exact ⟨parts.1.1, parts.1.2, parts.2⟩
+
+theorem letLayoutsAligned_begin_parts (first : Expr) (rest : List Expr)
+    (aligned : letLayoutsAligned (.begin first rest) = true) :
+    letLayoutsAligned first = true ∧ letLayoutsAlignedList rest = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_add_parts (left right : Expr)
+    (aligned : letLayoutsAligned (.add left right) = true) :
+    letLayoutsAligned left = true ∧ letLayoutsAligned right = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_sub_parts (left right : Expr)
+    (aligned : letLayoutsAligned (.sub left right) = true) :
+    letLayoutsAligned left = true ∧ letLayoutsAligned right = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_mul_parts (left right : Expr)
+    (aligned : letLayoutsAligned (.mul left right) = true) :
+    letLayoutsAligned left = true ∧ letLayoutsAligned right = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_le_parts (left right : Expr)
+    (aligned : letLayoutsAligned (.le left right) = true) :
+    letLayoutsAligned left = true ∧ letLayoutsAligned right = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_intEq_parts (left right : Expr)
+    (aligned : letLayoutsAligned (.intEq left right) = true) :
+    letLayoutsAligned left = true ∧ letLayoutsAligned right = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_floatBin_parts (op : Surface.FloatBinOp) (left right : Expr)
+    (aligned : letLayoutsAligned (.floatBin op left right) = true) :
+    letLayoutsAligned left = true ∧ letLayoutsAligned right = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_cons_parts (head tail : Expr)
+    (aligned : letLayoutsAligned (.cons head tail) = true) :
+    letLayoutsAligned head = true ∧ letLayoutsAligned tail = true := by
+  simpa [letLayoutsAligned, Bool.and_eq_true] using aligned
+
+theorem letLayoutsAligned_some_body (value : Expr)
+    (aligned : letLayoutsAligned (.some value) = true) :
+    letLayoutsAligned value = true := by
+  simpa [letLayoutsAligned] using aligned
+
+theorem letLayoutsAligned_matchList_parts (target empty full : Expr)
+    (head tail : Nat) (aligned : letLayoutsAligned (.matchList target empty head tail full) = true) :
+    letLayoutsAligned target = true ∧ letLayoutsAligned empty = true ∧
+      letLayoutsAligned full = true := by
+  have parts := aligned
+  simp only [letLayoutsAligned, Bool.and_eq_true] at parts
+  exact ⟨parts.1.1, parts.1.2, parts.2⟩
+
+theorem letLayoutsAligned_matchOption_parts (target empty full : Expr)
+    (binder : Nat) (aligned : letLayoutsAligned (.matchOption target empty binder full) = true) :
+    letLayoutsAligned target = true ∧ letLayoutsAligned empty = true ∧
+      letLayoutsAligned full = true := by
+  have parts := aligned
+  simp only [letLayoutsAligned, Bool.and_eq_true] at parts
+  exact ⟨parts.1.1, parts.1.2, parts.2⟩
+
+/-- The let-layout invariant is hereditary over every immediate expression
+child, including initializers and bodies beneath binders. -/
+theorem letLayoutsAligned_children (expression : Expr)
+    (aligned : letLayoutsAligned expression = true) :
+    ∀ child ∈ expressionChildren expression, letLayoutsAligned child = true := by
+  cases expression with
+  | var _ | global _ | bool _ | int _ | float _ | string _ | character _ | unit | nil | none => simp [expressionChildren]
+  | lam parameters body =>
+      intro child member
+      simp [expressionChildren] at member
+      subst child
+      exact letLayoutsAligned_lam_body parameters body aligned
+  | app function arguments =>
+      obtain ⟨functionAligned, argumentsAligned⟩ :=
+        letLayoutsAligned_app_parts function arguments aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | inArguments
+      · subst child
+        exact functionAligned
+      · exact letLayoutsAlignedList_mem arguments argumentsAligned inArguments
+  | ite condition yes no =>
+      obtain ⟨conditionAligned, yesAligned, noAligned⟩ :=
+        letLayoutsAligned_ite_parts condition yes no aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | same | rest
+      · subst child; exact conditionAligned
+      · subst child; exact yesAligned
+      · rcases rest with same | impossible
+        · subst child; exact noAligned
+        · simp at impossible
+  | add left right =>
+      obtain ⟨leftAligned, rightAligned⟩ := letLayoutsAligned_add_parts left right aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact leftAligned
+      · simp at member
+        subst child
+        exact rightAligned
+  | sub left right =>
+      obtain ⟨leftAligned, rightAligned⟩ := letLayoutsAligned_sub_parts left right aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact leftAligned
+      · simp at member
+        subst child
+        exact rightAligned
+  | mul left right =>
+      obtain ⟨leftAligned, rightAligned⟩ := letLayoutsAligned_mul_parts left right aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact leftAligned
+      · simp at member
+        subst child
+        exact rightAligned
+  | le left right =>
+      obtain ⟨leftAligned, rightAligned⟩ := letLayoutsAligned_le_parts left right aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact leftAligned
+      · simp at member
+        subst child
+        exact rightAligned
+  | intEq left right =>
+      obtain ⟨leftAligned, rightAligned⟩ := letLayoutsAligned_intEq_parts left right aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact leftAligned
+      · simp at member
+        subst child
+        exact rightAligned
+  | floatBin op left right =>
+      obtain ⟨leftAligned, rightAligned⟩ := letLayoutsAligned_floatBin_parts op left right aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact leftAligned
+      · simp at member
+        subst child
+        exact rightAligned
+  | letMany ids initializers body =>
+      obtain ⟨_, initializersAligned, bodyAligned⟩ :=
+        letLayoutsAligned_letMany_parts ids initializers body aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact bodyAligned
+      · exact letLayoutsAlignedList_mem initializers initializersAligned member
+  | begin first rest =>
+      obtain ⟨firstAligned, restAligned⟩ := letLayoutsAligned_begin_parts first rest aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact firstAligned
+      · exact letLayoutsAlignedList_mem rest restAligned member
+  | cons head tail =>
+      obtain ⟨headAligned, tailAligned⟩ := letLayoutsAligned_cons_parts head tail aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | member
+      · subst child; exact headAligned
+      · simp at member
+        subst child
+        exact tailAligned
+  | some value =>
+      intro child member
+      simp [expressionChildren] at member
+      subst child
+      exact letLayoutsAligned_some_body value aligned
+  | matchList target empty head tail full =>
+      obtain ⟨targetAligned, emptyAligned, fullAligned⟩ :=
+        letLayoutsAligned_matchList_parts target empty full head tail aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | same | rest
+      · subst child; exact targetAligned
+      · subst child; exact emptyAligned
+      · rcases rest with same | impossible
+        · subst child; exact fullAligned
+        · simp at impossible
+  | matchOption target empty binder full =>
+      obtain ⟨targetAligned, emptyAligned, fullAligned⟩ :=
+        letLayoutsAligned_matchOption_parts target empty full binder aligned
+      intro child member
+      simp only [expressionChildren, List.mem_cons] at member
+      rcases member with same | same | rest
+      · subst child; exact targetAligned
+      · subst child; exact emptyAligned
+      · rcases rest with same | impossible
+        · subst child; exact fullAligned
+        · simp at impossible
 
 theorem letLayoutsAligned_letMany_lengths (ids : List Nat) (initializers : List Expr)
     (body : Expr)
     (aligned : letLayoutsAligned (.letMany ids initializers body) = true) :
     ids.length = initializers.length := by
+  simp only [letLayoutsAligned] at aligned
   change (decide (ids.length = initializers.length) &&
-    (let_layouts_aligned_using Expr.rec_1) initializers &&
-    (let_layouts_aligned_using Expr.rec) body) = true at aligned
-  have components := Bool.and_eq_true.mp aligned
-  have arity := Bool.and_eq_true.mp components.1
+    letLayoutsAlignedList initializers && letLayoutsAligned body) = true at aligned
+  have components :
+      (decide (ids.length = initializers.length) &&
+        letLayoutsAlignedList initializers) = true ∧
+      letLayoutsAligned body = true := by
+    simpa only [Bool.and_eq_true] using aligned
+  have arity : decide (ids.length = initializers.length) = true ∧
+      letLayoutsAlignedList initializers = true := by
+    simpa only [Bool.and_eq_true] using components.1
   exact of_decide_eq_true arity.1
 
 def decodeExprChecked (fuel : Nat) (headers : List Header) (node : Node) : Option Expr := do
@@ -282,9 +554,84 @@ theorem decodeExprChecked_spec {fuel : Nat} {headers : List Header} {node : Node
       cases aligned : letLayoutsAligned result with
       | false => simp [raw, aligned] at decoded
       | true =>
-          simp [raw, aligned] at decoded
+          have resultEq : result = expression := by
+            apply Option.some.inj
+            simpa [decodeExprChecked, raw, aligned] using decoded
+          rw [← resultEq]
+          exact ⟨rfl, aligned⟩
+
+/- Global value initializers use the same recursive let-layout validation as
+function bodies. The unchecked decoder remains available for intermediate
+subexpressions, while this list decoder is the top-level acceptance boundary. -/
+def decodeExprsChecked : Nat → List Header → List Node → Option (List Expr)
+  | 0, _, _ => none
+  | fuel + 1, headers, [] => some []
+  | fuel + 1, headers, node :: tail => do
+      let expression ← decodeExprChecked fuel headers node
+      let rest ← decodeExprsChecked fuel headers tail
+      pure (expression :: rest)
+
+theorem decodeExprsChecked_length {fuel : Nat} {headers : List Header}
+    {nodes : List Node} {expressions : List Expr}
+    (decoded : decodeExprsChecked fuel headers nodes = some expressions) :
+    expressions.length = nodes.length := by
+  induction nodes generalizing fuel expressions with
+  | nil =>
+      cases fuel with
+      | zero => simp [decodeExprsChecked] at decoded
+      | succ fuel =>
+          simp [decodeExprsChecked] at decoded
           cases decoded
-          exact ⟨raw, aligned⟩
+          rfl
+  | cons node tail ih =>
+      cases fuel with
+      | zero => simp [decodeExprsChecked] at decoded
+      | succ fuel =>
+          cases headResult : decodeExprChecked fuel headers node with
+          | none => simp [decodeExprsChecked, headResult] at decoded
+          | some head =>
+              cases tailResult : decodeExprsChecked fuel headers tail with
+              | none => simp [decodeExprsChecked, headResult, tailResult] at decoded
+              | some rest =>
+                  have resultEq : head :: rest = expressions := by
+                    simpa [decodeExprsChecked, headResult, tailResult] using decoded
+                  cases resultEq
+                  simp only [List.length_cons]
+                  have tailLength := ih (fuel := fuel) (expressions := rest) tailResult
+                  simp [tailLength]
+
+theorem decodeExprsChecked_aligned {fuel : Nat} {headers : List Header}
+    {nodes : List Node} {expressions : List Expr}
+    (decoded : decodeExprsChecked fuel headers nodes = some expressions) :
+    ∀ expression ∈ expressions, letLayoutsAligned expression = true := by
+  induction nodes generalizing fuel expressions with
+  | nil =>
+      cases fuel with
+      | zero => simp [decodeExprsChecked] at decoded
+      | succ fuel =>
+          simp [decodeExprsChecked] at decoded
+          cases decoded
+          intro expression member
+          simp at member
+  | cons node tail ih =>
+      cases fuel with
+      | zero => simp [decodeExprsChecked] at decoded
+      | succ fuel =>
+          cases headResult : decodeExprChecked fuel headers node with
+          | none => simp [decodeExprsChecked, headResult] at decoded
+          | some head =>
+              cases tailResult : decodeExprsChecked fuel headers tail with
+              | none => simp [decodeExprsChecked, headResult, tailResult] at decoded
+              | some rest =>
+                  have resultEq : head :: rest = expressions := by
+                    simpa [decodeExprsChecked, headResult, tailResult] using decoded
+                  cases resultEq
+                  intro expression member
+                  simp only [List.mem_cons] at member
+                  rcases member with same | member
+                  · cases same
+                    exact (decodeExprChecked_spec headResult).2
+                  · exact ih tailResult expression member
 
 theorem decodeExprChecked_letMany_lengths {fuel : Nat} {headers : List Header}
     {node : Node} {ids : List Nat} {initializers : List Expr} {body : Expr}
@@ -318,11 +665,214 @@ theorem decodeExprChecked_letMany_evaluation_reflected
     ∃ sourceValue, Evaluates program env (.letMany ids initializers body) sourceValue ∧
       lowerValue sourceValue = value := by
   exact letMany_evaluation_reflected program env ids initializers body
-    (decodeExprChecked_letMany_lengths decoded) argumentsReflected bodyReflected
+    (decodeExprChecked_letMany_lengths decoded).symm argumentsReflected bodyReflected
     value evaluated
 
 def definitionsLetLayoutsAligned (definitions : Definitions) : Bool :=
   definitions.all (fun definition => letLayoutsAligned definition.2)
+
+/- This stronger invariant rules out the missing-variable alias introduced by
+`position`'s total fallback. `locals` are lexical binder identities, with the
+first identity corresponding to de Bruijn index zero. -/
+mutual
+inductive IdentityScoped : List Nat → Expr → Prop where
+  | var : ∀ {locals}, identity ∈ locals → IdentityScoped locals (.var identity)
+  | global : ∀ {locals}, IdentityScoped locals (.global index)
+  | bool : ∀ {locals}, IdentityScoped locals (.bool value)
+  | int : ∀ {locals}, IdentityScoped locals (.int value)
+  | float : ∀ {locals}, IdentityScoped locals (.float value)
+  | string : ∀ {locals}, IdentityScoped locals (.string value)
+  | character : ∀ {locals}, IdentityScoped locals (.character value)
+  | unit : ∀ {locals}, IdentityScoped locals .unit
+  | lam : ∀ {locals}, IdentityScoped (parameters ++ locals) body →
+      IdentityScoped locals (.lam parameters body)
+  | app : ∀ {locals}, IdentityScoped locals function → IdentityScopedList locals arguments →
+      IdentityScoped locals (.app function arguments)
+  | ite : ∀ {locals}, IdentityScoped locals condition → IdentityScoped locals yes →
+      IdentityScoped locals no → IdentityScoped locals (.ite condition yes no)
+  | add : ∀ {locals}, IdentityScoped locals left → IdentityScoped locals right →
+      IdentityScoped locals (.add left right)
+  | sub : ∀ {locals}, IdentityScoped locals left → IdentityScoped locals right →
+      IdentityScoped locals (.sub left right)
+  | mul : ∀ {locals}, IdentityScoped locals left → IdentityScoped locals right →
+      IdentityScoped locals (.mul left right)
+  | le : ∀ {locals}, IdentityScoped locals left → IdentityScoped locals right →
+      IdentityScoped locals (.le left right)
+  | intEq : ∀ {locals}, IdentityScoped locals left → IdentityScoped locals right →
+      IdentityScoped locals (.intEq left right)
+  | floatBin : ∀ {locals}, IdentityScoped locals left → IdentityScoped locals right →
+      IdentityScoped locals (.floatBin operation left right)
+  | letMany : ∀ {locals}, IdentityScopedList locals initializers →
+      IdentityScoped (parameters ++ locals) body →
+      IdentityScoped locals (.letMany parameters initializers body)
+  | begin : ∀ {locals}, IdentityScoped locals first → IdentityScopedList locals rest →
+      IdentityScoped locals (.begin first rest)
+  | nil : ∀ {locals}, IdentityScoped locals .nil
+  | cons : ∀ {locals}, IdentityScoped locals head → IdentityScoped locals tail →
+      IdentityScoped locals (.cons head tail)
+  | none : ∀ {locals}, IdentityScoped locals .none
+  | some : ∀ {locals}, IdentityScoped locals value → IdentityScoped locals (.some value)
+  | matchList : ∀ {locals}, IdentityScoped locals target → IdentityScoped locals empty →
+      IdentityScoped (headIdentity :: tailIdentity :: locals) full →
+      IdentityScoped locals (.matchList target empty headIdentity tailIdentity full)
+  | matchOption : ∀ {locals}, IdentityScoped locals target → IdentityScoped locals empty →
+      IdentityScoped (identity :: locals) full →
+      IdentityScoped locals (.matchOption target empty identity full)
+
+inductive IdentityScopedList : List Nat → List Expr → Prop where
+  | nil : ∀ {locals}, IdentityScopedList locals []
+  | cons : ∀ {locals}, IdentityScoped locals head → IdentityScopedList locals tail →
+      IdentityScopedList locals (head :: tail)
+end
+
+theorem acceptedSite_variable_identityScoped (site : CBindingWalk.Site)
+    (accepted : CBindingWalk.accepts site = true) :
+    IdentityScoped (site.caller.map (fun entry => entry.identity))
+      (.var site.selected) := by
+  obtain ⟨binding, member, identityEq⟩ :=
+    CBindingWalk.accepts_selected_identity_in_caller site accepted
+  apply IdentityScoped.var
+  rw [← identityEq]
+  exact List.mem_map.mpr ⟨binding, member, rfl⟩
+
+theorem acceptedCheck_reference_sites_identityScoped (fuel : Nat)
+    (forms : List Node) (builtins : CBindingWalk.Environment)
+    (accepted : CBindingWalk.check fuel forms builtins = true) :
+    ∃ sites, CBindingWalk.references fuel forms builtins = some sites ∧
+      ∀ site ∈ sites,
+        IdentityScoped (site.caller.map (fun entry => entry.identity))
+          (.var site.selected) := by
+  obtain ⟨sites, decoded, siteFacts⟩ :=
+    CBindingWalk.check_selected_identities_in_caller fuel forms builtins accepted
+  refine ⟨sites, decoded, ?_⟩
+  intro site member
+  apply IdentityScoped.var
+  exact siteFacts site member |>.2
+
+/- Runtime closure scope is indexed by the captured identities, so an identity
+used under the closure's parameter prefix must resolve in that prefix or in
+the environment that was actually captured. -/
+mutual
+inductive ValueIdentityScoped : Value → Prop where
+  | bool : ValueIdentityScoped (.bool value)
+  | int : ValueIdentityScoped (.int value)
+  | float : ValueIdentityScoped (.float value)
+  | string : ValueIdentityScoped (.string value)
+  | character : ValueIdentityScoped (.character value)
+  | unit : ValueIdentityScoped .unit
+  | closure : IdentityScoped (parameters ++ identities captured) body →
+      EnvironmentIdentityScoped captured →
+      ValueIdentityScoped (.closure parameters body captured)
+  | global : ValueIdentityScoped (.global index)
+  | nil : ValueIdentityScoped .nil
+  | cons : ValueIdentityScoped head → ValueIdentityScoped tail →
+      ValueIdentityScoped (.cons head tail)
+  | none : ValueIdentityScoped .none
+  | some : ValueIdentityScoped value → ValueIdentityScoped (.some value)
+
+inductive EnvironmentIdentityScoped : Environment → Prop where
+  | nil : EnvironmentIdentityScoped []
+  | cons : ValueIdentityScoped value → EnvironmentIdentityScoped rest →
+      EnvironmentIdentityScoped ((identity, value) :: rest)
+end
+
+theorem environmentIdentityScoped_append (left right : Environment)
+    (leftScoped : EnvironmentIdentityScoped left)
+    (rightScoped : EnvironmentIdentityScoped right) :
+    EnvironmentIdentityScoped (left ++ right) := by
+  induction left with
+  | nil => exact rightScoped
+  | cons head tail ih =>
+      cases leftScoped with
+      | cons valueScoped tailScoped => exact .cons valueScoped (ih tailScoped)
+
+theorem environmentIdentityScoped_bind_append (ids : List Nat) (values : List Value)
+    (environment : Environment)
+    (valuesScoped : ∀ value ∈ values, ValueIdentityScoped value)
+    (environmentScoped : EnvironmentIdentityScoped environment) :
+    EnvironmentIdentityScoped (bind ids values ++ environment) := by
+  induction ids generalizing values with
+  | nil => simpa [bind] using environmentScoped
+  | cons id rest ih =>
+      cases values with
+      | nil => simpa [bind] using environmentScoped
+      | cons value tail =>
+          have valueScoped := valuesScoped value (by simp)
+          have tailScoped : ∀ item ∈ tail, ValueIdentityScoped item := by
+            intro item member
+            exact valuesScoped item (by simp [member])
+          simpa [bind] using EnvironmentIdentityScoped.cons valueScoped
+            (ih tail tailScoped)
+
+theorem lambdaValue_identityScoped (environment : Environment) (parameters : List Nat)
+    (body : Expr) (environmentScoped : EnvironmentIdentityScoped environment)
+    (bodyScoped : IdentityScoped (parameters ++ identities environment) body) :
+    ValueIdentityScoped (.closure parameters body environment) :=
+  .closure bodyScoped environmentScoped
+
+/- Runtime closures carry their source body and captured source environment.
+This recursive invariant records that every such body obeys the binder/value
+arity condition and that the condition remains true for closures nested in
+captured lists, pairs, and options. -/
+mutual
+inductive ValueWellScoped : Value → Prop where
+  | bool : ValueWellScoped (.bool value)
+  | int : ValueWellScoped (.int value)
+  | float : ValueWellScoped (.float value)
+  | string : ValueWellScoped (.string value)
+  | character : ValueWellScoped (.character value)
+  | unit : ValueWellScoped .unit
+  | closure : letLayoutsAligned body = true → EnvironmentWellScoped captured →
+      ValueWellScoped (.closure parameters body captured)
+  | global : ValueWellScoped (.global index)
+  | nil : ValueWellScoped .nil
+  | cons : ValueWellScoped head → ValueWellScoped tail →
+      ValueWellScoped (.cons head tail)
+  | none : ValueWellScoped .none
+  | some : ValueWellScoped value → ValueWellScoped (.some value)
+
+inductive EnvironmentWellScoped : Environment → Prop where
+  | nil : EnvironmentWellScoped []
+  | cons : ValueWellScoped value → EnvironmentWellScoped rest →
+      EnvironmentWellScoped ((identity, value) :: rest)
+end
+
+abbrev valueWellScoped := ValueWellScoped
+abbrev environmentWellScoped := EnvironmentWellScoped
+
+def programWellScoped (definitions : Definitions) : Prop :=
+  definitionsLetLayoutsAligned definitions = true
+
+def executionWellScoped (definitions : Definitions) (environment : Environment) : Prop :=
+  programWellScoped definitions ∧ environmentWellScoped environment
+
+theorem environmentWellScoped_append (left right : Environment)
+    (leftScoped : environmentWellScoped left)
+    (rightScoped : environmentWellScoped right) :
+    environmentWellScoped (left ++ right) := by
+  induction left with
+  | nil => exact rightScoped
+  | cons head tail ih =>
+      cases leftScoped with
+      | cons valueScoped tailScoped => exact .cons valueScoped (ih tailScoped)
+
+theorem environmentWellScoped_bind_append (ids : List Nat) (values : List Value)
+    (environment : Environment)
+    (valuesScoped : ∀ value ∈ values, valueWellScoped value)
+    (environmentScoped : environmentWellScoped environment) :
+    environmentWellScoped (bind ids values ++ environment) := by
+  induction ids generalizing values with
+  | nil => simpa [bind] using environmentScoped
+  | cons id rest ih =>
+      cases values with
+      | nil => simpa [bind] using environmentScoped
+      | cons value tail =>
+          have valueScoped : valueWellScoped value := valuesScoped value (by simp)
+          have tailScoped : ∀ item ∈ tail, valueWellScoped item := by
+            intro item member
+            exact valuesScoped item (by simp [member])
+          simpa [bind] using EnvironmentWellScoped.cons valueScoped
+            (ih tail tailScoped)
 
 def decodeFunctions (fuel : Nat) (headers : List Header) : List Header → Option Definitions
   | [] => some []
@@ -351,11 +901,11 @@ theorem globalIndex_mappedValues (identity : Nat) (values : List GlobalHeader) :
       · simp [globalIndex, globalValueIndex, GlobalHeader.decodeHeader, same]
       · simp [globalIndex, globalValueIndex, GlobalHeader.decodeHeader, same, ih]
 
-theorem globalIndex_append_of_none (identity : Nat) (prefix suffix : List Header)
-    (prefixMissing : globalIndex identity prefix = none) :
-    globalIndex identity (prefix ++ suffix) =
-      (globalIndex identity suffix).map (prefix.length + ·) := by
-  induction prefix with
+theorem globalIndex_append_of_none (identity : Nat) (left suffix : List Header)
+    (prefixMissing : globalIndex identity left = none) :
+    globalIndex identity (left ++ suffix) =
+      (globalIndex identity suffix).map (left.length + ·) := by
+  induction left with
   | nil => simp [globalIndex]
   | cons head tail ih =>
       by_cases same : head.identity = identity
@@ -363,12 +913,27 @@ theorem globalIndex_append_of_none (identity : Nat) (prefix suffix : List Header
       · have tailMissing : globalIndex identity tail = none := by
           simpa [globalIndex, same] using prefixMissing
         cases suffixResult : globalIndex identity suffix with
-        | none => simp [globalIndex, same, tailMissing, suffixResult]
+        | none =>
+            calc
+              globalIndex identity (head :: (tail ++ suffix)) =
+                  Option.map Nat.succ (globalIndex identity (tail ++ suffix)) := by
+                simp [globalIndex, same]
+              _ = Option.map Nat.succ
+                  (Option.map (fun i => tail.length + i) (globalIndex identity suffix)) := by
+                rw [ih tailMissing]
+              _ = Option.map (fun i => (head :: tail).length + i) none := by
+                simp [suffixResult]
         | some value =>
-            have offsetEq : Nat.succ (tail.length + value) = (tail.length + 1) + value := by
-              omega
-            simp [globalIndex, same, tailMissing, ih tailMissing, suffixResult,
-              List.length_cons, offsetEq]
+            calc
+              globalIndex identity (head :: (tail ++ suffix)) =
+                  Option.map Nat.succ (globalIndex identity (tail ++ suffix)) := by
+                simp [globalIndex, same]
+              _ = Option.map Nat.succ
+                  (Option.map (fun i => tail.length + i) (globalIndex identity suffix)) := by
+                rw [ih tailMissing]
+              _ = Option.map (fun i => (head :: tail).length + i) (some value) := by
+                simp [suffixResult, List.length_cons]
+                omega
 
 theorem globalIndex_value_reference (identity slot : Nat) (functions : List Header)
     (values : List GlobalHeader)
@@ -382,7 +947,7 @@ theorem globalIndex_value_reference (identity slot : Nat) (functions : List Head
 
 def decodeGlobalInitializers (fuel : Nat) (functions : List Header)
     (values : List GlobalHeader) : Option (List Expr) :=
-  decodeExprs fuel (decodeHeadersWithGlobals functions values)
+  decodeExprsChecked fuel (decodeHeadersWithGlobals functions values)
     (values.map GlobalHeader.initializer)
 
 theorem decodeGlobalInitializers_length {fuel : Nat} {functions : List Header}
@@ -390,15 +955,22 @@ theorem decodeGlobalInitializers_length {fuel : Nat} {functions : List Header}
     (decoded : decodeGlobalInitializers fuel functions values = some initializers) :
     initializers.length = values.length := by
   have expressionsDecoded :
-      decodeExprs fuel (decodeHeadersWithGlobals functions values)
+      decodeExprsChecked fuel (decodeHeadersWithGlobals functions values)
         (values.map GlobalHeader.initializer) = some initializers := by
     simpa [decodeGlobalInitializers] using decoded
-  have length := decodeExprs_length expressionsDecoded
+  have length := decodeExprsChecked_length expressionsDecoded
   simpa using length
+
+theorem decodeGlobalInitializers_aligned {fuel : Nat} {functions : List Header}
+    {values : List GlobalHeader} {initializers : List Expr}
+    (decoded : decodeGlobalInitializers fuel functions values = some initializers) :
+    ∀ expression ∈ initializers, letLayoutsAligned expression = true := by
+  apply decodeExprsChecked_aligned
+  simpa [decodeGlobalInitializers] using decoded
 
 def decodeProgramWithGlobals (fuel : Nat) (functions : List Header)
     (values : List GlobalHeader) :
-    Option (Definitions × List Ty × List Expr) := do
+    Option (Definitions × List Surface.Ty × List Expr) := do
   let headers := decodeHeadersWithGlobals functions values
   let definitions ← decodeFunctions fuel headers functions
   let initializers ← decodeGlobalInitializers fuel functions values
@@ -427,7 +999,31 @@ theorem decodeProgramWithGlobals_layout (fuel : Nat) (functions : List Header)
                 (definitions, slotTypes, initializers) := by
             simpa [functionResult, initializerResult] using decoded
           cases resultEq
-          exact ⟨rfl, decodeGlobalInitializers_length initializerResult⟩
+          simp only [List.length_map]
+          exact ⟨trivial,
+            by simpa only [List.length_map] using
+              (decodeGlobalInitializers_length initializerResult).symm⟩
+
+theorem decodeProgramWithGlobals_initializers_aligned (fuel : Nat)
+    (functions : List Header) (values : List GlobalHeader)
+    (definitions : Definitions) (slotTypes : List Surface.Ty)
+    (initializers : List Expr)
+    (decoded : decodeProgramWithGlobals fuel functions values =
+      some (definitions, slotTypes, initializers)) :
+    ∀ expression ∈ initializers, letLayoutsAligned expression = true := by
+  unfold decodeProgramWithGlobals at decoded
+  cases functionResult : decodeFunctions fuel (decodeHeadersWithGlobals functions values) functions with
+  | none => simp [functionResult] at decoded
+  | some decodedDefinitions =>
+      cases initializerResult : decodeGlobalInitializers fuel functions values with
+      | none => simp [functionResult, initializerResult] at decoded
+      | some decodedInitializers =>
+          have resultEq :
+              (decodedDefinitions, values.map GlobalHeader.type, decodedInitializers) =
+                (definitions, slotTypes, initializers) := by
+            simpa [functionResult, initializerResult] using decoded
+          cases resultEq
+          exact decodeGlobalInitializers_aligned initializerResult
 
 theorem decodeTopLevelProgram_layout (fuel : Nat) (forms : List Node)
     (definitions : Definitions) (slotTypes : List Surface.Ty) (initializers : List Expr)
@@ -445,28 +1041,95 @@ theorem decodeTopLevelProgram_layout (fuel : Nat) (forms : List Node)
       exact (decodeProgramWithGlobals_layout fuel layout.functions layout.globals
         definitions slotTypes initializers innerDecoded).2
 
+theorem decodeTopLevelProgram_initializers_aligned (fuel : Nat) (forms : List Node)
+    (definitions : Definitions) (slotTypes : List Surface.Ty)
+    (initializers : List Expr)
+    (decoded : decodeTopLevelProgram fuel forms =
+      some (definitions, slotTypes, initializers)) :
+    ∀ expression ∈ initializers, letLayoutsAligned expression = true := by
+  unfold decodeTopLevelProgram at decoded
+  cases layoutResult : readProgramHeaders fuel 0 forms with
+  | none => simp [layoutResult] at decoded
+  | some layout =>
+      have innerDecoded :
+          decodeProgramWithGlobals fuel layout.functions layout.globals =
+            some (definitions, slotTypes, initializers) := by
+        simpa [layoutResult] using decoded
+      exact decodeProgramWithGlobals_initializers_aligned fuel layout.functions
+        layout.globals definitions slotTypes initializers innerDecoded
+
 theorem decodeFunctions_letLayoutsAligned (fuel : Nat) (headers : List Header)
     (functions : List Header) (definitions : Definitions)
     (decoded : decodeFunctions fuel headers functions = some definitions) :
     definitionsLetLayoutsAligned definitions = true := by
   induction functions generalizing definitions with
-  | nil => simp [decodeFunctions, definitionsLetLayoutsAligned] at decoded ⊢
+  | nil =>
+      have definitionsEq : [] = definitions := Option.some.inj (by
+        simpa [decodeFunctions] using decoded)
+      cases definitionsEq
+      rfl
   | cons header tail ih =>
       cases bodyResult : decodeExprChecked fuel headers header.body with
-      | none => simp [decodeFunctions, bodyResult] at decoded
+      | none =>
+          simp [decodeFunctions, bodyResult] at decoded
       | some body =>
           cases restResult : decodeFunctions fuel headers tail with
-          | none => simp [decodeFunctions, bodyResult, restResult] at decoded
+          | none =>
+              simp [decodeFunctions, bodyResult, restResult] at decoded
           | some rest =>
-              have tailAligned : definitionsLetLayoutsAligned rest = true :=
-                ih restResult
+              have definitionsEq : (header.parameters.map Prod.fst, body) :: rest = definitions := by
+                simpa [decodeFunctions, bodyResult, restResult] using decoded
+              cases definitionsEq
+              have tailAligned : definitionsLetLayoutsAligned rest = true := ih rest restResult
               have bodyAligned := (decodeExprChecked_spec bodyResult).2
-              simp [decodeFunctions, bodyResult, restResult,
-                definitionsLetLayoutsAligned, bodyAligned, tailAligned]
+              change (letLayoutsAligned body && definitionsLetLayoutsAligned rest) = true
+              rw [bodyAligned, tailAligned]
+              rfl
 
 def decodeProgram (fuel : Nat) (forms : List Node) : Option Definitions := do
   let headers ← forms.mapM (readHeader fuel)
   decodeFunctions fuel headers headers
+
+/- Raw decoding preserves the exact operational syntax but leaves checked
+let-layout validation to the caller. This is useful when the caller already
+has an independent well-scoped/type-checking derivation for the same forms. -/
+def decodeFunctionsRaw (fuel : Nat) (headers : List Header) : List Header → Option Definitions
+  | [] => some []
+  | header :: tail => do
+      let body ← decodeExpr fuel headers header.body
+      let rest ← decodeFunctionsRaw fuel headers tail
+      pure ((header.parameters.map Prod.fst, body) :: rest)
+
+def decodeProgramRaw (fuel : Nat) (forms : List Node) : Option Definitions := do
+  let headers ← forms.mapM (readHeader fuel)
+  decodeFunctionsRaw fuel headers headers
+
+theorem decodeFunctions_exists_of_each (fuel : Nat) (headers functions : List Header)
+    (bodyDecodes : ∀ header ∈ functions,
+      ∃ body, decodeExprChecked fuel headers header.body = some body) :
+    ∃ definitions, decodeFunctions fuel headers functions = some definitions := by
+  induction functions with
+  | nil => exact ⟨[], by simp [decodeFunctions]⟩
+  | cons header tail ih =>
+      obtain ⟨body, bodyDecoded⟩ := bodyDecodes header (by simp)
+      have tailDecodes : ∀ item ∈ tail,
+          ∃ body, decodeExprChecked fuel headers item.body = some body := by
+        intro item member
+        exact bodyDecodes item (by simp [member])
+      obtain ⟨definitions, tailDecoded⟩ := ih tailDecodes
+      exact ⟨(header.parameters.map Prod.fst, body) :: definitions,
+        by simp [decodeFunctions, bodyDecoded, tailDecoded]⟩
+
+theorem decodeProgram_isSome_of_components (fuel : Nat) (forms : List Node)
+    (headers : List Header)
+    (headersDecoded : forms.mapM (readHeader fuel) = some headers)
+    (bodiesDecoded : ∀ header ∈ headers,
+      ∃ body, decodeExprChecked fuel headers header.body = some body) :
+    (decodeProgram fuel forms).isSome = true := by
+  simp only [decodeProgram, headersDecoded]
+  obtain ⟨definitions, decoded⟩ :=
+    decodeFunctions_exists_of_each fuel headers headers bodiesDecoded
+  simp [decoded]
 
 theorem decodeProgram_letLayoutsAligned (fuel : Nat) (forms : List Node)
     (definitions : Definitions)
@@ -480,12 +1143,122 @@ theorem decodeProgram_letLayoutsAligned (fuel : Nat) (forms : List Node)
         simpa [headersResult] using decoded
       exact decodeFunctions_letLayoutsAligned fuel headers headers definitions functionsDecoded
 
+theorem decodeTopLevelProgram_functions_wellScoped (fuel : Nat) (forms : List Node)
+    (definitions : Definitions) (slotTypes : List Surface.Ty)
+    (initializers : List Expr)
+    (decoded : decodeTopLevelProgram fuel forms =
+      some (definitions, slotTypes, initializers)) :
+    programWellScoped definitions := by
+  unfold decodeTopLevelProgram at decoded
+  cases layoutResult : readProgramHeaders fuel 0 forms with
+  | none => simp [layoutResult] at decoded
+  | some layout =>
+      have innerDecoded :
+          decodeProgramWithGlobals fuel layout.functions layout.globals =
+            some (definitions, slotTypes, initializers) := by
+        simpa [layoutResult] using decoded
+      unfold decodeProgramWithGlobals at innerDecoded
+      cases functionResult : decodeFunctions fuel
+          (decodeHeadersWithGlobals layout.functions layout.globals) layout.functions with
+      | none => simp [functionResult] at innerDecoded
+      | some decodedDefinitions =>
+          cases initializerResult : decodeGlobalInitializers fuel
+              layout.functions layout.globals with
+          | none => simp [functionResult, initializerResult] at innerDecoded
+          | some decodedInitializers =>
+              have resultEq :
+                  (decodedDefinitions, layout.globals.map GlobalHeader.type,
+                    decodedInitializers) = (definitions, slotTypes, initializers) := by
+                simpa [functionResult, initializerResult] using innerDecoded
+              cases resultEq
+              exact decodeFunctions_letLayoutsAligned fuel
+                (decodeHeadersWithGlobals layout.functions layout.globals)
+                layout.functions definitions functionResult
+
+theorem decodeTopLevelProgram_wellScoped (fuel : Nat) (forms : List Node)
+    (definitions : Definitions) (slotTypes : List Surface.Ty)
+    (initializers : List Expr)
+    (decoded : decodeTopLevelProgram fuel forms =
+      some (definitions, slotTypes, initializers)) :
+    programWellScoped definitions ∧
+      ∀ expression ∈ initializers, letLayoutsAligned expression = true := by
+  exact ⟨decodeTopLevelProgram_functions_wellScoped fuel forms definitions
+    slotTypes initializers decoded,
+    decodeTopLevelProgram_initializers_aligned fuel forms definitions
+      slotTypes initializers decoded⟩
+
+/-- A successful mixed top-level decode exposes the exact header layout that
+produced it, along with the value-slot type order, initializer count, and the
+well-scopedness conditions needed by later typed runtime-layout construction. -/
+theorem decodeTopLevelProgram_layout_and_initializer_conditions
+    (fuel : Nat) (forms : List Node) (definitions : Definitions)
+    (slotTypes : List Surface.Ty) (initializers : List Expr)
+    (decoded : decodeTopLevelProgram fuel forms =
+      some (definitions, slotTypes, initializers)) :
+    ∃ layout : ProgramHeaders,
+      readProgramHeaders fuel 0 forms = some layout ∧
+      slotTypes = layout.globals.map GlobalHeader.type ∧
+      slotTypes.length = initializers.length ∧
+      programWellScoped definitions ∧
+      ∀ expression ∈ initializers, letLayoutsAligned expression = true := by
+  have decodedOriginal := decoded
+  unfold decodeTopLevelProgram at decoded
+  cases layoutResult : readProgramHeaders fuel 0 forms with
+  | none => simp [layoutResult] at decoded
+  | some layout =>
+      have innerDecoded :
+          decodeProgramWithGlobals fuel layout.functions layout.globals =
+            some (definitions, slotTypes, initializers) := by
+        simpa [layoutResult] using decoded
+      have layoutFacts := decodeProgramWithGlobals_layout fuel layout.functions
+        layout.globals definitions slotTypes initializers innerDecoded
+      have scopedFacts := decodeTopLevelProgram_wellScoped fuel forms definitions
+        slotTypes initializers decodedOriginal
+      exact ⟨layout, rfl, layoutFacts.1, layoutFacts.2,
+        scopedFacts.1, scopedFacts.2⟩
+
+theorem decodedProgram_wellScoped (fuel : Nat) (forms : List Node)
+    (definitions : Definitions)
+    (decoded : decodeProgram fuel forms = some definitions) :
+    programWellScoped definitions :=
+  decodeProgram_letLayoutsAligned fuel forms definitions decoded
+
+theorem lambda_closure_wellScoped (env : Environment) (parameters : List Nat)
+    (body : Expr) (envScoped : environmentWellScoped env)
+    (bodyAligned : letLayoutsAligned body = true) :
+    valueWellScoped (.closure parameters body env) := by
+  exact .closure bodyAligned envScoped
+
+theorem sourceLambdaEvaluation_preserves_wellScoped (environment : Environment)
+    (parameters : List Nat) (body : Expr)
+    (environmentScoped : environmentWellScoped environment)
+    (bodyAligned : letLayoutsAligned body = true) :
+    valueWellScoped (.closure parameters body environment) :=
+  lambda_closure_wellScoped environment parameters body environmentScoped bodyAligned
+
 theorem definitionsLetLayoutsAligned_mem (definitions : Definitions)
     (aligned : definitionsLetLayoutsAligned definitions = true)
     (definition : List Nat × Expr) (member : definition ∈ definitions) :
     letLayoutsAligned definition.2 = true := by
   unfold definitionsLetLayoutsAligned at aligned
   exact List.all_eq_true.mp aligned definition member
+
+theorem environmentWellScoped_lookup (environment : Environment) (identity : Nat)
+    (value : Value) (scopeProof : environmentWellScoped environment)
+    (found : lookup identity environment = some value) :
+    valueWellScoped value := by
+  induction environment with
+  | nil => simp [lookup] at found
+  | cons entry rest ih =>
+      rcases entry with ⟨key, current⟩
+      cases scopeProof with
+      | cons currentScoped restScoped =>
+          simp only [lookup] at found
+          split at found
+          · have same : current = value := Option.some.inj found
+            cases same
+            exact currentScoped
+          · exact ih restScoped found
 
 theorem decodeProgram_member_letMany_lengths (fuel : Nat) (forms : List Node)
     (definitions : Definitions) (decoded : decodeProgram fuel forms = some definitions)
@@ -516,6 +1289,222 @@ private theorem definition_mem_of_getElem? {definitions : Definitions} {index : 
           have foundTail : tail[index]? = some definition := by
             simpa [getElem?_def, List.length_cons, Nat.succ_lt_succ_iff] using found
           exact List.mem_cons_of_mem _ (ih foundTail)
+
+theorem program_lookup_body_wellScoped (program : Definitions) (index : Nat)
+    (parameters : List Nat) (body : Expr)
+    (programScoped : programWellScoped program)
+    (found : program[index]? = some (parameters, body)) :
+    letLayoutsAligned body = true := by
+  have member := definition_mem_of_getElem? found
+  exact definitionsLetLayoutsAligned_mem program
+    (by simpa [programWellScoped] using programScoped) (parameters, body) member
+
+theorem closureApplication_environment_wellScoped
+    (parameters : List Nat) (body : Expr) (captured : Environment)
+    (values : List Value)
+    (closureScoped : valueWellScoped (.closure parameters body captured))
+    (valuesScoped : ∀ value ∈ values, valueWellScoped value)
+    (_arity : values.length = parameters.length) :
+    letLayoutsAligned body = true ∧
+      environmentWellScoped (bind parameters values ++ captured) := by
+  cases closureScoped with
+  | closure bodyAligned capturedScoped =>
+      exact ⟨bodyAligned, environmentWellScoped_bind_append parameters values captured
+        valuesScoped capturedScoped⟩
+
+/-- A finite Named evaluation starting in a well-scoped environment preserves
+the recursive closure/binder invariant, provided every program body and every
+let layout is aligned. This is the source-side invariant needed to reflect
+closures produced by an erased execution back through later applications. -/
+theorem evaluation_preserves_valueWellScoped (program : Definitions)
+    (programScoped : programWellScoped program) :
+    ∀ {environment : Environment} {expression : Expr} {value : Value},
+      Evaluates program environment expression value →
+      environmentWellScoped environment → letLayoutsAligned expression = true →
+      valueWellScoped value := by
+  apply Evaluates.rec (program := program)
+    (motive_1 := fun environment expression value _ =>
+      environmentWellScoped environment → letLayoutsAligned expression = true →
+        valueWellScoped value)
+    (motive_2 := fun environment expressions values _ =>
+      environmentWellScoped environment →
+        (∀ expression ∈ expressions, letLayoutsAligned expression = true) →
+        ∀ value ∈ values, valueWellScoped value)
+    (motive_3 := fun environment expressions previous value _ =>
+      environmentWellScoped environment →
+        (∀ expression ∈ expressions, letLayoutsAligned expression = true) →
+        valueWellScoped previous →
+        valueWellScoped value)
+  all_goals intros
+  all_goals try assumption
+  all_goals try (exact ValueWellScoped.bool)
+  all_goals try (exact ValueWellScoped.int)
+  all_goals try (exact ValueWellScoped.float)
+  all_goals try (exact ValueWellScoped.string)
+  all_goals try (exact ValueWellScoped.character)
+  all_goals try (exact ValueWellScoped.unit)
+  all_goals try (exact ValueWellScoped.global)
+  all_goals try (exact ValueWellScoped.nil)
+  all_goals try (exact ValueWellScoped.none)
+  case var =>
+    rename_i identity environment value found environmentScoped _aligned
+    exact environmentWellScoped_lookup environment identity value environmentScoped found
+  case lam =>
+    rename_i environment parameters body environmentScoped aligned
+    have bodyAligned : letLayoutsAligned body = true := by
+      simpa [letLayoutsAligned] using aligned
+    exact ValueWellScoped.closure bodyAligned environmentScoped
+  case appClosure =>
+    rename_i environment function parameters body captured arguments values result
+      evalFunction evalArguments arity evalBody ihFunction ihArguments ihBody
+      environmentScoped aligned
+    rcases letLayoutsAligned_app_parts function arguments aligned with
+      ⟨functionAligned, argumentsAligned⟩
+    have functionScoped := ihFunction environmentScoped functionAligned
+    have argumentsScoped : ∀ value ∈ values, valueWellScoped value :=
+      ihArguments environmentScoped (by
+        intro expression member
+        exact letLayoutsAlignedList_mem arguments argumentsAligned member)
+    obtain ⟨bodyAligned, bodyEnvironmentScoped⟩ := closureApplication_environment_wellScoped
+      parameters body captured values functionScoped argumentsScoped arity
+    simpa using ihBody bodyEnvironmentScoped bodyAligned
+  case appGlobal =>
+    rename_i environment function index arguments values parameters body result
+      evalFunction evalArguments definitionFound arity evalBody ihFunction ihArguments ihBody
+      environmentScoped aligned
+    rcases letLayoutsAligned_app_parts function arguments aligned with
+      ⟨functionAligned, argumentsAligned⟩
+    have argumentsScoped : ∀ value ∈ values, valueWellScoped value :=
+      ihArguments environmentScoped (by
+        intro expression member
+        exact letLayoutsAlignedList_mem arguments argumentsAligned member)
+    have bodyAligned := program_lookup_body_wellScoped program index parameters body
+      programScoped definitionFound
+    have callEnvironmentScoped := environmentWellScoped_bind_append parameters values []
+      argumentsScoped EnvironmentWellScoped.nil
+    exact ihBody (by simpa using callEnvironmentScoped) bodyAligned
+  case ifTrue =>
+    rename_i environment condition yes result no evalCondition evalYes ihCondition ihYes
+      environmentScoped aligned
+    exact ihYes environmentScoped
+      (letLayoutsAligned_ite_parts condition yes no aligned).2.1
+  case ifFalse =>
+    rename_i environment condition no result yes evalCondition evalNo ihCondition ihNo
+      environmentScoped aligned
+    exact ihNo environmentScoped
+      (letLayoutsAligned_ite_parts condition yes no aligned).2.2
+  case letMany =>
+    rename_i environment initializers values ids body result evalInitializers arity evalBody
+      ihInitializers ihBody environmentScoped aligned
+    rcases letLayoutsAligned_letMany_parts ids initializers body aligned with
+      ⟨_arityAligned, initializersAligned, bodyAligned⟩
+    have valuesScoped : ∀ value ∈ values, valueWellScoped value :=
+      ihInitializers environmentScoped (by
+        intro expression member
+        exact letLayoutsAlignedList_mem initializers initializersAligned member)
+    have bodyEnvironmentScoped := environmentWellScoped_bind_append ids values environment
+      valuesScoped environmentScoped
+    exact ihBody bodyEnvironmentScoped bodyAligned
+  case begin =>
+    rename_i environment first previous rest result evalFirst evalRest ihFirst ihRest
+      environmentScoped aligned
+    rcases letLayoutsAligned_begin_parts first rest aligned with
+      ⟨firstAligned, restAligned⟩
+    exact ihRest environmentScoped (by
+      intro expression member
+      exact letLayoutsAlignedList_mem rest restAligned member)
+      (ihFirst environmentScoped firstAligned)
+  case cons =>
+    rename_i environment head headValue tail tailValue evalHead evalTail ihHead ihTail
+      environmentScoped aligned
+    rcases letLayoutsAligned_cons_parts head tail aligned with ⟨headAligned, tailAligned⟩
+    exact ValueWellScoped.cons (ihHead environmentScoped headAligned)
+      (ihTail environmentScoped tailAligned)
+  case some =>
+    rename_i environment expression value evalExpression ihExpression environmentScoped aligned
+    exact ValueWellScoped.some (ihExpression environmentScoped
+      (letLayoutsAligned_some_body expression aligned))
+  case matchNil =>
+    rename_i environment target empty value head tail full evalTarget evalEmpty ihTarget ihEmpty
+      environmentScoped aligned
+    rcases letLayoutsAligned_matchList_parts target empty full head tail aligned with
+      ⟨_targetAligned, emptyAligned, _fullAligned⟩
+    exact ihEmpty environmentScoped emptyAligned
+  case matchCons =>
+    rename_i environment target headValue tailValue headBinder tailBinder full value empty
+      evalTarget evalFull ihTarget ihFull environmentScoped aligned
+    rcases letLayoutsAligned_matchList_parts target empty full headBinder tailBinder aligned with
+      ⟨_targetAligned, _emptyAligned, fullAligned⟩
+    have pairScoped := ihTarget environmentScoped
+      (letLayoutsAligned_matchList_parts target empty full headBinder tailBinder aligned).1
+    cases pairScoped with
+    | cons headScoped tailScoped =>
+        exact ihFull (.cons headScoped (.cons tailScoped environmentScoped)) fullAligned
+  case matchNone =>
+    rename_i environment target empty value binder full evalTarget evalEmpty ihTarget ihEmpty
+      environmentScoped aligned
+    rcases letLayoutsAligned_matchOption_parts target empty full binder aligned with
+      ⟨_targetAligned, emptyAligned, _fullAligned⟩
+    exact ihEmpty environmentScoped emptyAligned
+  case matchSome =>
+    rename_i environment target item binder full value empty evalTarget evalFull ihTarget ihFull
+      environmentScoped aligned
+    rcases letLayoutsAligned_matchOption_parts target empty full binder aligned with
+      ⟨targetAligned, _emptyAligned, fullAligned⟩
+    cases h : ihTarget environmentScoped targetAligned with
+    | some itemScoped => exact ihFull (.cons itemScoped environmentScoped) fullAligned
+  case nil =>
+    rename_i environment envScoped _ value member
+    simp at member
+  case cons =>
+    rename_i environment head headValue tail values evalHead evalTail ihHead ihTail
+      environmentScoped aligned value member
+    simp only [List.mem_cons] at member
+    rcases member with same | inTail
+    · cases same
+      exact ihHead environmentScoped (aligned head (by simp))
+    · exact ihTail environmentScoped
+        (fun expression inTail' => aligned expression (List.mem_cons_of_mem _ inTail'))
+        value inTail
+  case cons =>
+    rename_i environment head headValue tail result previous evalHead evalTail ihHead ihTail
+      environmentScoped aligned previousScoped
+    have headScoped := ihHead environmentScoped (aligned head (by simp))
+    exact ihTail environmentScoped
+      (fun expression member => aligned expression (List.mem_cons_of_mem _ member)) headScoped
+
+/-- A body obtained from a successfully decoded function program inherits the
+same closure-safe result invariant from decoding and finite evaluation. -/
+theorem decodeProgram_body_evaluation_preserves_valueWellScoped
+    (fuel : Nat) (forms : List Node) (definitions : Definitions)
+    (decoded : decodeProgram fuel forms = some definitions)
+    (index : Nat) (parameters : List Nat) (body : Expr)
+    (found : definitions[index]? = some (parameters, body))
+    (environment : Environment) (value : Value)
+    (environmentScoped : environmentWellScoped environment)
+    (evaluated : Evaluates definitions environment body value) :
+    valueWellScoped value := by
+  apply evaluation_preserves_valueWellScoped definitions
+    (decodedProgram_wellScoped fuel forms definitions decoded) evaluated environmentScoped
+  exact program_lookup_body_wellScoped definitions index parameters body
+    (decodedProgram_wellScoped fuel forms definitions decoded) found
+
+/-- Initializers returned by the mixed top-level decoder also preserve the
+closure-safe invariant when they evaluate in a well-scoped environment. -/
+theorem decodeTopLevel_initializer_evaluation_preserves_valueWellScoped
+    (fuel : Nat) (forms : List Node) (definitions : Definitions)
+    (slotTypes : List Surface.Ty) (initializers : List Expr)
+    (decoded : decodeTopLevelProgram fuel forms =
+      some (definitions, slotTypes, initializers))
+    (environment : Environment) (expression : Expr) (value : Value)
+    (member : expression ∈ initializers)
+    (environmentScoped : environmentWellScoped environment)
+    (evaluated : Evaluates definitions environment expression value) :
+    valueWellScoped value := by
+  have aligned := decodeTopLevelProgram_wellScoped fuel forms definitions slotTypes
+    initializers decoded
+  apply evaluation_preserves_valueWellScoped definitions aligned.1 evaluated environmentScoped
+  exact aligned.2 expression member
 
 theorem decodeProgram_lookup_letMany_lengths (fuel : Nat) (forms : List Node)
     (definitions : Definitions) (decoded : decodeProgram fuel forms = some definitions)

@@ -11,6 +11,9 @@ inductive Term where
   | global : Nat → Term
   | bool : Bool → Term
   | int : Int → Term
+  | float : Float → Term
+  | string : String → Term
+  | character : Char → Term
   | unit : Term
   | lam : Nat → Term → Term
   | app : Term → List Term → Term
@@ -28,6 +31,7 @@ inductive Term where
   | some : Term → Term
   | matchList : Term → Term → Term → Term
   | matchOption : Term → Term → Term → Term
+  | floatBin : FloatBinOp → Term → Term → Term
   deriving Repr
 
 /- Count only recursive syntax nodes. The default sizeOf also counts the
@@ -37,7 +41,8 @@ The nested recursors are used only in termination proofs, so their lack of
 native code generation in Lean 4.8 does not affect executable erasure. -/
 macro "source_nodes_using " recursor:term : term => `(
   $recursor (motive_1 := fun _ => Nat) (motive_2 := fun _ => Nat)
-    (fun _ => 1) (fun _ _ => 1) (fun _ => 1) (fun _ => 1) 1
+    (fun _ => 1) (fun _ _ => 1) (fun _ => 1) (fun _ => 1) (fun _ => 1)
+    (fun _ => 1) (fun _ => 1) 1
     (fun _ _ _ body => 1 + body)
     (fun _ _ f args => 1 + f + args)
     (fun _ _ _ c y n => 1 + c + y + n)
@@ -52,6 +57,7 @@ macro "source_nodes_using " recursor:term : term => `(
     (fun _ => 1) (fun _ _ value => 1 + value)
     (fun _ _ _ target empty full => 1 + target + empty + full)
     (fun _ _ _ target empty full => 1 + target + empty + full)
+    (fun _ _ _ left right => 1 + left + right)
     0 (fun _ _ head tail => 1 + head + tail))
 
 noncomputable def sourceNodes (expression : Surface.Expr) : Nat :=
@@ -67,6 +73,9 @@ def erase (expression : Surface.Expr) : Term :=
   | .global i _ => .global i
   | .bool b => .bool b
   | .int n => .int n
+  | .float x => .float x
+  | .string value => .string value
+  | .character value => .character value
   | .unit => .unit
   | .lam args _ body => .lam args.length (erase body)
   | .app f args => .app (erase f) (eraseList args)
@@ -84,6 +93,7 @@ def erase (expression : Surface.Expr) : Term :=
   | .some _ value => .some (erase value)
   | .matchList target empty full => .matchList (erase target) (erase empty) (erase full)
   | .matchOption target empty full => .matchOption (erase target) (erase empty) (erase full)
+  | .floatBin op left right => .floatBin op (erase left) (erase right)
 termination_by sourceNodes expression
 decreasing_by all_goals simp_wf; simp only [sourceNodes, sourceListNodes]; omega
 
@@ -112,6 +122,9 @@ structure Program where
 inductive Value where
   | bool : Bool → Value
   | int : Int → Value
+  | float : Float → Value
+  | string : String → Value
+  | character : Char → Value
   | unit : Value
   | closure : Nat → Term → List Value → Value
   | global : Nat → Value
@@ -148,6 +161,20 @@ mutual
       | .global i => match program[i]? with | some _ => pure (.global i) | none => .error .unbound
       | .bool b => pure (.bool b)
       | .int n => pure (.int n)
+      | .float x => pure (.float x)
+      | .string value => pure (.string value)
+      | .character value => pure (.character value)
+      | .floatBin op left right => do
+        let leftValue ← evaluate program fuel env left
+        let rightValue ← evaluate program fuel env right
+        match leftValue, rightValue with
+        | .float x, .float y =>
+          pure (.float (match op with
+            | .add => Float.add x y
+            | .sub => Float.sub x y
+            | .mul => Float.mul x y
+            | .div => Float.div x y))
+        | _, _ => .error .wrongShape
       | .unit => pure .unit
       | .lam arity body => pure (.closure arity body env)
       | .app f args =>

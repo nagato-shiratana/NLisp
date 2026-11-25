@@ -10,6 +10,17 @@ mutual
         Evaluates program env (.global index) (.global index)
     | bool : Evaluates program env (.bool b) (.bool b)
     | int : Evaluates program env (.int n) (.int n)
+    | float : Evaluates program env (.float x) (.float x)
+    | string : Evaluates program env (.string value) (.string value)
+    | character : Evaluates program env (.character value) (.character value)
+    | floatBin : Evaluates program env left (.float x) →
+        Evaluates program env right (.float y) →
+        Evaluates program env (.floatBin op left right)
+          (.float (match op with
+            | .add => Float.add x y
+            | .sub => Float.sub x y
+            | .mul => Float.mul x y
+            | .div => Float.div x y))
     | unit : Evaluates program env .unit .unit
     | lam : Evaluates program env (.lam arity body) (.closure arity body env)
     | appClosure : Evaluates program env f (.closure arity body captured) →

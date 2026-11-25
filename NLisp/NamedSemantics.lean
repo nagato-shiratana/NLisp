@@ -10,6 +10,9 @@ inductive Expr where
   | global : Nat → Expr
   | bool : Bool → Expr
   | int : Int → Expr
+  | float : Float → Expr
+  | string : String → Expr
+  | character : Char → Expr
   | unit : Expr
   | lam : List Nat → Expr → Expr
   | app : Expr → List Expr → Expr
@@ -19,6 +22,7 @@ inductive Expr where
   | mul : Expr → Expr → Expr
   | le : Expr → Expr → Expr
   | intEq : Expr → Expr → Expr
+  | floatBin : Surface.FloatBinOp → Expr → Expr → Expr
   | letMany : List Nat → List Expr → Expr → Expr
   | begin : Expr → List Expr → Expr
   | nil : Expr
@@ -32,6 +36,9 @@ inductive Expr where
 inductive Value where
   | bool : Bool → Value
   | int : Int → Value
+  | float : Float → Value
+  | string : String → Value
+  | character : Char → Value
   | unit : Value
   | closure : List Nat → Expr → List (Nat × Value) → Value
   | global : Nat → Value
@@ -56,6 +63,9 @@ inductive Evaluates (program : Definitions) : Environment → Expr → Value →
       Evaluates program env (.global index) (.global index)
   | bool : Evaluates program env (.bool b) (.bool b)
   | int : Evaluates program env (.int n) (.int n)
+  | float : Evaluates program env (.float x) (.float x)
+  | string : Evaluates program env (.string s) (.string s)
+  | character : Evaluates program env (.character c) (.character c)
   | unit : Evaluates program env .unit .unit
   | lam : Evaluates program env (.lam ps body) (.closure ps body env)
   | appClosure : Evaluates program env f (.closure ps body captured) →
@@ -80,6 +90,9 @@ inductive Evaluates (program : Definitions) : Environment → Expr → Value →
       Evaluates program env (.le a b) (.bool (decide (x ≤ y)))
   | intEq : Evaluates program env a (.int x) → Evaluates program env b (.int y) →
       Evaluates program env (.intEq a b) (.bool (x == y))
+  | floatBin : Evaluates program env left (.float x) → Evaluates program env right (.float y) →
+      Evaluates program env (.floatBin op left right) (.float (match op with
+        | .add => x.add y | .sub => x.sub y | .mul => x.mul y | .div => x.div y))
   | letMany : ArgumentsEvaluate program env initializers values → values.length = ids.length →
       Evaluates program (bind ids values ++ env) body value →
       Evaluates program env (.letMany ids initializers body) value

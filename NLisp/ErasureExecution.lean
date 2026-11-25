@@ -2,6 +2,8 @@ import NLisp.Erasure
 import NLisp.SurfaceEvaluator
 import NLisp.EvaluatorCompleteness
 import NLisp.SurfaceEvaluatorCorrectness
+import NLisp.SurfaceEvaluatorCompleteness
+import NLisp.PolymorphicSafety
 
 namespace NLisp.PolyIR
 
@@ -160,5 +162,39 @@ theorem fuel_divergence_iff (program : Surface.Definitions) (env : List Surface.
   constructor
   · intro h fuel; exact execution_error_iff.mp (h fuel)
   · intro h fuel; exact execution_error_iff.mpr (h fuel)
+
+/-- For a closed, well-typed Surface expression in a typed program, semantic
+divergence (no finite big-step derivation) is equivalent to exhaustion at
+every fuel depth. The typing premise excludes finite wrong-shape/unbound
+faults, so a single out-of-fuel result is not used as a divergence test. -/
+theorem typed_closed_divergence_iff_fuel_exhaustion
+    (program : Surface.Definitions) (globals : List Surface.Signature)
+    (wellTypedProgram : ProgramTyped globals program)
+    (expression : Surface.Expr) (type : Surface.Ty)
+    (typing : Surface.HasType globals 0 [] expression type) :
+    (¬ ∃ value, Surface.Evaluates program [] expression value) ↔
+      ∀ fuel, Surface.evaluate program fuel [] expression = .error .outOfFuel := by
+  constructor
+  · intro noFinite fuel
+    cases result : Surface.evaluate program fuel [] expression with
+    | ok value =>
+        exact False.elim (noFinite ⟨value, Surface.evaluate_sound result⟩)
+    | error fault =>
+        have erasedFailure : evaluate (eraseDefinitions program) fuel []
+            (erase expression) = .error fault :=
+          execution_error_iff.mpr result
+        have emptyTyped : ValuesTyped globals []
+            (Surface.interpretTypes (fun _ => Surface.Ty.unit) []) := by
+          simp [Surface.interpretTypes]
+          exact ValuesTyped.nil
+        have onlyFuelFault := evaluation_no_type_error wellTypedProgram typing
+          (assignment := fun _ => Surface.Ty.unit) emptyTyped erasedFailure
+        subst fault
+        simpa [result]
+  · intro allFuel
+    rintro ⟨value, derivation⟩
+    obtain ⟨fuel, successful⟩ := Surface.evaluate_complete derivation
+    rw [allFuel fuel] at successful
+    cases successful
 
 end NLisp.PolyIR

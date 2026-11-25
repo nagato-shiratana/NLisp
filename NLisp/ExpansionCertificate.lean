@@ -70,8 +70,7 @@ theorem membershipWithCost_cost_le {α : Type} [DecidableEq α]
       by_cases same : head = needle
       · simp [membershipWithCost, same]
       · simp only [membershipWithCost, same, if_neg same, List.length_cons]
-        have tailBound := ih
-        omega
+        exact Nat.add_le_add_right ih 1
 
 /- The cost model covers rule dispatch, the parameter/argument walk, and the
 actual number of entries inspected for rule membership after a successful
@@ -95,7 +94,12 @@ theorem checkStepWithMatchCost_result (rules : List (Nat × Tree))
   simp only [checkStepWithMatchCost, matchRuleWithCost_result]
   cases matched : matchRule rule input with
   | none => simp [checkStep, matched]
-  | some payload => simp [checkStep, matched, membershipWithCost_result]
+  | some payload =>
+      cases payload with
+      | mk holes template =>
+          simp only [checkStep, matched, membershipWithCost_result]
+          apply Bool.eq_iff_iff.mpr
+          simp
 
 theorem checkStepWithMatchCost_cost_le (rules : List (Nat × Tree))
     (origin fuel fresh final : Nat) (rule input output : Tree) :
@@ -303,7 +307,8 @@ theorem separatedManyWithCost_result (interval : Nat × Nat)
   induction others with
   | nil => rfl
   | cons head tail ih =>
-      cases separated interval head <;> simp [separatedManyWithCost, ih]
+      cases sep : separated interval head <;>
+        simp [separatedManyWithCost, sep, ih]
 
 theorem separatedManyWithCost_cost_le (interval : Nat × Nat)
     (others : List (Nat × Nat)) :
@@ -311,10 +316,10 @@ theorem separatedManyWithCost_cost_le (interval : Nat × Nat)
   induction others with
   | nil => simp [separatedManyWithCost]
   | cons head tail ih =>
-      cases separated interval head with
-      | false => simp [separatedManyWithCost, List.length_cons]
+      cases sep : separated interval head with
+      | false => simp [separatedManyWithCost, sep, List.length_cons]
       | true =>
-          simp only [separatedManyWithCost, List.length_cons]
+          simp [separatedManyWithCost, sep, List.length_cons]
           omega
 
 def disjointIntervalsWithCost : List (Nat × Nat) → Bool × Nat
@@ -338,17 +343,21 @@ theorem disjointIntervalsWithCost_result (intervals : List (Nat × Nat)) :
       | true =>
           cases pairwise : (separatedManyWithCost interval tail).1 with
           | false =>
+              have pairwise' : tail.all (separated interval) = false := by
+                simpa [separatedManyWithCost_result] using pairwise
               simp [disjointIntervalsWithCost, disjointIntervals, bound, pairwise,
-                separatedManyWithCost_result]
+                pairwise', separatedManyWithCost_result]
           | true =>
+              have pairwise' : tail.all (separated interval) = true := by
+                simpa [separatedManyWithCost_result] using pairwise
               simp [disjointIntervalsWithCost, disjointIntervals, bound, pairwise,
-                separatedManyWithCost_result, ih]
+                pairwise', separatedManyWithCost_result, ih]
 
 theorem disjointIntervalsWithCost_cost_le (intervals : List (Nat × Nat)) :
     (disjointIntervalsWithCost intervals).2 ≤
       intervalPairComparisonCost intervals + intervals.length := by
   induction intervals with
-  | nil => rfl
+  | nil => simp [disjointIntervalsWithCost, intervalPairComparisonCost]
   | cons interval tail ih =>
       have pairBound := separatedManyWithCost_cost_le interval tail
       simp only [disjointIntervalsWithCost, intervalPairComparisonCost, List.length_cons]
@@ -470,9 +479,9 @@ theorem certificateMatchCostBound_eq_components (rules : List (Nat × Tree))
       certificateMacroParameterTotal, certificateMacroStepCount, certificateTransCount,
       certificateTransComparisonCost]
   | congList pre suffix child ih =>
-      simpa [certificateMatchCostBound, certificateNodeCount,
+      simp [certificateMatchCostBound, certificateNodeCount,
         certificateMacroParameterTotal, certificateMacroStepCount, certificateTransCount,
-        certificateTransComparisonCost] using ih
+        certificateTransComparisonCost, ih, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm]
   | macroStep origin fuel fresh final rule input output =>
       simp [certificateMatchCostBound, certificateNodeCount,
         certificateMacroParameterTotal, certificateMacroStepCount, certificateTransCount,
@@ -545,7 +554,6 @@ theorem checkWithMatchTraversalCost_le_bound (rules : List (Nat × Tree))
   | refl tree => simp [checkWithMatchTraversalCost, certificateMatchCostBound]
   | congList pre suffix child ih =>
       simp [checkWithMatchTraversalCost, certificateMatchCostBound, ih]
-      omega
   | macroStep origin fuel fresh final rule input output =>
       simpa [checkWithMatchTraversalCost, certificateMatchCostBound] using
         checkStepWithMatchCost_cost_le rules origin fuel fresh final rule input output
@@ -714,6 +722,18 @@ theorem checkFresh_sound (certificate : Certificate)
   simp [checkFresh] at accepted
   exact check_sound certificate accepted.2
 
+/-- Joint soundness for the single certificate acceptance decision: an accepted
+freshness certificate both describes a finite expansion and proves that the
+fresh-counter intervals recorded by its macro steps are pairwise disjoint.
+This does not yet include binder-level non-capture or type preservation. -/
+theorem checkFresh_sound_with_intervals (certificate : Certificate)
+    (accepted : checkFresh rules certificate = true) :
+    Expands rules (source certificate) (target certificate) ∧
+      disjointIntervals (freshIntervals certificate) = true := by
+  constructor
+  · exact checkFresh_sound certificate accepted
+  · exact checkFresh_intervals accepted
+
 theorem checkFresh_separates_interval_counters (certificate : Certificate)
     (accepted : checkFresh rules certificate = true)
     (first second : Nat × Nat)
@@ -736,6 +756,29 @@ theorem checkFresh_generated_tokens_differ (certificate : Certificate)
     3 * a + 2 ≠ 3 * b + 2 := by
   exact CExpansion.disjoint_interval_generated_ids_differ (checkFresh_intervals accepted)
     first second firstMember secondMember different aLower aUpper bLower bUpper
+
+/-- Any two generated binder-token collections are disjoint when every token
+is tied to the counter interval of its accepted certificate. This abstracts
+the same interval argument from parameter, let, pattern, and case binders. -/
+theorem checkFresh_separates_token_collections (certificate : Certificate)
+    (accepted : checkFresh rules certificate = true)
+    (first second : Nat × Nat)
+    (firstMember : first ∈ freshIntervals certificate)
+    (secondMember : second ∈ freshIntervals certificate)
+    (different : first ≠ second)
+    (firstTokens secondTokens : List Nat)
+    (firstWithin : ∀ token, token ∈ firstTokens →
+      ∃ counter, first.1 < counter ∧ counter ≤ first.2 ∧ token = 3 * counter + 2)
+    (secondWithin : ∀ token, token ∈ secondTokens →
+      ∃ counter, second.1 < counter ∧ counter ≤ second.2 ∧ token = 3 * counter + 2) :
+    ∀ tokenA, tokenA ∈ firstTokens → ∀ tokenB, tokenB ∈ secondTokens → tokenA ≠ tokenB := by
+  intro tokenA memberA tokenB memberB
+  obtain ⟨counterA, lowerA, upperA, tokenEqA⟩ := firstWithin tokenA memberA
+  obtain ⟨counterB, lowerB, upperB, tokenEqB⟩ := secondWithin tokenB memberB
+  have differentIds := checkFresh_generated_tokens_differ certificate accepted first second
+    firstMember secondMember different lowerA upperA lowerB upperB
+  rw [tokenEqA, tokenEqB]
+  exact differentIds
 
 theorem checkFresh_separates_parameter_copy_tokens (certificate : Certificate)
     (certificateAccepted : checkFresh rules certificate = true)

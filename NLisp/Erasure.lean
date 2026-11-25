@@ -8,6 +8,9 @@ def eraseValue (value : Surface.Value) : Value :=
   match value with
   | .bool b => .bool b
   | .int n => .int n
+  | .float x => .float x
+  | .string value => .string value
+  | .character value => .character value
   | .unit => .unit
   | .closure ps _ body env => .closure ps.length (erase body) (eraseValues env)
   | .global i _ => .global i
@@ -99,12 +102,14 @@ theorem evaluation_preserved {program : Surface.Definitions}
     exact Evaluates.appGlobal ihf iha
       (eraseDefinitions_lookup lookup) (by simpa using arity) ihb
   all_goals solve_by_elim (config := { maxDepth := 8 }) [Evaluates.var, Evaluates.global,
-    Evaluates.bool, Evaluates.int, Evaluates.unit, Evaluates.lam,
+    Evaluates.bool, Evaluates.int, Evaluates.float, Evaluates.unit, Evaluates.lam,
+    Evaluates.string, Evaluates.character,
     Evaluates.appClosure, Evaluates.appGlobal, Evaluates.ifTrue, Evaluates.ifFalse,
     Evaluates.add, Evaluates.sub, Evaluates.mul, Evaluates.le, Evaluates.intEq,
     Evaluates.letMany, Evaluates.begin, Evaluates.nil, Evaluates.cons,
     Evaluates.none, Evaluates.some, Evaluates.matchNil, Evaluates.matchCons,
-    Evaluates.matchNone, Evaluates.matchSome, ArgumentsEvaluate.nil, ArgumentsEvaluate.cons,
+    Evaluates.matchNone, Evaluates.matchSome, Evaluates.floatBin,
+    ArgumentsEvaluate.nil, ArgumentsEvaluate.cons,
     SequenceEvaluates.nil, SequenceEvaluates.cons, eraseValues_lookup, eraseDefinitions_lookup, erased_arity]
 
 theorem closed_integer_result {program : Surface.Definitions} {expression : Surface.Expr} {n : Int}

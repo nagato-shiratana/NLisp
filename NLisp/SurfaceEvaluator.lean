@@ -14,6 +14,20 @@ mutual
       | .global i types => match program[i]? with | some _ => pure (.global i types) | none => .error .unbound
       | .bool b => pure (.bool b)
       | .int n => pure (.int n)
+      | .float x => pure (.float x)
+      | .string value => pure (.string value)
+      | .character value => pure (.character value)
+      | .floatBin op left right => do
+        let leftValue ← evaluate program fuel env left
+        let rightValue ← evaluate program fuel env right
+        match leftValue, rightValue with
+        | .float x, .float y =>
+          pure (.float (match op with
+            | .add => Float.add x y
+            | .sub => Float.sub x y
+            | .mul => Float.mul x y
+            | .div => Float.div x y))
+        | _, _ => .error .wrongShape
       | .unit => pure .unit
       | .lam parameters result body => pure (.closure parameters result body env)
       | .app f args =>

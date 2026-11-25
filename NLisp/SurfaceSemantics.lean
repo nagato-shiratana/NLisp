@@ -7,6 +7,9 @@ arguments. This semantics is independent of the erased evaluator. -/
 inductive Value where
   | bool : Bool → Value
   | int : Int → Value
+  | float : Float → Value
+  | string : String → Value
+  | character : Char → Value
   | unit : Value
   | closure : List Ty → Ty → Expr → List Value → Value
   | global : Nat → List Ty → Value
@@ -27,6 +30,17 @@ mutual
         Evaluates program env (.global index types) (.global index types)
     | bool : Evaluates program env (.bool b) (.bool b)
     | int : Evaluates program env (.int n) (.int n)
+    | float : Evaluates program env (.float x) (.float x)
+    | string : Evaluates program env (.string value) (.string value)
+    | character : Evaluates program env (.character value) (.character value)
+    | floatBin : Evaluates program env left (.float x) →
+        Evaluates program env right (.float y) →
+        Evaluates program env (.floatBin op left right)
+          (.float (match op with
+            | .add => Float.add x y
+            | .sub => Float.sub x y
+            | .mul => Float.mul x y
+            | .div => Float.div x y))
     | unit : Evaluates program env .unit .unit
     | lam : Evaluates program env (.lam ps result body) (.closure ps result body env)
     | appClosure : Evaluates program env f (.closure ps result body captured) →

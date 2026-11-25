@@ -30,6 +30,9 @@ def readType : Nat → List String → Node → Option Ty
       | none => match a.name with
         | "Integer" => some .integer
         | "Boolean" => some .boolean
+        | "Float" => some .float
+        | "String" => some .string
+        | "Character" => some .character
         | "Unit" => some .unit
         | _ => none
     | .list [head, t] => do
@@ -129,6 +132,14 @@ def globalValueIndex (identity : Nat) : List GlobalHeader → Option Nat
       if header.identity = identity then some 0
       else (globalValueIndex identity tail).map Nat.succ
 
+private theorem getElem?_some_lt_length {α : Type} (items : List α)
+    (index : Nat) (item : α) (found : items[index]? = some item) :
+    index < items.length := by
+  simp only [getElem?_def] at found
+  split at found
+  · assumption
+  · contradiction
+
 theorem globalValueIndex_lookup_sound (identity : Nat) (headers : List GlobalHeader)
     (slot : Nat) (resolved : globalValueIndex identity headers = some slot) :
     ∃ header, headers[slot]? = some header ∧ header.identity = identity := by
@@ -146,14 +157,22 @@ theorem globalValueIndex_lookup_sound (identity : Nat) (headers : List GlobalHea
               simpa [globalValueIndex, same, tailResult] using resolved
             subst slot
             obtain ⟨header, headerEntry, identityEq⟩ := ih tailSlot tailResult
+            have tailFound : tail[tailSlot]? = some header := headerEntry
+            have tailBound := getElem?_some_lt_length tail tailSlot header tailFound
             have headerEntry' : (head :: tail)[tailSlot + 1]? = some header := by
-              have tailBound : tailSlot < tail.length := by
-                by_contra notBound
-                simp [getElem?_def, notBound] at headerEntry
+              have valueEquality : tail[tailSlot] = header := by
+                simp only [getElem?_def] at tailFound
+                split at tailFound
+                · exact Option.some.inj tailFound
+                · contradiction
               have headBound : tailSlot + 1 < (head :: tail).length := by
-                simp only [List.length_cons]
-                omega
-              simpa [getElem?_def, tailBound, headBound] using headerEntry
+                simpa only [Nat.add_one, List.length_cons] using
+                  Nat.succ_lt_succ tailBound
+              simp only [List.length_cons, Nat.add_one] at headBound ⊢
+              change (if h : tailSlot.succ < tail.length.succ then
+                some ((head :: tail)[tailSlot.succ]) else none) = some header
+              rw [dif_pos headBound]
+              simpa using valueEquality
             exact ⟨header, headerEntry', identityEq⟩
 
 def globalValueReferenceIndex (functionCount identity : Nat)
@@ -211,13 +230,27 @@ def primitive : Nat → Option Expr
 type checker to recognize a primitive's fixed lambda representation. -/
 def checkPrimitive (selected : Nat) : Expr → Bool
   | .lam parameters result body =>
-    decide (parameters = [.integer, .integer]) &&
+    (if selected == 39 || selected == 42 || selected == 45 || selected == 48 then
+      decide (parameters = [.float, .float])
+     else if selected == 33 then decide (parameters = [.boolean, .boolean])
+     else if selected == 36 then decide (parameters = [.boolean])
+     else decide (parameters = [.integer, .integer])) &&
       match selected, result, body with
       | 3, .integer, .add (.var 0) (.var 1)
       | 6, .integer, .sub (.var 0) (.var 1)
       | 9, .integer, .mul (.var 0) (.var 1)
       | 15, .boolean, .le (.var 0) (.var 1)
+      | 12, .boolean, .ite (.le (.var 1) (.var 0)) (.bool false) (.bool true)
+      | 18, .boolean, .ite (.le (.var 0) (.var 1)) (.bool false) (.bool true)
+      | 21, .boolean, .le (.var 1) (.var 0)
       | 24, .boolean, .intEq (.var 0) (.var 1) => true
+      | 33, .boolean, .ite (.var 0) (.var 1)
+          (.ite (.var 1) (.bool false) (.bool true)) => true
+      | 36, .boolean, .ite (.var 0) (.bool false) (.bool true) => true
+      | 39, .float, .floatBin .add (.var 0) (.var 1)
+      | 42, .float, .floatBin .sub (.var 0) (.var 1)
+      | 45, .float, .floatBin .mul (.var 0) (.var 1)
+      | 48, .float, .floatBin .div (.var 0) (.var 1) => true
       | _, _, _ => false
   | _ => false
 
@@ -246,6 +279,9 @@ def checkExpr : Nat → List Header → List String → List Nat → Bool → No
       | .var index => decide (locals[index]? = some selected)
       | .global index arguments => checkGlobal fuel headers allowInference selected index arguments
       | .int n => selected == 0 && Lexical.integerLiteral a.name.toList && a.name.toInt? == some n
+      | .float x => selected == 0 && Lexical.readFloatLiteral a.name == some x
+      | .string value => selected == 0 && Lexical.readStringLiteral a.name == some value
+      | .character value => selected == 0 && Lexical.readCharacterLiteral a.name == some value
       | .bool b => selected == 0 && a.name == (if b then "true" else "false")
       | .unit => selected == 0 && a.name == "unit"
       | e => checkPrimitive selected e

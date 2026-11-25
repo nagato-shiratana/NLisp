@@ -36,6 +36,54 @@ def Primitive.type : Primitive → Ty
   | .toFloat => .fn .integer .floating
   | .truncate => .fn .floating (.option .integer)
 
+/-- Signed integer division used by the `quotient` builtin. The magnitude
+division is Nat division and the sign is applied afterward, so negative
+operands truncate toward zero as GMP's `mpz_tdiv_q` does. This function is
+only observed through `integerOptional` when the divisor is nonzero. -/
+def truncQuotient (left right : Int) : Int :=
+  let magnitude := Int.ofNat (left.natAbs / right.natAbs)
+  if (left < 0) = (right < 0) then magnitude else -magnitude
+
+/-- Integer option-valued builtin semantics. Division by zero returns None;
+remainder is defined from the same truncating quotient, matching `mpz_tdiv_r`
+and fixing the remainder sign to the dividend. -/
+def integerOptional (operation : Primitive) (left right : Int) : Option Int :=
+  if right = 0 then none else
+    match operation with
+    | .quotient => some (truncQuotient left right)
+    | .remainder => some (left - truncQuotient left right * right)
+    | _ => none
+
+theorem integerOptional_quotient_defined_iff (left right : Int) :
+    (integerOptional .quotient left right).isSome = true ↔ right ≠ 0 := by
+  by_cases h : right = 0 <;> simp [integerOptional, h]
+
+theorem integerOptional_remainder_defined_iff (left right : Int) :
+    (integerOptional .remainder left right).isSome = true ↔ right ≠ 0 := by
+  by_cases h : right = 0 <;> simp [integerOptional, h]
+
+theorem integerOptional_remainder_equation (left right : Int) (nonzero : right ≠ 0) :
+    integerOptional .remainder left right =
+      some (left - truncQuotient left right * right) := by
+  simp [integerOptional, nonzero]
+
+/-- For every nonzero divisor, quotient and remainder are both present and
+reconstruct the dividend with the C/GMP truncation convention. -/
+theorem integerOptional_division_equation (left right : Int) (nonzero : right ≠ 0) :
+    ∃ quotient remainder,
+      integerOptional .quotient left right = some quotient ∧
+      integerOptional .remainder left right = some remainder ∧
+      left = quotient * right + remainder := by
+  refine ⟨truncQuotient left right, left - truncQuotient left right * right,
+    ?_, ?_, ?_⟩
+  · simp [integerOptional, nonzero]
+  · exact integerOptional_remainder_equation left right nonzero
+  · calc
+      left = left - truncQuotient left right * right + truncQuotient left right * right :=
+        (Int.sub_add_cancel left (truncQuotient left right * right)).symm
+      _ = truncQuotient left right * right +
+          (left - truncQuotient left right * right) := Int.add_comm _ _
+
 inductive Member : List Ty → Nat → Ty → Prop where
   | zero : Member (t :: Γ) 0 t
   | succ : Member Γ n t → Member (u :: Γ) (n + 1) t

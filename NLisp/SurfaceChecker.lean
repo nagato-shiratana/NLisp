@@ -11,7 +11,7 @@ def checkWF : Nat → (count : Nat) → (t : Ty) → Option (PLift (t.wellFormed
   | 0, _, _ => none
   | fuel + 1, count, t =>
     match t with
-    | .boolean | .integer | .unit => some ⟨True.intro⟩
+    | .boolean | .integer | .float | .string | .character | .unit => some ⟨True.intro⟩
     | .var i => if h : i < count then some ⟨by simpa [Ty.wellFormed] using h⟩ else none
     | .fn args result => do
       let a ← checkTypesWF fuel count args
@@ -74,6 +74,15 @@ def infer : Nat → (globals : List Signature) → (count : Nat) → (context : 
         else none
     | .bool _ => some ⟨.boolean, .bool⟩
     | .int _ => some ⟨.integer, .int⟩
+    | .float _ => some ⟨.float, .float⟩
+    | .string _ => some ⟨.string, .string⟩
+    | .character _ => some ⟨.character, .character⟩
+    | .floatBin op left right => do
+      let leftType ← infer fuel globals count context left
+      let rightType ← infer fuel globals count context right
+      let leftProof ← leftType.expect .float
+      let rightProof ← rightType.expect .float
+      pure ⟨.float, .floatBin leftProof.down rightProof.down⟩
     | .unit => some ⟨.unit, .unit⟩
     | .lam parameters result body => do
       let params ← checkTypesWF fuel count parameters
@@ -204,6 +213,7 @@ def elaborate (fuel : Nat) (globals : List Signature) (count : Nat) (context : L
   let result ← infer fuel globals count context expression
   let proof ← result.expect expected
   pure ⟨expression, proof.down⟩
+
 
 theorem infer_sound (result : Inferred globals count context expression) :
     HasType globals count context expression result.type := result.typing

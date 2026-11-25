@@ -14,6 +14,119 @@ def findName : List Entry → String → Option Entry
   | [], _ => none
   | entry :: tail, name => if name = entry.name then some entry else findName tail name
 
+/- Costed form of the same immutable-environment lookup. One unit is charged
+for each entry whose name is compared, including a successful final lookup. -/
+def findNameWithCost : List Entry → String → Option Entry × Nat
+  | [], _ => (none, 0)
+  | entry :: tail, name =>
+      if name = entry.name then (some entry, 1)
+      else
+        let (found, cost) := findNameWithCost tail name
+        (found, cost + 1)
+
+theorem findNameWithCost_result (environment : List Entry) (name : String) :
+    (findNameWithCost environment name).1 = findName environment name := by
+  induction environment with
+  | nil => rfl
+  | cons entry tail ih =>
+      by_cases equal : name = entry.name <;> simp [findNameWithCost, findName, equal, ih]
+
+theorem findNameWithCost_le_length (environment : List Entry) (name : String) :
+    (findNameWithCost environment name).2 ≤ environment.length := by
+  induction environment with
+  | nil => simp [findNameWithCost]
+  | cons entry tail ih =>
+      by_cases equal : name = entry.name
+      · simp [findNameWithCost, equal]
+      · simp only [findNameWithCost, if_neg equal]
+        simp only [List.length_cons]
+        omega
+
+/- A conservative strcmp cost: one byte comparison per byte in either string,
+plus the terminating NUL comparison. The bound deliberately ignores early
+mismatches, so it is compositional over a linked-list scan. -/
+def findNameWithByteCost : List Entry → String → Option Entry × Nat
+  | [], _ => (none, 0)
+  | entry :: tail, name =>
+      let comparisonCost := name.toUTF8.data.size + entry.name.toUTF8.data.size + 1
+      if name = entry.name then (some entry, comparisonCost)
+      else
+        let (found, cost) := findNameWithByteCost tail name
+        (found, cost + comparisonCost)
+
+theorem findNameWithByteCost_result (environment : List Entry) (name : String) :
+    (findNameWithByteCost environment name).1 = findName environment name := by
+  induction environment with
+  | nil => rfl
+  | cons entry tail ih =>
+      by_cases equal : name = entry.name <;>
+        simp [findNameWithByteCost, findName, equal, ih]
+
+theorem findNameWithByteCost_le_lengths (environment : List Entry) (name : String) :
+    (findNameWithByteCost environment name).2 ≤
+      environment.foldr
+        (fun entry rest => name.toUTF8.data.size + entry.name.toUTF8.data.size + 1 + rest) 0 := by
+  induction environment with
+  | nil => simp [findNameWithByteCost]
+  | cons entry tail ih =>
+      let comparisonCost := name.toUTF8.data.size + entry.name.toUTF8.data.size + 1
+      by_cases equal : name = entry.name
+      · simp [findNameWithByteCost, comparisonCost, equal, List.foldr]
+        omega
+      · simp only [findNameWithByteCost, if_neg equal]
+        simp only [List.foldr]
+        omega
+
+/- C's runtime keeps the linked RBind environment fixed while initializer
+results mutate the Value pointer stored in a selected cell. Model the cells by
+identity and the mutable payload separately from name resolution. -/
+abbrev CellStore (α : Type) := Nat → Option α
+
+def writeCell {α : Type} (store : CellStore α) (identity : Nat) (value : α) : CellStore α :=
+  fun queried => if queried = identity then some value else store queried
+
+def readName {α : Type} (environment : List Entry) (store : CellStore α) (name : String) :
+    Option α :=
+  (findName environment name).bind (fun entry => store entry.identity)
+
+theorem readName_after_cell_write {α : Type} (environment : List Entry)
+    (store : CellStore α) (name : String) (entry : Entry) (value : α)
+    (selected : findName environment name = some entry) :
+    readName environment (writeCell store entry.identity value) name = some value := by
+  simp [readName, selected, writeCell]
+
+/-- Updating a different RBind cell cannot change the value selected by C's
+front-to-back name search. This is the frame property for shared-cell writes. -/
+theorem readName_after_other_cell_write {α : Type} (environment : List Entry)
+    (store : CellStore α) (name : String) (entry : Entry)
+    (writtenIdentity : Nat) (value : α)
+    (selected : findName environment name = some entry)
+    (different : writtenIdentity ≠ entry.identity) :
+    readName environment (writeCell store writtenIdentity value) name =
+      readName environment store name := by
+  have selectedCell : entry.identity ≠ writtenIdentity := Ne.symm different
+  simp [readName, selected, writeCell, selectedCell]
+
+/-- Closures keep the same captured name environment when another global
+initializer commits its cell; names resolved to different identities retain
+their prior payload. -/
+theorem captured_environment_other_cell_write
+    {α : Type} (capturedEnvironment : List Entry) (store : CellStore α)
+    (name : String) (entry : Entry) (writtenIdentity : Nat) (value : α)
+    (selected : findName capturedEnvironment name = some entry)
+    (different : writtenIdentity ≠ entry.identity) :
+    readName capturedEnvironment (writeCell store writtenIdentity value) name =
+      readName capturedEnvironment store name :=
+  readName_after_other_cell_write capturedEnvironment store name entry
+    writtenIdentity value selected different
+
+theorem captured_environment_reads_later_cell_value
+    {α : Type} (capturedEnvironment : List Entry) (store : CellStore α)
+    (name : String) (entry : Entry) (value : α)
+    (selected : findName capturedEnvironment name = some entry) :
+    readName capturedEnvironment (writeCell store entry.identity value) name = some value :=
+  readName_after_cell_write capturedEnvironment store name entry value selected
+
 inductive Resolves : List Entry → String → Entry → Prop where
   | here : name = entry.name → Resolves (entry :: tail) name entry
   | there : name ≠ other.name → Resolves tail name entry → Resolves (other :: tail) name entry
@@ -81,6 +194,26 @@ theorem observations_correspond (environment : List Entry) (observations : List 
   have all := List.all_eq_true.mp accepted
   exact checked_lookup_corresponds environment observation.name observation.selected
     (of_decide_eq_true (all observation member)) interpret
+
+/- Recompute every observation lookup with an explicit byte-comparison cost.
+The result is the same conjunction as `checkObservations`; the cost is in bits
+(eight units per conservative UTF-8 byte comparison). -/
+def checkObservationsWithCost (environment : List Entry) :
+    List Observation → Bool × Nat
+  | [] => (true, 0)
+  | observation :: rest =>
+      let (tailAccepted, tailCost) := checkObservationsWithCost environment rest
+      let (found, lookupCost) := findNameWithByteCost environment observation.name
+      (decide (found = some observation.selected) && tailAccepted, 8 * lookupCost + tailCost)
+
+theorem checkObservationsWithCost_result (environment : List Entry)
+    (observations : List Observation) :
+    (checkObservationsWithCost environment observations).1 =
+      checkObservations environment observations := by
+  induction observations with
+  | nil => rfl
+  | cons observation rest ih =>
+      simp [checkObservationsWithCost, checkObservations, findNameWithByteCost_result, ih]
 
 theorem shadowed_binding_not_selected
     (first second : Entry) (tail : List Entry) (_sameName : first.name = second.name)
