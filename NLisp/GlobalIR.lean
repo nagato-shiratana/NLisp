@@ -1,4 +1,5 @@
 import NLisp.PolymorphicSafety
+import NLisp.TypedExpansion
 import NLisp.NamedDecoder
 
 namespace NLisp.GlobalIR
@@ -661,10 +662,7 @@ theorem assembleProgram_typed (definitions : Surface.Definitions)
       rw [indexEq, getterEntry] at runtimeEntry
       have definitionsEq := Option.some.inj runtimeEntry
       have slotEq : slotIndex = slot := by
-        have := congrArg (fun definition => match definition with
-          | .function _ => 0
-          | .getter getterIndex => getterIndex) definitionsEq
-        exact this
+        exact Definition.getter.inj definitionsEq
       subst slot
       obtain ⟨type, slotEntry⟩ := lookup_exists_of_lt slotTypes slotIndex slotBound
       refine ⟨type, ?_, sourceTyped.slot_wellFormed slotIndex type slotEntry, slotEntry⟩
@@ -1160,6 +1158,51 @@ theorem evaluate_floatBin_of_children (program : List Definition) (store : Store
       .ok (.float (floatBinValue operation x y)) := by
   simp [evaluate, floatBinValue, leftEvaluates, rightEvaluates, bind, Except.bind, Except.pure, pure]
 
+/-- Exact fault order for a floating binary operation: evaluate the left
+operand, then the right operand, then check that both results are Float. -/
+theorem evaluate_floatBin_error_iff (program : List Definition) (store : Store)
+    (operation : Surface.FloatBinOp) (fuel : Nat) (environment : List Value)
+    (left right : Term) (fault : Fault) :
+    evaluate program store (fuel + 1) environment (.floatBin operation left right) =
+        .error fault ↔
+      (∃ leftFault,
+        evaluate program store fuel environment left = .error leftFault ∧ fault = leftFault) ∨
+      (∃ leftValue rightFault,
+        evaluate program store fuel environment left = .ok leftValue ∧
+        evaluate program store fuel environment right = .error rightFault ∧ fault = rightFault) ∨
+      (∃ leftValue rightValue,
+        evaluate program store fuel environment left = .ok leftValue ∧
+        evaluate program store fuel environment right = .ok rightValue ∧
+        (¬ ∃ x y, leftValue = .float x ∧ rightValue = .float y) ∧
+        fault = .core .wrongShape) := by
+  simp only [evaluate, bind, Except.bind, pure, Except.pure]
+  cases leftResult : evaluate program store fuel environment left with
+  | error leftFault => simp [leftResult, eq_comm]
+  | ok leftValue =>
+      cases rightResult : evaluate program store fuel environment right with
+      | error rightFault => simp [leftResult, rightResult, eq_comm]
+      | ok rightValue =>
+          cases leftValue <;> cases rightValue <;> simp [leftResult, rightResult, eq_comm]
+
+/-- Characterization of successful Float binary operations. -/
+theorem evaluate_floatBin_success_iff (program : List Definition) (store : Store)
+    (operation : Surface.FloatBinOp) (fuel : Nat) (environment : List Value)
+    (left right : Term) (result : Value) :
+    evaluate program store (fuel + 1) environment (.floatBin operation left right) = .ok result ↔
+      ∃ x y,
+        evaluate program store fuel environment left = .ok (.float x) ∧
+        evaluate program store fuel environment right = .ok (.float y) ∧
+        result = .float (floatBinValue operation x y) := by
+  simp only [evaluate, bind, Except.bind, pure, Except.pure]
+  cases leftResult : evaluate program store fuel environment left with
+  | error fault => simp [leftResult]
+  | ok leftValue =>
+      cases rightResult : evaluate program store fuel environment right with
+      | error fault => simp [leftResult, rightResult]
+      | ok rightValue =>
+          cases leftValue <;> cases rightValue <;>
+            simp [leftResult, rightResult, floatBinValue, eq_comm]
+
 theorem evaluate_floatBin_typed_of_children (globals : List Surface.Signature)
     (program : List Definition) (store : Store) (environment : List Value)
     (fuel : Nat) (operation : Surface.FloatBinOp) (left right : Term)
@@ -1217,6 +1260,447 @@ theorem evaluate_le_typed_of_children (globals : List Surface.Signature)
   exact ⟨evaluate_le_of_children program store environment fuel left right x y
     leftEvaluates rightEvaluates, .bool⟩
 
+inductive IntegerOptionalOperation where
+  | quotient
+  | remainder
+  deriving DecidableEq, Repr
+
+def IntegerOptionalOperation.toPrimitive : IntegerOptionalOperation → TypedExpansion.Primitive
+  | .quotient => .quotient
+  | .remainder => .remainder
+
+def IntegerOptionalOperation.evaluate (operation : IntegerOptionalOperation)
+    (left right : Int) : Option Int :=
+  TypedExpansion.integerOptional operation.toPrimitive left right
+
+/- Convert the independent integer builtin specification to the runtime
+Option representation. -/
+def integerOptionalRuntimeValue (operation : TypedExpansion.Primitive)
+    (left right : Int) : Value :=
+  match TypedExpansion.integerOptional operation left right with
+  | none => .none
+  | some value => .some (.int value)
+
+/-- Every result of the specified quotient/remainder operation has the
+runtime Option Integer type, including the zero-divisor `none` case. -/
+theorem integerOptionalRuntimeValue_typed (globals : List Surface.Signature)
+    (operation : TypedExpansion.Primitive) (left right : Int) :
+    PolyIR.ValueTyped globals (integerOptionalRuntimeValue operation left right)
+      (.option .integer) := by
+  unfold integerOptionalRuntimeValue
+  cases TypedExpansion.integerOptional operation left right with
+  | none => exact .none
+  | some value => exact .some .int
+
+/-- Operational contract for a native integer quotient/remainder call after
+its two IR arguments are evaluated. `GlobalIR.Term` currently represents
+native builtins through the definition table, so this rule is kept explicit
+until builtin values are represented directly in that IR. -/
+def evaluateIntegerOptionalCall (program : List Definition) (store : Store)
+    (operation : IntegerOptionalOperation) : Nat → List Value → Term → Term →
+      Except Fault Value
+  | 0, _, _, _ => .error (.core .outOfFuel)
+  | fuel + 1, environment, left, right => do
+      let leftValue ← evaluate program store fuel environment left
+      let rightValue ← evaluate program store fuel environment right
+      match leftValue, rightValue with
+      | .int x, .int y => pure (integerOptionalRuntimeValue operation.toPrimitive x y)
+      | _, _ => .error (.core .wrongShape)
+
+/-- Runtime value specified for the registered `to-float` primitive. The
+integer-to-binary64 rounding correspondence with C's GMP helper is a separate
+numeric refinement obligation. -/
+def integerToFloatRuntimeValue (integer : Int) : Value :=
+  .float (Float.ofInt integer)
+
+theorem integerToFloatRuntimeValue_typed (globals : List Surface.Signature)
+    (integer : Int) :
+    PolyIR.ValueTyped globals (integerToFloatRuntimeValue integer) .float := by
+  exact .float
+
+/-- Operational contract for the unary native integer-to-float call after its
+operand is evaluated. As with the other native helpers, this models the
+registered builtin until native closures are represented in `GlobalIR.Term`. -/
+def evaluateIntegerToFloatCall (program : List Definition) (store : Store) :
+    Nat → List Value → Term → Except Fault Value
+  | 0, _, _ => .error (.core .outOfFuel)
+  | fuel + 1, environment, operand => do
+      let value ← evaluate program store fuel environment operand
+      match value with
+      | .int integer => pure (integerToFloatRuntimeValue integer)
+      | _ => .error (.core .wrongShape)
+
+theorem evaluateIntegerToFloatCall_of_integer_child
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (fuel : Nat) (environment : List Value) (operand : Term) (integer : Int)
+    (operandEvaluates : evaluate program store fuel environment operand = .ok (.int integer)) :
+    evaluateIntegerToFloatCall program store (fuel + 1) environment operand =
+        .ok (integerToFloatRuntimeValue integer) ∧
+      PolyIR.ValueTyped globals (integerToFloatRuntimeValue integer) .float := by
+  constructor
+  · simp [evaluateIntegerToFloatCall, operandEvaluates, bind, Except.bind,
+      Except.pure, pure]
+  · exact integerToFloatRuntimeValue_typed globals integer
+
+/-- Runtime value for `float-truncate` over an explicit binary64 encoding.
+This bit-oriented entry point preserves NaN payload and signed-zero cases in
+the independent numeric specification even though Lean's `Float` API does
+not expose a raw-bit reinterpretation operation. -/
+def floatTruncateRuntimeValue (bits : UInt64) : Value :=
+  match TypedExpansion.binary64Truncate bits with
+  | none => .none
+  | some integer => .some (.int integer)
+
+theorem floatTruncateRuntimeValue_typed (globals : List Surface.Signature)
+    (bits : UInt64) :
+    PolyIR.ValueTyped globals (floatTruncateRuntimeValue bits) (.option .integer) := by
+  unfold floatTruncateRuntimeValue
+  cases TypedExpansion.binary64Truncate bits with
+  | none => exact .none
+  | some integer => exact .some .int
+
+/-- Runtime model for the registered Boolean equality builtin. -/
+def evaluateBooleanEqualityValue (left right : Bool) : Value :=
+  .bool (left == right)
+
+theorem evaluateBooleanEqualityValue_typed (globals : List Surface.Signature)
+    (left right : Bool) :
+    PolyIR.ValueTyped globals (evaluateBooleanEqualityValue left right) .boolean :=
+  .bool
+
+/-- Operational contract for the binary Boolean equality builtin after its
+two operands have been evaluated. -/
+def evaluateBooleanEqualityCall (program : List Definition) (store : Store) :
+    Nat → List Value → Term → Term → Except Fault Value
+  | 0, _, _, _ => .error (.core .outOfFuel)
+  | fuel + 1, environment, left, right => do
+      let leftValue ← evaluate program store fuel environment left
+      let rightValue ← evaluate program store fuel environment right
+      match leftValue, rightValue with
+      | .bool x, .bool y => pure (evaluateBooleanEqualityValue x y)
+      | _, _ => .error (.core .wrongShape)
+
+theorem evaluateBooleanEqualityCall_of_boolean_children
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (fuel : Nat) (environment : List Value) (left right : Term) (x y : Bool)
+    (leftEvaluates : evaluate program store fuel environment left = .ok (.bool x))
+    (rightEvaluates : evaluate program store fuel environment right = .ok (.bool y)) :
+    evaluateBooleanEqualityCall program store (fuel + 1) environment left right =
+        .ok (evaluateBooleanEqualityValue x y) ∧
+      PolyIR.ValueTyped globals (evaluateBooleanEqualityValue x y) .boolean := by
+  constructor
+  · simp [evaluateBooleanEqualityCall, leftEvaluates, rightEvaluates,
+      evaluateBooleanEqualityValue, bind, Except.bind, Except.pure, pure]
+  · exact evaluateBooleanEqualityValue_typed globals x y
+
+/-- Operational contract for Boolean negation after its operand evaluates. -/
+def evaluateBooleanNotCall (program : List Definition) (store : Store) :
+    Nat → List Value → Term → Except Fault Value
+  | 0, _, _ => .error (.core .outOfFuel)
+  | fuel + 1, environment, operand => do
+      let value ← evaluate program store fuel environment operand
+      match value with
+      | .bool b => pure (.bool (!b))
+      | _ => .error (.core .wrongShape)
+
+theorem evaluateBooleanNotCall_of_boolean_child
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (fuel : Nat) (environment : List Value) (operand : Term) (value : Bool)
+    (operandEvaluates : evaluate program store fuel environment operand = .ok (.bool value)) :
+    evaluateBooleanNotCall program store (fuel + 1) environment operand = .ok (.bool (!value)) ∧
+      PolyIR.ValueTyped globals (.bool (!value)) .boolean := by
+  constructor
+  · simp [evaluateBooleanNotCall, operandEvaluates, bind, Except.bind,
+      Except.pure, pure]
+  · exact .bool
+
+/-- The five C Float comparisons. The explicit NaN guard matches IEEE/C
+ordered comparisons: every relational comparison and equality is false when
+either operand is NaN. -/
+inductive FloatComparisonOperation where
+  | lt | le | gt | ge | eq
+  deriving DecidableEq, Repr
+
+def FloatComparisonOperation.toPrimitive : FloatComparisonOperation → TypedExpansion.Primitive
+  | .lt => .flt
+  | .le => .fle
+  | .gt => .fgt
+  | .ge => .fge
+  | .eq => .floatEq
+
+def FloatComparisonOperation.evaluate (operation : FloatComparisonOperation)
+    (left right : Float) : Bool :=
+  if left.isNaN || right.isNaN then false else
+  match operation with
+  | .lt => decide (left < right)
+  | .le => decide (left ≤ right)
+  | .gt => decide (left > right)
+  | .ge => decide (left ≥ right)
+  | .eq => left == right
+
+theorem FloatComparisonOperation.evaluate_left_nan
+    (operation : FloatComparisonOperation) (left right : Float)
+    (leftNaN : left.isNaN = true) :
+    operation.evaluate left right = false := by
+  simp [FloatComparisonOperation.evaluate, leftNaN]
+
+theorem FloatComparisonOperation.evaluate_right_nan
+    (operation : FloatComparisonOperation) (left right : Float)
+    (rightNaN : right.isNaN = true) :
+    operation.evaluate left right = false := by
+  simp [FloatComparisonOperation.evaluate, rightNaN]
+
+/-- Outside the NaN case, Float comparison evaluation is exactly the selected
+IEEE/C comparison operator. -/
+theorem FloatComparisonOperation.evaluate_of_not_nan
+    (operation : FloatComparisonOperation) (left right : Float)
+    (leftNotNaN : left.isNaN = false) (rightNotNaN : right.isNaN = false) :
+    operation.evaluate left right =
+      match operation with
+      | .lt => decide (left < right)
+      | .le => decide (left ≤ right)
+      | .gt => decide (left > right)
+      | .ge => decide (left ≥ right)
+      | .eq => left == right := by
+  cases operation <;>
+    simp [FloatComparisonOperation.evaluate, leftNotNaN, rightNotNaN]
+
+def floatComparisonRuntimeValue (operation : FloatComparisonOperation)
+    (left right : Float) : Value :=
+  .bool (operation.evaluate left right)
+
+theorem FloatComparisonOperation.runtimeValue_nan
+    (operation : FloatComparisonOperation) (left right : Float)
+    (leftNaN : left.isNaN = true) :
+    floatComparisonRuntimeValue operation left right = .bool false := by
+  simp [floatComparisonRuntimeValue,
+    FloatComparisonOperation.evaluate_left_nan operation left right leftNaN]
+
+theorem floatComparisonRuntimeValue_typed (globals : List Surface.Signature)
+    (operation : FloatComparisonOperation) (left right : Float) :
+    PolyIR.ValueTyped globals (floatComparisonRuntimeValue operation left right) .boolean :=
+  .bool
+
+def evaluateFloatComparisonCall (program : List Definition) (store : Store)
+    (operation : FloatComparisonOperation) : Nat → List Value → Term → Term → Except Fault Value
+  | 0, _, _, _ => .error (.core .outOfFuel)
+  | fuel + 1, environment, left, right => do
+      let leftValue ← evaluate program store fuel environment left
+      let rightValue ← evaluate program store fuel environment right
+      match leftValue, rightValue with
+      | .float x, .float y => pure (floatComparisonRuntimeValue operation x y)
+      | _, _ => .error (.core .wrongShape)
+
+theorem evaluateFloatComparisonCall_of_float_children
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (operation : FloatComparisonOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (x y : Float)
+    (leftEvaluates : evaluate program store fuel environment left = .ok (.float x))
+    (rightEvaluates : evaluate program store fuel environment right = .ok (.float y)) :
+    evaluateFloatComparisonCall program store operation (fuel + 1) environment left right =
+        .ok (floatComparisonRuntimeValue operation x y) ∧
+      PolyIR.ValueTyped globals (floatComparisonRuntimeValue operation x y) .boolean := by
+  constructor
+  · simp [evaluateFloatComparisonCall, leftEvaluates, rightEvaluates,
+      bind, Except.bind, Except.pure, pure]
+  · exact floatComparisonRuntimeValue_typed globals operation x y
+
+/-- Exact fault order for a floating comparison: evaluate left, then right,
+then reject either non-Float value. -/
+theorem evaluateFloatComparisonCall_error_iff (program : List Definition) (store : Store)
+    (operation : FloatComparisonOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (fault : Fault) :
+    evaluateFloatComparisonCall program store operation (fuel + 1) environment left right =
+        .error fault ↔
+      (∃ leftFault,
+        evaluate program store fuel environment left = .error leftFault ∧ fault = leftFault) ∨
+      (∃ leftValue rightFault,
+        evaluate program store fuel environment left = .ok leftValue ∧
+        evaluate program store fuel environment right = .error rightFault ∧ fault = rightFault) ∨
+      (∃ leftValue rightValue,
+        evaluate program store fuel environment left = .ok leftValue ∧
+        evaluate program store fuel environment right = .ok rightValue ∧
+        (¬ ∃ x y, leftValue = .float x ∧ rightValue = .float y) ∧
+        fault = .core .wrongShape) := by
+  simp only [evaluateFloatComparisonCall, bind, Except.bind, pure, Except.pure]
+  cases leftResult : evaluate program store fuel environment left with
+  | error leftFault => simp [leftResult, eq_comm]
+  | ok leftValue =>
+      cases rightResult : evaluate program store fuel environment right with
+      | error rightFault => simp [leftResult, rightResult, eq_comm]
+      | ok rightValue =>
+          cases leftValue <;> cases rightValue <;> simp [leftResult, rightResult, eq_comm]
+
+/-- Characterization of successful Float comparison helper calls for arbitrary
+operand terms. A result is successful exactly when both terms evaluate to
+Float values, in left-to-right evaluator order. -/
+theorem evaluateFloatComparisonCall_success_iff (program : List Definition) (store : Store)
+    (operation : FloatComparisonOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (result : Value) :
+    evaluateFloatComparisonCall program store (operation) (fuel + 1) environment left right =
+        .ok result ↔
+      ∃ x y,
+        evaluate program store fuel environment left = .ok (.float x) ∧
+        evaluate program store fuel environment right = .ok (.float y) ∧
+        result = floatComparisonRuntimeValue operation x y := by
+  simp only [evaluateFloatComparisonCall, bind, Except.bind, pure, Except.pure]
+  cases leftResult : evaluate program store fuel environment left with
+  | error leftFault => simp [leftResult]
+  | ok leftValue =>
+      cases rightResult : evaluate program store fuel environment right with
+      | error rightFault => simp [leftResult, rightResult]
+      | ok rightValue =>
+          cases leftValue <;> cases rightValue <;>
+            simp [leftResult, rightResult, floatComparisonRuntimeValue, eq_comm]
+
+/-- Every successful Float comparison helper result has Boolean type, even
+when no assumptions are made about the operand terms. -/
+theorem evaluateFloatComparisonCall_preserves_type (globals : List Surface.Signature)
+    (program : List Definition) (store : Store) (operation : FloatComparisonOperation)
+    (fuel : Nat) (environment : List Value) (left right : Term) (result : Value)
+    (success : evaluateFloatComparisonCall program store operation fuel environment left right =
+      .ok result) :
+    PolyIR.ValueTyped globals result .boolean := by
+  cases fuel with
+  | zero => simp [evaluateFloatComparisonCall] at success
+  | succ remaining =>
+      obtain ⟨x, y, leftEvaluates, rightEvaluates, resultEq⟩ :=
+        (evaluateFloatComparisonCall_success_iff program store operation remaining
+          environment left right result).mp (by simpa using success)
+      rw [resultEq]
+      exact floatComparisonRuntimeValue_typed globals operation x y
+
+/-- The native Option-valued integer call evaluates to the shared runtime
+result and preserves its Option Integer type whenever both integer operands
+evaluate successfully. -/
+theorem evaluateIntegerOptionalCall_of_integer_children
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (operation : IntegerOptionalOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (x y : Int)
+    (leftEvaluates : evaluate program store fuel environment left = .ok (.int x))
+    (rightEvaluates : evaluate program store fuel environment right = .ok (.int y)) :
+    evaluateIntegerOptionalCall program store operation (fuel + 1) environment left right =
+        .ok (integerOptionalRuntimeValue operation.toPrimitive x y) ∧
+      PolyIR.ValueTyped globals (integerOptionalRuntimeValue operation.toPrimitive x y)
+        (.option .integer) := by
+  constructor
+  · cases operation <;>
+      simp [evaluateIntegerOptionalCall, IntegerOptionalOperation.evaluate,
+        integerOptionalRuntimeValue, leftEvaluates, rightEvaluates,
+        bind, Except.bind, pure, Except.pure, TypedExpansion.integerOptional]
+  · exact integerOptionalRuntimeValue_typed globals operation.toPrimitive x y
+
+/-- The native quotient/remainder call reports an error from evaluating its
+left operand without evaluating or replacing that error. -/
+theorem evaluateIntegerOptionalCall_left_error
+    (program : List Definition) (store : Store)
+    (operation : IntegerOptionalOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (fault : Fault)
+    (leftFails : evaluate program store fuel environment left = .error fault) :
+    evaluateIntegerOptionalCall program store operation (fuel + 1) environment left right =
+      .error fault := by
+  simp [evaluateIntegerOptionalCall, leftFails, bind, Except.bind]
+
+/-- Once the left operand has evaluated to an integer, a right-operand fault
+is propagated unchanged by the Option-valued integer operation. -/
+theorem evaluateIntegerOptionalCall_right_error
+    (program : List Definition) (store : Store)
+    (operation : IntegerOptionalOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (x : Int) (fault : Fault)
+    (leftEvaluates : evaluate program store fuel environment left = .ok (.int x))
+    (rightFails : evaluate program store fuel environment right = .error fault) :
+    evaluateIntegerOptionalCall program store operation (fuel + 1) environment left right =
+      .error fault := by
+  simp [evaluateIntegerOptionalCall, leftEvaluates, rightFails, bind, Except.bind]
+
+/-- If both operands evaluate successfully but at least one is not an
+integer, the native operation reports the evaluator's wrong-shape fault. -/
+theorem evaluateIntegerOptionalCall_wrong_shape
+    (program : List Definition) (store : Store)
+    (operation : IntegerOptionalOperation) (fuel : Nat) (environment : List Value)
+    (left right : Term) (leftValue rightValue : Value)
+    (leftEvaluates : evaluate program store fuel environment left = .ok leftValue)
+    (rightEvaluates : evaluate program store fuel environment right = .ok rightValue)
+    (wrongShape : ¬ ∃ x y, leftValue = .int x ∧ rightValue = .int y) :
+    evaluateIntegerOptionalCall program store operation (fuel + 1) environment left right =
+      .error (.core .wrongShape) := by
+  simp [evaluateIntegerOptionalCall, leftEvaluates, rightEvaluates, bind, Except.bind]
+  cases leftValue <;> cases rightValue <;> simp_all
+
+/-- Exact success characterization for the Option-valued integer call helper.
+It succeeds precisely when both operands evaluate to integers, and returns
+the shared Option semantics for those values. -/
+theorem evaluateIntegerOptionalCall_success_iff
+    (program : List Definition) (store : Store) (operation : IntegerOptionalOperation)
+    (fuel : Nat) (environment : List PolyIR.Value) (left right : PolyIR.Term)
+    (result : PolyIR.Value) :
+    evaluateIntegerOptionalCall program store operation (fuel + 1) environment left right =
+        .ok result ↔
+      ∃ x y, evaluate program store fuel environment left = .ok (.int x) ∧
+        evaluate program store fuel environment right = .ok (.int y) ∧
+        result = integerOptionalRuntimeValue operation.toPrimitive x y := by
+  simp only [evaluateIntegerOptionalCall, bind, Except.bind, pure, Except.pure]
+  cases leftResult : evaluate program store fuel environment left with
+  | error fault => simp [leftResult]
+  | ok leftValue =>
+      cases rightResult : evaluate program store fuel environment right with
+      | error fault => simp [leftResult, rightResult]
+      | ok rightValue =>
+          cases leftValue <;> cases rightValue <;>
+            simp [leftResult, rightResult, integerOptionalRuntimeValue, eq_comm]
+
+/-- Exact error classification for the Option-valued integer call helper.
+The helper evaluates the left operand, then the right operand, and only then
+checks their runtime shapes. -/
+theorem evaluateIntegerOptionalCall_error_iff
+    (program : List Definition) (store : Store) (operation : IntegerOptionalOperation)
+    (fuel : Nat) (environment : List PolyIR.Value) (left right : PolyIR.Term)
+    (fault : Fault) :
+    evaluateIntegerOptionalCall program store operation (fuel + 1) environment left right =
+        .error fault ↔
+      (∃ leftFault, evaluate program store fuel environment left = .error leftFault ∧
+        fault = leftFault) ∨
+      (∃ leftValue rightFault, evaluate program store fuel environment left = .ok leftValue ∧
+        evaluate program store fuel environment right = .error rightFault ∧
+        fault = rightFault) ∨
+      (∃ leftValue rightValue, evaluate program store fuel environment left = .ok leftValue ∧
+        evaluate program store fuel environment right = .ok rightValue ∧
+        (¬ ∃ x y, leftValue = .int x ∧ rightValue = .int y) ∧ fault = .core .wrongShape) := by
+  simp only [evaluateIntegerOptionalCall, bind, Except.bind, pure, Except.pure]
+  cases leftResult : evaluate program store fuel environment left with
+  | error leftFault => simp [leftResult, eq_comm]
+  | ok leftValue =>
+      cases rightResult : evaluate program store fuel environment right with
+      | error rightFault => simp [leftResult, rightResult, eq_comm]
+      | ok rightValue =>
+          cases leftValue <;> cases rightValue <;>
+            simp [leftResult, rightResult, eq_comm]
+
+/-- Zero fuel is the sole out-of-fuel case of this helper. -/
+theorem evaluateIntegerOptionalCall_zero_fuel
+    (program : List Definition) (store : Store) (operation : IntegerOptionalOperation)
+    (environment : List PolyIR.Value) (left right : PolyIR.Term) :
+    evaluateIntegerOptionalCall program store operation 0 environment left right =
+      .error (.core .outOfFuel) := rfl
+
+/-- Any successful result of the standalone Option-valued integer call
+helper has type Option Integer, for arbitrary operand terms. -/
+theorem evaluateIntegerOptionalCall_preserves_type
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (operation : IntegerOptionalOperation) (fuel : Nat)
+    (environment : List PolyIR.Value) (left right : PolyIR.Term) (result : PolyIR.Value)
+    (success : evaluateIntegerOptionalCall program store operation fuel environment left right =
+      .ok result) :
+    PolyIR.ValueTyped globals result (.option .integer) := by
+  obtain ⟨leftInteger, rightInteger, leftEvaluates, rightEvaluates, resultEq⟩ :=
+    (evaluateIntegerOptionalCall_success_iff program store operation (fuel - 1)
+      environment left right result).mp (by
+        cases fuel with
+        | zero => simp [evaluateIntegerOptionalCall] at success
+        | succ remaining => simpa using success)
+  rw [resultEq]
+  exact integerOptionalRuntimeValue_typed globals operation.toPrimitive leftInteger rightInteger
+
 theorem evaluate_intEq_typed_of_children (globals : List Surface.Signature)
     (program : List Definition) (store : Store) (environment : List Value)
     (fuel : Nat) (left right : Term) (x y : Int)
@@ -1272,6 +1756,19 @@ theorem evaluate_typed_var_preserves_type (globals : List Surface.Signature)
   | var typeFound =>
       exact evaluate_var_preserves_type globals assignment context program store fuel index
         environment value type environmentTyped typeFound success
+
+/-- Float literals are preserved by the complete GlobalIR evaluator for every
+positive fuel, independently of the store and environment. This isolates the
+binary64 payload from the polymorphic type valuation: the evaluator returns
+the same float bits and the typing rule assigns the fixed `float` type. -/
+theorem evaluate_float_literal_preserves_type
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (fuel : Nat) (environment : List Value) (number : Float) :
+    evaluate program store (fuel + 1) environment (.float number) = .ok (.float number) ∧
+      ValueTyped globals (.float number) .float := by
+  constructor
+  · simp [evaluate, Pure.pure, Except.pure]
+  · exact .float
 
 /-- The integer-literal/arithmetic fragment has evaluator type preservation
 without assumptions on the program, store, or environment. This is the
@@ -1768,6 +2265,119 @@ inductive ContextualGlobalArithmeticTerms (globals : List Surface.Signature)
       ContextualGlobalArithmeticTerms globals assignment context (type :: types)
         (term :: terms)
 
+/-- A typed runtime fragment that adds lowered value reads to the existing
+global arithmetic/function-reference fragment. Getter references are the
+zero-argument applications emitted by `lowerGlobalReads`. -/
+inductive ContextualGlobalRuntimeTerm (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) (context : List Surface.Ty) : Term → Surface.Ty → Prop where
+  | arithmetic {term type} :
+      ContextualGlobalArithmeticTerm globals assignment context term type →
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes functionSources
+        program context term type
+  | getter {index slot type} :
+      program[index]? = some (.getter slot) →
+      globals[index]? = some ⟨0, [], type⟩ →
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes functionSources
+        program context (.app (.global index) []) type
+  | lambdaApplication {parameters : List Nat} {arguments : List Term}
+      {argumentTypes : List Surface.Ty} {body : Term} {resultType : Surface.Ty} :
+      ContextualGlobalArithmeticTerms globals assignment context argumentTypes arguments →
+      argumentTypes.length = parameters.length →
+      ContextualGlobalArithmeticTerm globals assignment (argumentTypes ++ context)
+        body (Surface.interpret assignment resultType) →
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes functionSources
+        program context (.app (.lam parameters.length body) arguments)
+        (Surface.interpret assignment resultType)
+
+/-- Sequences may mix arithmetic/global-reference terms with lowered getter
+reads; as with the ordinary global sequence fragment, the final term fixes
+the result type. -/
+inductive ContextualGlobalRuntimeSequence (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) (context : List Surface.Ty) :
+    List Term → Surface.Ty → Prop where
+  | last : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program context term type →
+      ContextualGlobalRuntimeSequence globals assignment definitions slotTypes
+        functionSources program context [term] type
+  | skip : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program context first firstType →
+      ContextualGlobalRuntimeSequence globals assignment definitions slotTypes
+        functionSources program context rest resultType →
+      ContextualGlobalRuntimeSequence globals assignment definitions slotTypes
+        functionSources program context (first :: rest) resultType
+
+inductive ContextualGlobalRuntimeTerms (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) (context : List Surface.Ty) :
+    List Surface.Ty → List Term → Prop where
+  | nil : ContextualGlobalRuntimeTerms globals assignment definitions slotTypes
+      functionSources program context [] []
+  | cons : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program context term (Surface.interpret assignment type) →
+      ContextualGlobalRuntimeTerms globals assignment definitions slotTypes
+        functionSources program context types terms →
+      ContextualGlobalRuntimeTerms globals assignment definitions slotTypes
+        functionSources program context (type :: types) (term :: terms)
+
+inductive ContextualGlobalRuntimeIntegerOptionalCall (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) (context : List Surface.Ty) :
+    IntegerOptionalOperation → Term → Term → Prop where
+  | mk (operation : IntegerOptionalOperation) (left right : Term) :
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+        functionSources program context left .integer →
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+        functionSources program context right .integer →
+      ContextualGlobalRuntimeIntegerOptionalCall globals assignment definitions slotTypes
+        functionSources program context operation left right
+
+/-- Runtime typing for Float comparisons whose operands may read initialized
+global value slots through generated getters. -/
+inductive ContextualGlobalRuntimeFloatComparisonCall (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) (context : List Surface.Ty) :
+    FloatComparisonOperation → Term → Term → Prop where
+  | mk (operation : FloatComparisonOperation) (left right : Term) :
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+        functionSources program context left .float →
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+        functionSources program context right .float →
+      ContextualGlobalRuntimeFloatComparisonCall globals assignment definitions slotTypes
+        functionSources program context operation left right
+
+/-- Runtime typing for Float arithmetic over operands that may include global
+getter reads. -/
+inductive ContextualGlobalRuntimeFloatBinCall (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) (context : List Surface.Ty) :
+    Surface.FloatBinOp → Term → Term → Prop where
+  | mk (operation : Surface.FloatBinOp) (left right : Term) :
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+        functionSources program context left .float →
+      ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+        functionSources program context right .float →
+      ContextualGlobalRuntimeFloatBinCall globals assignment definitions slotTypes
+        functionSources program context operation left right
+
+/-- Contextual typing for the native Option-valued integer operations. Their
+runtime boundary is `evaluateIntegerOptionalCall`, which evaluates both
+integer operands and represents division by zero as `none`. -/
+inductive ContextualGlobalIntegerOptionalCall (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (context : List Surface.Ty) :
+    IntegerOptionalOperation → Term → Term → Prop where
+  | mk (operation : IntegerOptionalOperation) (left right : Term) :
+      ContextualGlobalArithmeticTerm globals assignment context left .integer →
+      ContextualGlobalArithmeticTerm globals assignment context right .integer →
+      ContextualGlobalIntegerOptionalCall globals assignment context operation left right
+
 /-- Pointwise contextual typing for the initializer list of a parallel let.
 Each initializer is checked in the original context, matching `letMany`
 evaluation; the resulting types are prepended to the body's context. -/
@@ -1788,6 +2398,15 @@ inductive ContextualArithmeticSequence (globals : List Surface.Signature) (assig
   | skip : ContextualArithmeticTerm globals assignment context first firstType →
       ContextualArithmeticSequence globals assignment context rest resultType →
       ContextualArithmeticSequence globals assignment context (first :: rest) resultType
+
+inductive ContextualGlobalArithmeticSequence (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (context : List Surface.Ty) :
+    List Term → Surface.Ty → Prop where
+  | last : ContextualGlobalArithmeticTerm globals assignment context term type →
+      ContextualGlobalArithmeticSequence globals assignment context [term] type
+  | skip : ContextualGlobalArithmeticTerm globals assignment context first firstType →
+      ContextualGlobalArithmeticSequence globals assignment context rest resultType →
+      ContextualGlobalArithmeticSequence globals assignment context (first :: rest) resultType
 
 /-- Successful evaluation preserves types for closed arithmetic terms plus
 typed local variables and one-binding lets whose body may use the new binder. -/
@@ -2198,6 +2817,54 @@ theorem evaluate_contextualGlobalArithmeticTerm_preserves_type
       cases success
       exact valueTyped
 
+/-- A successful typed contextual quotient/remainder call has integer-typed
+operands and an Option Integer result. This connects the native call helper
+to the same contextual fragment used for GlobalIR function bodies. -/
+theorem evaluate_contextualGlobalIntegerOptionalCall_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (operation : IntegerOptionalOperation) (left right : Term)
+    (typing : ContextualGlobalIntegerOptionalCall globals assignment context operation left right)
+    (result : Value)
+    (success : evaluateIntegerOptionalCall program store operation fuel environment left right =
+      .ok result) :
+    PolyIR.ValueTyped globals result (.option .integer) ∧
+      ∃ leftValue rightValue,
+        evaluate program store (fuel - 1) environment left = .ok leftValue ∧
+        evaluate program store (fuel - 1) environment right = .ok rightValue ∧
+        PolyIR.ValueTyped globals leftValue .integer ∧
+        PolyIR.ValueTyped globals rightValue .integer := by
+  cases fuel with
+  | zero => simp [evaluateIntegerOptionalCall] at success
+  | succ fuel =>
+      obtain ⟨leftInteger, rightInteger, leftEval, rightEval, resultEq⟩ :=
+        (evaluateIntegerOptionalCall_success_iff program store operation fuel environment
+          left right result).mp (by simpa using success)
+      cases typing with
+      | mk leftTyping rightTyping =>
+          have leftTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped
+            store context fuel environment environmentTyped left .integer leftTyping
+            (.int leftInteger) leftEval
+          have rightTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped
+            store context fuel environment environmentTyped right .integer rightTyping
+            (.int rightInteger) rightEval
+          refine ⟨?_, .int leftInteger, .int rightInteger, ?_, ?_, ?_, ?_⟩
+          · rw [resultEq]
+            exact integerOptionalRuntimeValue_typed globals operation.toPrimitive
+              leftInteger rightInteger
+          · exact leftEval
+          · exact rightEval
+          · exact leftTyped
+          · exact rightTyped
+
 theorem evaluate_contextualGlobalArithmeticTerms_preserves_type
     (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
     (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
@@ -2242,6 +2909,164 @@ theorem evaluate_contextualGlobalArithmeticTerms_preserves_type
                   subst values
                   simpa [Surface.interpretTypes] using
                     (ValuesTyped.cons headTypedValue tailTypedValues)
+
+/-- Parallel `letMany` preserves types when its initializers and body may
+refer to typed GlobalIR entries. Initializers are checked and evaluated in
+the incoming local context; their resulting values are then prepended in the
+same order used by the evaluator before checking the body. -/
+theorem evaluate_contextualGlobalLetMany_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context types : List Surface.Ty)
+    (fuel : Nat) (environment : List Value) (initializers : List Term)
+    (body : Term) (resultType : Surface.Ty)
+    (initializersTyped : ContextualGlobalArithmeticTerms globals assignment context types initializers)
+    (bodyTyped : ContextualGlobalArithmeticTerm globals assignment (types ++ context) body resultType)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluate program store fuel environment
+      (.letMany initializers body) = .ok value) :
+    PolyIR.ValueTyped globals value resultType := by
+  cases fuel with
+  | zero => simp [evaluate, bind, Except.bind, Except.pure] at success
+  | succ fuel =>
+      change (do
+        let bindings ← evaluateArgs program store fuel environment initializers
+        evaluate program store fuel (bindings ++ environment) body) = .ok value at success
+      cases initializersResult : evaluateArgs program store fuel environment initializers with
+      | error fault => simp [initializersResult, bind, Except.bind] at success
+      | ok bindings =>
+          have bindingsTyped := evaluate_contextualGlobalArithmeticTerms_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped
+            store context fuel environment environmentTyped initializers types
+            initializersTyped bindings initializersResult
+          have bodyEnvironmentTyped : ValuesTyped globals (bindings ++ environment)
+              (Surface.interpretTypes assignment (types ++ context)) := by
+            simpa [Surface.interpretTypes_append] using
+              (ValuesTyped.append bindingsTyped environmentTyped)
+          have bodySuccess : evaluate program store fuel (bindings ++ environment) body =
+              .ok value := by
+            simpa [initializersResult, bind, Except.bind, Except.pure] using success
+          exact evaluate_contextualGlobalArithmeticTerm_preserves_type globals assignment
+            definitions slotTypes functionSources program programTyped store (types ++ context)
+            fuel (bindings ++ environment) bodyEnvironmentTyped body resultType bodyTyped value
+            bodySuccess
+
+theorem evaluate_contextualGlobalArithmeticSequence_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (previous : Value) (terms : List Term)
+    (resultType : Surface.Ty)
+    (typing : ContextualGlobalArithmeticSequence globals assignment context terms resultType)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluateSequence program store fuel environment previous terms = .ok value) :
+    PolyIR.ValueTyped globals value resultType := by
+  induction typing generalizing fuel environment previous value with
+  | last expressionTyped =>
+      rename_i term type
+      cases fuel with
+      | zero => simp [evaluateSequence] at success
+      | succ fuel =>
+          cases fuel with
+          | zero => simp [evaluateSequence, evaluate, bind, Except.bind] at success
+          | succ fuel =>
+              cases expressionResult : evaluate program store (fuel + 1) environment term with
+              | error fault => simp [evaluateSequence, expressionResult, bind, Except.bind] at success
+              | ok expressionValue =>
+                  have expressionValueTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+                    globals assignment definitions slotTypes functionSources program programTyped
+                    store context (fuel + 1) environment environmentTyped term type expressionTyped
+                    expressionValue expressionResult
+                  have valueEq : value = expressionValue := by
+                    simpa [evaluateSequence, expressionResult, bind, Except.bind,
+                      Except.pure, Pure.pure] using success.symm
+                  cases valueEq
+                  exact expressionValueTyped
+  | skip firstTyped restTyped restIH =>
+      rename_i firstTerm firstType restTerms resultType
+      cases fuel with
+      | zero => simp [evaluateSequence] at success
+      | succ fuel =>
+          cases firstResult : evaluate program store fuel environment firstTerm with
+          | error fault => simp [evaluateSequence, firstResult, bind, Except.bind] at success
+          | ok firstValue =>
+              have restSuccess : evaluateSequence program store fuel environment
+                  firstValue restTerms = .ok value := by
+                simpa [evaluateSequence, firstResult, bind, Except.bind] using success
+              exact restIH fuel environment firstValue environmentTyped value restSuccess
+
+theorem evaluate_contextualGlobalBegin_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (first : Term) (firstType : Surface.Ty)
+    (rest : List Term) (resultType : Surface.Ty)
+    (firstTyped : ContextualGlobalArithmeticTerm globals assignment context first firstType)
+    (restTyped : ContextualGlobalArithmeticSequence globals assignment context rest resultType)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluate program store fuel environment (.begin first rest) = .ok value) :
+    PolyIR.ValueTyped globals value resultType := by
+  cases fuel with
+  | zero => simp [evaluate] at success
+  | succ fuel =>
+      change (do
+        let firstValue ← evaluate program store fuel environment first
+        evaluateSequence program store fuel environment firstValue rest) = .ok value at success
+      cases firstResult : evaluate program store fuel environment first with
+      | error fault => simp [firstResult, bind, Except.bind] at success
+      | ok firstValue =>
+          have restSuccess : evaluateSequence program store fuel environment
+              firstValue rest = .ok value := by
+            simpa [firstResult, bind, Except.bind] using success
+          exact evaluate_contextualGlobalArithmeticSequence_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped
+            store context fuel environment firstValue rest resultType restTyped environmentTyped
+            value restSuccess
+
+theorem evaluate_contextualGlobalBegin_empty_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (first : Term) (type : Surface.Ty)
+    (firstTyped : ContextualGlobalArithmeticTerm globals assignment context first type)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluate program store fuel environment (.begin first []) = .ok value) :
+    PolyIR.ValueTyped globals value type := by
+  cases fuel with
+  | zero => simp [evaluate] at success
+  | succ fuel =>
+      cases fuel with
+      | zero => simp [evaluate, evaluateSequence, bind, Except.bind] at success
+      | succ fuel =>
+          cases firstResult : evaluate program store (fuel + 1) environment first with
+          | error fault => simp [evaluate, evaluateSequence, firstResult,
+              bind, Except.bind] at success
+          | ok firstValue =>
+              have firstValueTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+                globals assignment definitions slotTypes functionSources program programTyped
+                store context (fuel + 1) environment environmentTyped first type firstTyped
+                firstValue firstResult
+              have valueEq : value = firstValue := by
+                simpa [evaluate, evaluateSequence, firstResult, bind, Except.bind,
+                  Except.pure, Pure.pure] using success.symm
+              cases valueEq
+              exact firstValueTyped
 
 /-- A zero-argument GlobalIR function call preserves the result type when its
 runtime body is in the contextual global arithmetic fragment. This composes
@@ -2320,6 +3145,129 @@ theorem evaluate_contextual_global_call_preserves_type
     slotTypes functionSources program programTyped store argumentTypes fuel values argumentsTyped
     runtime.body resultType bodyTyping result bodySuccess
 
+/-- Global function calls also preserve their result type when their argument
+expressions read from an arbitrary typed caller environment. The function
+body still runs in the argument environment, as required by GlobalIR. -/
+theorem evaluate_contextual_global_call_preserves_type_in_context
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (callerContext : List Surface.Ty)
+    (callerEnvironment : List Value)
+    (callerEnvironmentTyped : ValuesTyped globals callerEnvironment
+      (Surface.interpretTypes assignment callerContext))
+    (fuel index : Nat) (runtime : RuntimeDefinition)
+    (fuelPositive : 0 < fuel)
+    (runtimeEntry : program[index]? = some (.function runtime))
+    (terms : List Term) (argumentTypes : List Surface.Ty)
+    (argumentsTyping : ContextualGlobalArithmeticTerms globals assignment callerContext
+      argumentTypes terms)
+    (values : List Value)
+    (argumentsSuccess : evaluateArgs program store fuel callerEnvironment terms = .ok values)
+    (arity : runtime.arity = values.length) (resultType : Surface.Ty)
+    (bodyTyping : ContextualGlobalArithmeticTerm globals assignment argumentTypes
+      runtime.body resultType)
+    (bodySuccess : evaluate program store fuel values runtime.body = .ok result)
+    (callSuccess : evaluate program store (fuel + 1) callerEnvironment
+      (.app (.global index) terms) = .ok result) :
+    PolyIR.ValueTyped globals result resultType := by
+  have runtimeAt : program[index]? = some (.function runtime) := runtimeEntry
+  have functionSuccess : evaluate program store fuel callerEnvironment (.global index) =
+      .ok (.global index) := by
+    cases fuel with
+    | zero => omega
+    | succ remaining => simp [evaluate, runtimeAt, pure, Except.pure]
+  have argumentsTyped := evaluate_contextualGlobalArithmeticTerms_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    callerContext fuel callerEnvironment callerEnvironmentTyped terms argumentTypes
+    argumentsTyping values argumentsSuccess
+  have callEq : evaluate program store (fuel + 1) callerEnvironment
+      (.app (.global index) terms) = evaluate program store fuel values runtime.body := by
+    simp [evaluate, functionSuccess, argumentsSuccess, runtimeAt, arity,
+      bind, Except.bind, Except.pure, pure]
+  rw [callEq, bodySuccess] at callSuccess
+  cases callSuccess
+  exact evaluate_contextualGlobalArithmeticTerm_preserves_type globals assignment
+    definitions slotTypes functionSources program programTyped store argumentTypes fuel values
+    argumentsTyped runtime.body resultType bodyTyping result bodySuccess
+
+/-- Type preservation for an application whose computed callee evaluates to
+a typed global function value. This extends the direct-global-call theorem to
+callees produced by arbitrary evaluation, while argument and body typing are
+kept explicit at this fragment boundary. -/
+theorem evaluate_contextual_computed_global_call_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (callerContext : List Surface.Ty)
+    (callerEnvironment : List Value)
+    (callerEnvironmentTyped : ValuesTyped globals callerEnvironment
+      (Surface.interpretTypes assignment callerContext))
+    (fuel index : Nat) (runtime : RuntimeDefinition) (function : Term)
+    (functionSuccess : evaluate program store fuel callerEnvironment function =
+      .ok (.global index))
+    (fuelPositive : 0 < fuel)
+    (runtimeEntry : program[index]? = some (.function runtime))
+    (terms : List Term) (argumentTypes : List Surface.Ty)
+    (argumentsTyping : ContextualGlobalArithmeticTerms globals assignment callerContext
+      argumentTypes terms)
+    (values : List Value)
+    (argumentsSuccess : evaluateArgs program store fuel callerEnvironment terms = .ok values)
+    (arityAgreement : runtime.arity = values.length) (resultType : Surface.Ty)
+    (bodyTyping : ContextualGlobalArithmeticTerm globals assignment argumentTypes
+      runtime.body resultType)
+    (callSuccess : evaluate program store (fuel + 1) callerEnvironment
+      (.app function terms) = .ok result) :
+    PolyIR.ValueTyped globals result resultType := by
+  have functionGlobalSuccess : evaluate program store fuel callerEnvironment (.global index) =
+      .ok (.global index) := by
+    cases fuel with
+    | zero => omega
+    | succ remaining => simp [evaluate, runtimeEntry, pure, Except.pure]
+  have computedCallEq : evaluate program store (fuel + 1) callerEnvironment
+      (.app function terms) = evaluate program store fuel values runtime.body := by
+    simp [evaluate, functionSuccess, argumentsSuccess, runtimeEntry, arityAgreement,
+      bind, Except.bind, Except.pure, pure]
+  rw [computedCallEq] at callSuccess
+  have directCallEq : evaluate program store (fuel + 1) callerEnvironment
+      (.app (.global index) terms) = evaluate program store fuel values runtime.body := by
+    simp [evaluate, functionGlobalSuccess, argumentsSuccess, runtimeEntry, arityAgreement,
+      bind, Except.bind, Except.pure, pure]
+  have directCallSuccess : evaluate program store (fuel + 1) callerEnvironment
+      (.app (.global index) terms) = .ok result := by
+    rw [directCallEq]
+    exact callSuccess
+  exact evaluate_contextual_global_call_preserves_type_in_context globals assignment
+    definitions slotTypes functionSources program programTyped store callerContext
+    callerEnvironment callerEnvironmentTyped fuel index runtime fuelPositive runtimeEntry
+    terms argumentTypes argumentsTyping values argumentsSuccess arityAgreement resultType
+    bodyTyping callSuccess directCallSuccess
+
+/-- The evaluator's closure-call rule preserves an already established result
+type for any captured body. This separates the call-by-value application
+step from the fragment-specific proof that the closure body is type safe. -/
+theorem evaluate_closure_application_preserves_type_from_body_result
+    (globals : List Surface.Signature) (program : List Definition) (store : Store)
+    (fuel : Nat) (callerEnvironment captured : List Value)
+    (function : Term) (arity : Nat) (body : Term)
+    (functionSuccess : evaluate program store fuel callerEnvironment function =
+      .ok (.closure arity body captured))
+    (terms : List Term) (values : List Value)
+    (argumentsSuccess : evaluateArgs program store fuel callerEnvironment terms = .ok values)
+    (arityAgreement : values.length = arity)
+    (result : Value) (resultType : Surface.Ty)
+    (bodySuccess : evaluate program store fuel (values ++ captured) body = .ok result)
+    (bodyResultTyped : PolyIR.ValueTyped globals result resultType) :
+    evaluate program store (fuel + 1) callerEnvironment (.app function terms) = .ok result ∧
+      PolyIR.ValueTyped globals result resultType := by
+  have callEq : evaluate program store (fuel + 1) callerEnvironment
+      (.app function terms) = evaluate program store fuel (values ++ captured) body := by
+    simp [evaluate, functionSuccess, argumentsSuccess, arityAgreement, bind, Except.bind,
+      Except.pure, pure]
+  exact ⟨callEq.trans bodySuccess, bodyResultTyped⟩
+
 /-- A syntactic lambda application preserves the body result type for
 arbitrary arity when its arguments and body are in the contextual global
 arithmetic fragment. This composes lambda creation, argument evaluation,
@@ -2340,7 +3288,7 @@ theorem evaluate_contextual_lambda_application_preserves_type
     (values : List Value)
     (argumentsSuccess : evaluateArgs program store fuel environment terms = .ok values)
     (resultType : Surface.Ty)
-    (bodyTyping : ContextualArithmeticTerm globals assignment
+    (bodyTyping : ContextualGlobalArithmeticTerm globals assignment
       (argumentTypes ++ context) (PolyIR.erase body)
       (Surface.interpret assignment resultType))
     (result : Value)
@@ -2369,16 +3317,19 @@ theorem evaluate_contextual_lambda_application_preserves_type
         argumentsTyped.length
       _ = argumentTypes.length := Surface.interpretTypes_length assignment argumentTypes
       _ = parameters.length := arity
-  have callEq : evaluate program store (fuel + 1) environment
-      (.app (.lam parameters.length (PolyIR.erase body)) terms) =
-        evaluate program store fuel (values ++ environment) (PolyIR.erase body) := by
-    simp [evaluate, functionSuccess, argumentsSuccess, valuesArity, bind, Except.bind,
-      Except.pure, pure]
-  rw [callEq, bodySuccess] at callSuccess
-  cases callSuccess
-  exact evaluate_contextualArithmetic_preserves_type globals assignment program store
-    (argumentTypes ++ context) fuel (values ++ environment) (PolyIR.erase body)
-    (Surface.interpret assignment resultType) bodyTyping bodyEnvironmentTyped result bodySuccess
+  have bodyResultTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    (argumentTypes ++ context) fuel
+    (values ++ environment) bodyEnvironmentTyped (PolyIR.erase body)
+    (Surface.interpret assignment resultType) bodyTyping result bodySuccess
+  obtain ⟨callResult, callTyped⟩ :=
+    evaluate_closure_application_preserves_type_from_body_result globals program store fuel
+      environment environment (.lam parameters.length (PolyIR.erase body)) parameters.length
+      (PolyIR.erase body) functionSuccess terms values argumentsSuccess valuesArity result
+      (Surface.interpret assignment resultType) bodySuccess bodyResultTyped
+  rw [callSuccess] at callResult
+  cases callResult
+  exact callTyped
 
 /-- Type preservation for application of an arbitrary evaluated closure.
 The closure may capture an environment distinct from the caller environment;
@@ -2405,7 +3356,7 @@ theorem evaluate_contextual_closure_application_preserves_type
     (capturedTyped : ValuesTyped globals captured
       (Surface.interpretTypes assignment capturedTypes))
     (resultType : Surface.Ty)
-    (bodyTyping : ContextualArithmeticTerm globals assignment
+    (bodyTyping : ContextualGlobalArithmeticTerm globals assignment
       (argumentTypes ++ capturedTypes) body (Surface.interpret assignment resultType))
     (result : Value)
     (bodySuccess : evaluate program store fuel (values ++ captured) body = .ok result) :
@@ -2425,14 +3376,14 @@ theorem evaluate_contextual_closure_application_preserves_type
         argumentsTyped.length
       _ = argumentTypes.length := Surface.interpretTypes_length assignment argumentTypes
       _ = arity := arityAgreement
-  have callEq : evaluate program store (fuel + 1) callerEnvironment
-      (.app function terms) = evaluate program store fuel (values ++ captured) body := by
-    simp [evaluate, functionSuccess, argumentsSuccess, valuesArity, bind, Except.bind,
-      Except.pure, pure]
-  refine ⟨callEq.trans bodySuccess, ?_⟩
-  exact evaluate_contextualArithmetic_preserves_type globals assignment program store
-    (argumentTypes ++ capturedTypes) fuel (values ++ captured) body
-    (Surface.interpret assignment resultType) bodyTyping bodyEnvironmentTyped result bodySuccess
+  have bodyResultTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    (argumentTypes ++ capturedTypes) fuel
+    (values ++ captured) bodyEnvironmentTyped body (Surface.interpret assignment resultType)
+    bodyTyping result bodySuccess
+  exact evaluate_closure_application_preserves_type_from_body_result globals program store fuel
+    callerEnvironment captured function arity body functionSuccess terms values argumentsSuccess
+    valuesArity result (Surface.interpret assignment resultType) bodySuccess bodyResultTyped
 
 /- Any successful parallel evaluation of a pointwise-typed initializer list
 produces values with the corresponding declared types. -/
@@ -2669,11 +3620,89 @@ theorem initializeValues_stops_on_divergence (program : List Definition)
     have step := diverges (fuel + 1) (by omega)
     simp [initializeValues, step, bind, Except.bind]
 
+/-- A divergent initializer after any successfully evaluated prefix exhausts
+the sequential initializer walk. The prefix may commit arbitrary values to
+the store; divergence is stated against that resulting store. -/
+theorem initializeValues_stops_on_divergence_after_prefix
+    (program : List Definition) (fuel : Nat) (store : Store) (slot : Nat)
+    (initializersBefore : List Term) (head : Term) (tail : List Term) (after : Store)
+    (prefixSuccess : initializeValues program (fuel + initializersBefore.length + 2)
+      store slot initializersBefore = .ok after)
+    (diverges : Diverges program after [] head) :
+    initializeValues program (fuel + initializersBefore.length + 2) store slot
+      (initializersBefore ++ head :: tail) = .error (.core .outOfFuel) := by
+  induction initializersBefore generalizing fuel store slot after with
+  | nil =>
+      have afterEq : after = store := by
+        have storeEq : store = after := by
+          simpa [initializeValues, pure, Except.pure] using prefixSuccess
+        exact storeEq.symm
+      subst after
+      exact initializeValues_stops_on_divergence program store slot (fuel + 1)
+        head tail diverges
+  | cons first rest ih =>
+      have fuelEq : fuel + (rest.length + 1) + 2 = (fuel + rest.length + 2) + 1 := by omega
+      have prefixStep : initializeValues program ((fuel + rest.length + 2) + 1)
+          store slot (first :: rest) = .ok after := by
+        simpa [List.length_cons, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using prefixSuccess
+      cases firstEval : evaluate program store (fuel + rest.length + 2) [] first with
+      | error fault => simp [initializeValues, firstEval, bind, Except.bind] at prefixStep
+      | ok value =>
+          have restSuccess : initializeValues program (fuel + rest.length + 2)
+              (store.set slot (some value)) (slot + 1) rest = .ok after := by
+            simpa [initializeValues, firstEval] using prefixStep
+          have restDiverges := ih fuel (store.set slot (some value)) (slot + 1)
+            after restSuccess diverges
+          have mainFuelEq : fuel + (rest.length + 1) + 2 =
+              (fuel + rest.length + 2) + 1 := by omega
+          simp only [List.length_cons]
+          rw [mainFuelEq]
+          simp only [List.cons_append, initializeValues, firstEval]
+          exact restDiverges
+
 theorem initializeValues_stops_on_error (program : List Definition) (fuel : Nat)
     (store : Store) (slot : Nat) (head : Term) (tail : List Term) (fault : Fault)
     (step : evaluate program store fuel [] head = .error fault) :
     initializeValues program (fuel + 1) store slot (head :: tail) = .error fault := by
   simp [initializeValues, step, bind, Except.bind]
+
+/-- An initializer fault after a successful prefix is returned unchanged by
+the sequential initializer walk. -/
+theorem initializeValues_reports_error_after_prefix
+    (program : List Definition) (fuel : Nat) (store : Store) (slot : Nat)
+    (initializersBefore : List Term) (head : Term) (tail : List Term)
+    (after : Store) (fault : Fault)
+    (prefixSuccess : initializeValues program (fuel + initializersBefore.length + 2)
+      store slot initializersBefore = .ok after)
+    (faultStep : evaluate program after (fuel + 1) [] head = .error fault) :
+    initializeValues program (fuel + initializersBefore.length + 2) store slot
+      (initializersBefore ++ head :: tail) = .error fault := by
+  induction initializersBefore generalizing fuel store slot after with
+  | nil =>
+      have storeEq : store = after := by
+        simpa [initializeValues, pure, Except.pure] using prefixSuccess
+      subst after
+      exact initializeValues_stops_on_error program (fuel + 1) store slot head tail fault
+        faultStep
+  | cons first rest ih =>
+      have prefixStep : initializeValues program ((fuel + rest.length + 2) + 1)
+          store slot (first :: rest) = .ok after := by
+        simpa [List.length_cons, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using prefixSuccess
+      cases firstEval : evaluate program store (fuel + rest.length + 2) [] first with
+      | error firstFault =>
+          simp [initializeValues, firstEval, bind, Except.bind] at prefixStep
+      | ok value =>
+          have restSuccess : initializeValues program (fuel + rest.length + 2)
+              (store.set slot (some value)) (slot + 1) rest = .ok after := by
+            simpa [initializeValues, firstEval] using prefixStep
+          have restFault := ih fuel (store.set slot (some value)) (slot + 1)
+            after restSuccess faultStep
+          have fuelEq : fuel + (rest.length + 1) + 2 =
+              (fuel + rest.length + 2) + 1 := by omega
+          simp only [List.length_cons]
+          rw [fuelEq]
+          simp only [List.cons_append, initializeValues, firstEval]
+          exact restFault
 
 theorem initializeValues_commits_head (program : List Definition) (fuel : Nat)
     (store : Store) (slot : Nat) (head : Term) (tail : List Term) (value : Value)
@@ -2720,6 +3749,56 @@ theorem run_reports_first_initializer_fault (program : Program) (fuel : Nat)
   exact initializeValues_stops_on_error program.definitions fuel
     (List.replicate (head :: tail).length none) 0 head tail fault (by
       simpa [initializers] using step)
+
+/-- Divergence of the first top-level initializer reaches the observable
+program result as fuel exhaustion. Later initializers and the entry function
+are not evaluated after that nonterminating initializer. -/
+theorem run_reports_first_initializer_diverges (program : Program) (fuel : Nat)
+    (head : Term) (tail : List Term)
+    (initializers : program.initializers = head :: tail)
+    (diverges : Diverges program.definitions
+      (List.replicate (head :: tail).length none) [] head) :
+    run program (fuel + 1) = .error (.core .outOfFuel) := by
+  apply run_reports_initializer_fault program (fuel + 1) (.core .outOfFuel)
+  rw [initializers]
+  exact initializeValues_stops_on_divergence program.definitions
+    (List.replicate (head :: tail).length none) 0 fuel head tail diverges
+
+/-- Divergence at an arbitrary initializer position propagates through the
+successfully committed prefix to the observable result of `run`. -/
+theorem run_reports_initializer_diverges_after_prefix (program : Program) (fuel : Nat)
+    (initializersBefore : List Term) (head : Term) (tail : List Term) (after : Store)
+    (layout : program.initializers = initializersBefore ++ head :: tail)
+    (prefixSuccess : initializeValues program.definitions
+      (fuel + initializersBefore.length + 2)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after)
+    (diverges : Diverges program.definitions after [] head) :
+    run program (fuel + initializersBefore.length + 2) = .error (.core .outOfFuel) := by
+  apply run_reports_initializer_fault program (fuel + initializersBefore.length + 2)
+    (.core .outOfFuel)
+  rw [layout]
+  exact initializeValues_stops_on_divergence_after_prefix program.definitions fuel
+    (List.replicate (initializersBefore ++ head :: tail).length none) 0
+    initializersBefore head tail after
+    (by simpa [layout] using prefixSuccess) diverges
+
+/-- A fault at an arbitrary top-level initializer position propagates after
+the preceding initializer prefix has committed successfully. -/
+theorem run_reports_initializer_fault_after_prefix (program : Program) (fuel : Nat)
+    (initializersBefore : List Term) (head : Term) (tail : List Term)
+    (after : Store) (fault : Fault)
+    (layout : program.initializers = initializersBefore ++ head :: tail)
+    (prefixSuccess : initializeValues program.definitions
+      (fuel + initializersBefore.length + 2)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after)
+    (faultStep : evaluate program.definitions after (fuel + 1) [] head = .error fault) :
+    run program (fuel + initializersBefore.length + 2) = .error fault := by
+  apply run_reports_initializer_fault program (fuel + initializersBefore.length + 2) fault
+  rw [layout]
+  exact initializeValues_reports_error_after_prefix program.definitions fuel
+    (List.replicate (initializersBefore ++ head :: tail).length none) 0
+    initializersBefore head tail after fault
+    (by simpa [layout] using prefixSuccess) faultStep
 
 noncomputable def programOfNamed (functions : Named.Definitions) (slotTypes : List Surface.Ty)
     (initializers : List Named.Expr) (entry : Nat) : Program :=
@@ -2787,6 +3866,13 @@ theorem getter_call_reads_current_store (program : List Definition) (store : Sto
     (getter : program[index]? = some (.getter slot))
     (initialized : store[slot]? = some (some value)) :
     evaluate program store (fuel + 2) [] (.app (.global index) []) = .ok value := by
+  simp [evaluate, evaluateArgs, getter, readGlobal, initialized, List.isEmpty]
+
+theorem getter_call_reads_current_environment (program : List Definition) (store : Store)
+    (fuel index slot : Nat) (environment : List Value) (value : Value)
+    (getter : program[index]? = some (.getter slot))
+    (initialized : store[slot]? = some (some value)) :
+    evaluate program store (fuel + 2) environment (.app (.global index) []) = .ok value := by
   simp [evaluate, evaluateArgs, getter, readGlobal, initialized, List.isEmpty]
 
 /-- A closure created while a value cell is empty captures no stale cell
@@ -2871,6 +3957,32 @@ theorem typed_getter_call_preserves_type (program : List Definition)
   obtain ⟨result, evaluated, resultTyped⟩ := getter_call_preserves_type
     program globals slotTypes store fuel index slot value type getter slotType storeTyped initialized
   exact ⟨type, result, signatureEntry, typeWellFormed, slotType, evaluated, resultTyped⟩
+
+theorem typed_getter_call_preserves_type_in_environment (program : List Definition)
+    (globals : List Surface.Signature) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (store : Store) (fuel index slot : Nat) (environment : List Value)
+    (value : PolyIR.Value)
+    (typed : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (getter : program[index]? = some (.getter slot))
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (initialized : store[slot]? = some (some value)) :
+    ∃ type result, globals[index]? = some ⟨0, [], type⟩ ∧ type.wellFormed 0 ∧
+      slotTypes[slot]? = some type ∧
+      evaluate program store (fuel + 2) environment (.app (.global index) []) = .ok result ∧
+      PolyIR.ValueTyped globals result type := by
+  obtain ⟨type, signatureEntry, typeWellFormed, slotType⟩ :=
+    getter_layout_typed globals definitions slotTypes functionSources program typed index slot getter
+  have slotType' : slotTypes.get? slot = some type := by
+    rw [← indexed_lookup_eq_get?]
+    exact slotType
+  have initialized' : store.get? slot = some (some value) := by
+    rw [← indexed_lookup_eq_get?]
+    exact initialized
+  have evaluated := getter_call_reads_current_environment program store fuel index slot
+    environment value getter initialized
+  exact ⟨type, value, signatureEntry, typeWellFormed, slotType, evaluated,
+    readGlobal_preserves_type globals slotTypes store slot value type storeTyped slotType' initialized'⟩
 
 /-- A getter call is type safe whenever its declared store slot is populated.
 This composes the layout theorem with `StoreWellTyped`, so callers need not
@@ -2997,6 +4109,605 @@ theorem typed_getter_call_type_safe_or_early_read (program : List Definition)
     exact ⟨type, signatureEntry, slotType, Or.inr
       (getter_call_reports_early_read program store fuel index slot getter uninitialized)⟩
 
+/-- The getter safety dichotomy is independent of the caller's local
+environment. This is the form needed when a global value is read from inside
+a closure body. -/
+theorem typed_getter_call_type_safe_or_early_read_in_environment
+    (program : List Definition) (globals : List Surface.Signature)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (store : Store) (fuel index slot : Nat)
+    (environment : List Value)
+    (typed : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (getter : program[index]? = some (.getter slot))
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store) :
+    ∃ type, globals[index]? = some ⟨0, [], type⟩ ∧ slotTypes[slot]? = some type ∧
+      ((∃ value, evaluate program store (fuel + 2) environment
+          (.app (.global index) []) = .ok value ∧ PolyIR.ValueTyped globals value type) ∨
+        evaluate program store (fuel + 2) environment (.app (.global index) []) =
+          .error (.beforeInitialization slot)) := by
+  obtain ⟨type, signatureEntry, _typeWellFormed, slotType⟩ :=
+    getter_layout_typed globals definitions slotTypes functionSources program typed index slot getter
+  have slotTypeGet : slotTypes.get? slot = some type := by
+    rw [← indexed_lookup_eq_get?]
+    exact slotType
+  rcases readGlobal_type_safe_or_before_initialization_of_layout globals slotTypes store
+      slot type slotTypeGet storeLayout storeTyped with safe | early
+  · rcases safe with ⟨value, readSuccess, valueTyped⟩
+    cases entry : store[slot]? with
+    | none => simp [readGlobal, entry] at readSuccess
+    | some cell =>
+        cases cell with
+        | none => simp [readGlobal, entry] at readSuccess
+        | some stored =>
+            simp [readGlobal, entry] at readSuccess
+            subst stored
+            exact ⟨type, signatureEntry, slotType, Or.inl ⟨value,
+              getter_call_reads_current_environment program store fuel index slot environment
+                value getter entry, valueTyped⟩⟩
+  · have uninitialized : store[slot]? = some none := by
+      cases entry : store[slot]? with
+      | none => simp [readGlobal, entry] at early
+      | some cell =>
+          cases cell with
+          | none => rfl
+          | some value => simp [readGlobal, entry] at early
+    have earlyRead : evaluate program store (fuel + 2) environment
+        (.app (.global index) []) = .error (.beforeInitialization slot) := by
+      simp [evaluate, evaluateArgs, getter, readGlobal, uninitialized, List.isEmpty]
+    exact ⟨type, signatureEntry, slotType, Or.inr earlyRead⟩
+
+theorem evaluate_lambda_application_success_parts
+    (program : List Definition) (store : Store) (fuel : Nat) (environment : List Value)
+    (arity : Nat) (body : Term) (arguments : List Term) (value : Value)
+    (fuelPositive : 0 < fuel)
+    (success : evaluate program store (fuel + 1) environment
+      (.app (.lam arity body) arguments) = .ok value) :
+    ∃ values, evaluateArgs program store fuel environment arguments = .ok values ∧
+      values.length = arity ∧
+      evaluate program store fuel (values ++ environment) body = .ok value := by
+  cases fuel with
+  | zero => omega
+  | succ fuel =>
+      have functionSuccess : evaluate program store (fuel + 1) environment
+          (.lam arity body) = .ok (.closure arity body environment) := by
+        simp [evaluate, pure, Except.pure]
+      cases argumentsSuccess : evaluateArgs program store (fuel + 1) environment arguments with
+      | error fault =>
+          simp [evaluate, functionSuccess, argumentsSuccess, bind, Except.bind] at success
+      | ok values =>
+          by_cases arityEq : values.length = arity
+          · refine ⟨values, rfl, arityEq, ?_⟩
+            simpa [evaluate, functionSuccess, argumentsSuccess, arityEq, bind, Except.bind]
+              using success
+          · simp [evaluate, functionSuccess, argumentsSuccess, arityEq, bind, Except.bind]
+              at success
+
+/-- Successful evaluation preserves types for the contextual runtime fragment
+that includes lowered getter reads. The getter case uses the typed store
+layout to rule out an untyped returned value; an uninitialized cell is
+reported as a fault and therefore cannot satisfy the success premise. -/
+theorem evaluate_contextualGlobalRuntimeTerm_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (context : List Surface.Ty) (fuel : Nat) (environment : List Value)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (term : Term) (type : Surface.Ty)
+    (typing : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program context term type)
+    (value : Value) (success : evaluate program store fuel environment term = .ok value) :
+    PolyIR.ValueTyped globals value type := by
+  cases typing with
+  | arithmetic arithmeticTyping =>
+      exact evaluate_contextualGlobalArithmeticTerm_preserves_type globals assignment
+        definitions slotTypes functionSources program programTyped store context fuel
+        environment environmentTyped term type arithmeticTyping value success
+  | @getter index slot resultType getterEntry signatureEntry =>
+      obtain ⟨getterType, getterSignature, _wellFormed, _slotType⟩ :=
+        getter_layout_typed globals definitions slotTypes functionSources program programTyped
+          index slot getterEntry
+      have sameSignature := Option.some.inj (signatureEntry.symm.trans getterSignature)
+      have getterTypeEq : getterType = type := by
+        have resultEq := congrArg Surface.Signature.result sameSignature
+        exact resultEq.symm
+      cases getterTypeEq
+      cases fuel with
+      | zero => simp [evaluate] at success
+      | succ fuel =>
+          cases fuel with
+          | zero => simp [evaluate, evaluateArgs, bind, Except.bind, pure, Except.pure] at success
+          | succ remaining =>
+              obtain ⟨helperType, helperSignature, _helperSlotType, getterResult⟩ :=
+                typed_getter_call_type_safe_or_early_read_in_environment
+                  program globals definitions slotTypes functionSources store remaining index slot
+                  environment programTyped getterEntry storeLayout storeTyped
+              have helperTypeEq : helperType = type := by
+                have signatureEq := Option.some.inj (signatureEntry.symm.trans helperSignature)
+                have resultEq := congrArg Surface.Signature.result signatureEq
+                exact resultEq.symm
+              cases helperTypeEq
+              rcases getterResult with typedResult | earlyRead
+              · rcases typedResult with ⟨result, getterSuccess, resultTyped⟩
+                rw [getterSuccess] at success
+                cases success
+                exact resultTyped
+              · rw [earlyRead] at success
+                cases success
+  | @lambdaApplication parameters arguments argumentTypes body resultType
+      argumentsTyping arityAgreement bodyTyping =>
+      cases fuel with
+      | zero => simp [evaluate] at success
+      | succ fuel =>
+        cases fuel with
+        | zero => simp [evaluate, bind, Except.bind] at success
+        | succ fuel =>
+          obtain ⟨values, argumentsSuccess, valuesArity, bodySuccess⟩ :=
+            evaluate_lambda_application_success_parts program store (fuel + 1) environment
+              parameters.length body arguments value (by omega) success
+          have functionSuccess : evaluate program store (fuel + 1) environment
+              (.lam parameters.length body) =
+                .ok (.closure parameters.length body environment) := by
+            simp [evaluate, pure, Except.pure]
+          have argumentsTyped := evaluate_contextualGlobalArithmeticTerms_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            context (fuel + 1) environment environmentTyped arguments argumentTypes
+            argumentsTyping values argumentsSuccess
+          have bodyEnvironmentTyped : ValuesTyped globals (values ++ environment)
+              (Surface.interpretTypes assignment (argumentTypes ++ context)) := by
+            simpa [Surface.interpretTypes_append] using
+              (ValuesTyped.append argumentsTyped environmentTyped)
+          have bodyResultTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            (argumentTypes ++ context) (fuel + 1) (values ++ environment) bodyEnvironmentTyped
+            body (Surface.interpret assignment resultType) bodyTyping value bodySuccess
+          exact (evaluate_closure_application_preserves_type_from_body_result globals program
+            store (fuel + 1) environment environment (.lam parameters.length body)
+            parameters.length body functionSuccess arguments values argumentsSuccess valuesArity
+            value (Surface.interpret assignment resultType) bodySuccess bodyResultTyped).2
+
+theorem evaluate_contextualGlobalRuntimeIntegerOptionalCall_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (operation : IntegerOptionalOperation) (left right : Term)
+    (typing : ContextualGlobalRuntimeIntegerOptionalCall globals assignment definitions slotTypes
+      functionSources program context operation left right)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (result : Value)
+    (success : evaluateIntegerOptionalCall program store operation fuel environment left right =
+      .ok result) :
+    PolyIR.ValueTyped globals result (.option .integer) ∧
+      ∃ leftValue rightValue,
+        evaluate program store (fuel - 1) environment left = .ok leftValue ∧
+        evaluate program store (fuel - 1) environment right = .ok rightValue ∧
+        PolyIR.ValueTyped globals leftValue .integer ∧
+        PolyIR.ValueTyped globals rightValue .integer := by
+  cases fuel with
+  | zero => simp [evaluateIntegerOptionalCall] at success
+  | succ fuel =>
+      obtain ⟨leftInteger, rightInteger, leftEval, rightEval, resultEq⟩ :=
+        (evaluateIntegerOptionalCall_success_iff program store operation fuel environment
+          left right result).mp (by simpa using success)
+      cases typing with
+      | mk leftTyping rightTyping =>
+          have leftTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            storeLayout storeTyped context fuel environment environmentTyped left .integer leftTyping
+            (.int leftInteger) leftEval
+          have rightTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            storeLayout storeTyped context fuel environment environmentTyped right .integer rightTyping
+            (.int rightInteger) rightEval
+          refine ⟨?_, .int leftInteger, .int rightInteger, ?_, ?_, ?_, ?_⟩
+          · rw [resultEq]
+            exact integerOptionalRuntimeValue_typed globals operation.toPrimitive
+              leftInteger rightInteger
+          · exact leftEval
+          · exact rightEval
+          · exact leftTyped
+          · exact rightTyped
+
+/-- A successful Float comparison over runtime-typed operands (including
+getter reads) returns a Boolean. The proof also exposes the two Float child
+evaluations so the exact evaluation/fault order remains available to callers. -/
+theorem evaluate_contextualGlobalRuntimeFloatComparisonCall_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (operation : FloatComparisonOperation) (left right : Term)
+    (typing : ContextualGlobalRuntimeFloatComparisonCall globals assignment definitions slotTypes
+      functionSources program context operation left right)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (result : Value)
+    (success : evaluateFloatComparisonCall program store operation fuel environment left right =
+      .ok result) :
+    PolyIR.ValueTyped globals result .boolean ∧
+      ∃ leftValue rightValue,
+        evaluate program store (fuel - 1) environment left = .ok leftValue ∧
+        evaluate program store (fuel - 1) environment right = .ok rightValue ∧
+        PolyIR.ValueTyped globals leftValue .float ∧
+        PolyIR.ValueTyped globals rightValue .float := by
+  cases fuel with
+  | zero => simp [evaluateFloatComparisonCall] at success
+  | succ fuel =>
+      obtain ⟨leftFloat, rightFloat, leftEval, rightEval, resultEq⟩ :=
+        (evaluateFloatComparisonCall_success_iff program store operation fuel environment
+          left right result).mp (by simpa using success)
+      cases typing with
+      | mk leftTyping rightTyping =>
+          have leftTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            storeLayout storeTyped context fuel environment environmentTyped left .float leftTyping
+            (.float leftFloat) leftEval
+          have rightTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            storeLayout storeTyped context fuel environment environmentTyped right .float rightTyping
+            (.float rightFloat) rightEval
+          refine ⟨?_, .float leftFloat, .float rightFloat, ?_, ?_, ?_, ?_⟩
+          · rw [resultEq]
+            exact floatComparisonRuntimeValue_typed globals operation leftFloat rightFloat
+          · exact leftEval
+          · exact rightEval
+          · exact leftTyped
+          · exact rightTyped
+
+/-- Getter-aware type preservation for GlobalIR Float arithmetic terms. -/
+theorem evaluate_contextualGlobalRuntimeFloatBinCall_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (operation : Surface.FloatBinOp) (left right : Term)
+    (typing : ContextualGlobalRuntimeFloatBinCall globals assignment definitions slotTypes
+      functionSources program context operation left right)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (result : Value)
+    (success : evaluate program store fuel environment (.floatBin operation left right) =
+      .ok result) :
+    PolyIR.ValueTyped globals result .float ∧
+      ∃ leftValue rightValue,
+        evaluate program store (fuel - 1) environment left = .ok leftValue ∧
+        evaluate program store (fuel - 1) environment right = .ok rightValue ∧
+        PolyIR.ValueTyped globals leftValue .float ∧
+        PolyIR.ValueTyped globals rightValue .float := by
+  cases fuel with
+  | zero => simp [evaluate] at success
+  | succ fuel =>
+      have successParts := (evaluate_floatBin_success_iff program store operation fuel environment
+        left right result).mp (by simpa using success)
+      obtain ⟨leftFloat, rightFloat, leftEval, rightEval, resultEq⟩ := successParts
+      cases typing with
+      | mk leftTyping rightTyping =>
+          have leftTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            storeLayout storeTyped context fuel environment environmentTyped left .float leftTyping
+            (.float leftFloat) leftEval
+          have rightTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            storeLayout storeTyped context fuel environment environmentTyped right .float rightTyping
+            (.float rightFloat) rightEval
+          refine ⟨?_, .float leftFloat, .float rightFloat, ?_, ?_, ?_, ?_⟩
+          · rw [resultEq]
+            exact .float
+          · exact leftEval
+          · exact rightEval
+          · exact leftTyped
+          · exact rightTyped
+
+theorem evaluate_contextualGlobalRuntimeSequence_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (previous : Value) (terms : List Term)
+    (resultType : Surface.Ty)
+    (typing : ContextualGlobalRuntimeSequence globals assignment definitions slotTypes
+      functionSources program context terms resultType)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluateSequence program store fuel environment previous terms = .ok value) :
+    PolyIR.ValueTyped globals value resultType := by
+  induction typing generalizing fuel environment previous value with
+  | last expressionTyped =>
+      rename_i term type
+      cases fuel with
+      | zero => simp [evaluateSequence] at success
+      | succ fuel =>
+          cases fuel with
+          | zero => simp [evaluateSequence, evaluate, bind, Except.bind] at success
+          | succ fuel =>
+              cases expressionResult : evaluate program store (fuel + 1) environment term with
+              | error fault => simp [evaluateSequence, expressionResult, bind, Except.bind] at success
+              | ok expressionValue =>
+                  have expressionValueTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+                    globals assignment definitions slotTypes functionSources program programTyped
+                    store storeLayout storeTyped context (fuel + 1) environment environmentTyped
+                    term type expressionTyped expressionValue expressionResult
+                  have valueEq : value = expressionValue := by
+                    simpa [evaluateSequence, expressionResult, bind, Except.bind,
+                      Except.pure, Pure.pure] using success.symm
+                  cases valueEq
+                  exact expressionValueTyped
+  | skip firstTyped restTyped restIH =>
+      rename_i firstTerm firstType restTerms resultType
+      cases fuel with
+      | zero => simp [evaluateSequence] at success
+      | succ fuel =>
+          cases firstResult : evaluate program store fuel environment firstTerm with
+          | error fault => simp [evaluateSequence, firstResult, bind, Except.bind] at success
+          | ok firstValue =>
+              have restSuccess : evaluateSequence program store fuel environment
+                  firstValue restTerms = .ok value := by
+                simpa [evaluateSequence, firstResult, bind, Except.bind] using success
+              exact restIH fuel environment firstValue environmentTyped value restSuccess
+
+/-- `begin` carries the getter-aware sequence guarantee through evaluation. -/
+theorem evaluate_contextualGlobalRuntimeBegin_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (first : Term) (firstType : Surface.Ty)
+    (rest : List Term) (resultType : Surface.Ty)
+    (firstTyped : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program context first firstType)
+    (restTyped : ContextualGlobalRuntimeSequence globals assignment definitions slotTypes
+      functionSources program context rest resultType)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluate program store fuel environment (.begin first rest) = .ok value) :
+    PolyIR.ValueTyped globals value resultType := by
+  cases fuel with
+  | zero => simp [evaluate] at success
+  | succ fuel =>
+      change (do
+        let firstValue ← evaluate program store fuel environment first
+        evaluateSequence program store fuel environment firstValue rest) = .ok value at success
+      cases firstResult : evaluate program store fuel environment first with
+      | error fault => simp [firstResult, bind, Except.bind] at success
+      | ok firstValue =>
+          have restSuccess : evaluateSequence program store fuel environment
+              firstValue rest = .ok value := by
+            simpa [firstResult, bind, Except.bind] using success
+          exact evaluate_contextualGlobalRuntimeSequence_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped store
+            context fuel environment firstValue rest resultType restTyped storeLayout storeTyped
+            environmentTyped value restSuccess
+
+theorem evaluate_contextualGlobalRuntimeTerms_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context)) (terms : List Term) (types : List Surface.Ty)
+    (typing : ContextualGlobalRuntimeTerms globals assignment definitions slotTypes
+      functionSources program context types terms)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (values : List Value)
+    (success : evaluateArgs program store fuel environment terms = .ok values) :
+    ValuesTyped globals values (Surface.interpretTypes assignment types) := by
+  induction typing generalizing fuel values with
+  | nil =>
+      cases fuel with
+      | zero => simp [evaluateArgs] at success
+      | succ fuel =>
+          have valuesEmpty : values = [] := by
+            simpa [evaluateArgs, pure, Except.pure] using success.symm
+          subst values
+          exact .nil
+  | cons headTyped tailTyped tailIH =>
+      rename_i headTerm headType tailTypes tailTerms
+      cases fuel with
+      | zero => simp [evaluateArgs] at success
+      | succ fuel =>
+          cases headResult : evaluate program store fuel environment headTerm with
+          | error fault => simp [evaluateArgs, headResult, bind, Except.bind] at success
+          | ok headValue =>
+              cases tailResult : evaluateArgs program store fuel environment tailTerms with
+              | error fault =>
+                  simp [evaluateArgs, headResult, tailResult, bind, Except.bind] at success
+              | ok tailValues =>
+                  have headTypedValue := evaluate_contextualGlobalRuntimeTerm_preserves_type
+                    globals assignment definitions slotTypes functionSources program programTyped
+                    store storeLayout storeTyped context fuel environment environmentTyped
+                    headTerm (Surface.interpret assignment headType) headTyped headValue headResult
+                  have tailTypedValues := tailIH fuel tailValues tailResult
+                  have valuesEq : values = headValue :: tailValues := by
+                    simpa [evaluateArgs, headResult, tailResult, bind, Except.bind,
+                      Except.pure, Pure.pure, List.cons.injEq] using success.symm
+                  subst values
+                  simpa [Surface.interpretTypes] using
+                    (ValuesTyped.cons headTypedValue tailTypedValues)
+
+/-- A global function call preserves its declared result type when both its
+argument expressions and its body may read initialized top-level value
+slots. The argument row is evaluated in the caller environment, while the
+body is evaluated in the argument-value environment, matching the evaluator's
+call-by-value rule. -/
+theorem evaluate_contextualGlobalRuntimeCall_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (callerContext : List Surface.Ty) (callerEnvironment : List Value)
+    (callerEnvironmentTyped : ValuesTyped globals callerEnvironment
+      (Surface.interpretTypes assignment callerContext))
+    (fuel index : Nat) (runtime : RuntimeDefinition)
+    (fuelPositive : 0 < fuel)
+    (runtimeEntry : program[index]? = some (.function runtime))
+    (terms : List Term) (argumentTypes : List Surface.Ty)
+    (argumentsTyping : ContextualGlobalRuntimeTerms globals assignment definitions slotTypes
+      functionSources program callerContext argumentTypes terms)
+    (values : List Value)
+    (argumentsSuccess : evaluateArgs program store fuel callerEnvironment terms = .ok values)
+    (arity : runtime.arity = values.length) (resultType : Surface.Ty)
+    (bodyTyping : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program argumentTypes runtime.body resultType)
+    (result : Value)
+    (bodySuccess : evaluate program store fuel values runtime.body = .ok result)
+    (callSuccess : evaluate program store (fuel + 1) callerEnvironment
+      (.app (.global index) terms) = .ok result) :
+    PolyIR.ValueTyped globals result resultType := by
+  have functionSuccess : evaluate program store fuel callerEnvironment (.global index) =
+      .ok (.global index) := by
+    cases fuel with
+    | zero => omega
+    | succ remaining => simp [evaluate, runtimeEntry, pure, Except.pure]
+  have callEq : evaluate program store (fuel + 1) callerEnvironment
+      (.app (.global index) terms) = evaluate program store fuel values runtime.body := by
+    simp [evaluate, functionSuccess, argumentsSuccess, runtimeEntry, arity,
+      bind, Except.bind, Except.pure, pure]
+  have argumentsTyped := evaluate_contextualGlobalRuntimeTerms_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    callerContext fuel callerEnvironment callerEnvironmentTyped terms argumentTypes
+    argumentsTyping storeLayout storeTyped values argumentsSuccess
+  have bodyTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    storeLayout storeTyped argumentTypes fuel values argumentsTyped runtime.body resultType
+    bodyTyping result bodySuccess
+  rw [callEq, bodySuccess] at callSuccess
+  cases callSuccess
+  exact bodyTyped
+
+/-- Closure calls also preserve their result type when their arguments and
+captured body use top-level getters. Argument values and captured values are
+typed independently, then appended in the exact order used by the evaluator. -/
+theorem evaluate_contextualGlobalRuntimeClosureCall_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (callerContext argumentTypes capturedTypes : List Surface.Ty)
+    (callerEnvironment captured : List Value)
+    (callerEnvironmentTyped : ValuesTyped globals callerEnvironment
+      (Surface.interpretTypes assignment callerContext))
+    (capturedTyped : ValuesTyped globals captured
+      (Surface.interpretTypes assignment capturedTypes))
+    (fuel : Nat) (function : Term) (arity : Nat) (body : Term)
+    (functionSuccess : evaluate program store fuel callerEnvironment function =
+      .ok (.closure arity body captured))
+    (terms : List Term)
+    (argumentsTyping : ContextualGlobalRuntimeTerms globals assignment definitions slotTypes
+      functionSources program callerContext argumentTypes terms)
+    (values : List Value)
+    (argumentsSuccess : evaluateArgs program store fuel callerEnvironment terms = .ok values)
+    (arityAgreement : argumentTypes.length = arity)
+    (resultType : Surface.Ty)
+    (bodyTyping : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program (argumentTypes ++ capturedTypes) body resultType)
+    (result : Value)
+    (bodySuccess : evaluate program store fuel (values ++ captured) body = .ok result)
+    (callSuccess : evaluate program store (fuel + 1) callerEnvironment
+      (.app function terms) = .ok result) :
+    PolyIR.ValueTyped globals result resultType := by
+  have argumentsTyped := evaluate_contextualGlobalRuntimeTerms_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    callerContext fuel callerEnvironment callerEnvironmentTyped terms argumentTypes
+    argumentsTyping storeLayout storeTyped values argumentsSuccess
+  have bodyEnvironmentTyped : ValuesTyped globals (values ++ captured)
+      (Surface.interpretTypes assignment (argumentTypes ++ capturedTypes)) := by
+    simpa [Surface.interpretTypes_append] using
+      (ValuesTyped.append argumentsTyped capturedTyped)
+  have bodyResultTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+    globals assignment definitions slotTypes functionSources program programTyped store
+    storeLayout storeTyped (argumentTypes ++ capturedTypes) fuel (values ++ captured)
+    bodyEnvironmentTyped body resultType bodyTyping result bodySuccess
+  obtain ⟨_callEvaluates, callTyped⟩ :=
+    evaluate_closure_application_preserves_type_from_body_result globals program store fuel
+      callerEnvironment captured function arity body functionSuccess terms values argumentsSuccess
+      (by
+        calc
+          values.length = (Surface.interpretTypes assignment argumentTypes).length :=
+            argumentsTyped.length
+          _ = argumentTypes.length := by simp [Surface.interpretTypes]
+          _ = arity := arityAgreement)
+      result resultType bodySuccess bodyResultTyped
+  rw [_callEvaluates] at callSuccess
+  cases callSuccess
+  exact callTyped
+
+theorem evaluate_contextualGlobalRuntimeLetMany_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (store : Store) (context types : List Surface.Ty) (fuel : Nat)
+    (environment : List Value) (initializers : List Term) (body : Term)
+    (resultType : Surface.Ty)
+    (initializersTyped : ContextualGlobalRuntimeTerms globals assignment definitions
+      slotTypes functionSources program context types initializers)
+    (bodyTyped : ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+      functionSources program (types ++ context) body resultType)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (environmentTyped : ValuesTyped globals environment
+      (Surface.interpretTypes assignment context))
+    (value : Value)
+    (success : evaluate program store fuel environment
+      (.letMany initializers body) = .ok value) :
+    PolyIR.ValueTyped globals value resultType := by
+  cases fuel with
+  | zero => simp [evaluate] at success
+  | succ fuel =>
+      change (do
+        let bindings ← evaluateArgs program store fuel environment initializers
+        evaluate program store fuel (bindings ++ environment) body) = .ok value at success
+      cases initializersResult : evaluateArgs program store fuel environment initializers with
+      | error fault => simp [initializersResult, bind, Except.bind] at success
+      | ok bindings =>
+          have bindingsTyped := evaluate_contextualGlobalRuntimeTerms_preserves_type
+            globals assignment definitions slotTypes functionSources program programTyped
+            store context fuel environment environmentTyped initializers types initializersTyped
+            storeLayout storeTyped bindings initializersResult
+          have bodyEnvironmentTyped : ValuesTyped globals (bindings ++ environment)
+              (Surface.interpretTypes assignment (types ++ context)) := by
+            simpa [Surface.interpretTypes_append] using
+              (ValuesTyped.append bindingsTyped environmentTyped)
+          have bodySuccess : evaluate program store fuel (bindings ++ environment) body =
+              .ok value := by
+            simpa [initializersResult, bind, Except.bind, Except.pure] using success
+          exact evaluate_contextualGlobalRuntimeTerm_preserves_type globals assignment
+            definitions slotTypes functionSources program programTyped store storeLayout storeTyped
+            (types ++ context) fuel (bindings ++ environment) bodyEnvironmentTyped body resultType
+            bodyTyped value bodySuccess
+
 theorem read_initialized {store : Store} {slot : Nat} {value : Value}
     (entry : store[slot]? = some (some value)) : readGlobal store slot = .ok value := by
   simp [readGlobal, entry]
@@ -3039,6 +4750,41 @@ theorem set_other_lookup (store : Store) (slot index : Nat) (value : Option Valu
     · simp [getElem?_def, Nat.succ_lt_succ_iff]
     · simp [getElem?_def]
     · simpa [getElem?_def, Nat.succ_lt_succ_iff] using ih _ _ (by omega)
+
+/-- Successfully evaluating an initializer prefix only writes the consecutive
+slots assigned to that prefix. Every later in-range store position keeps its
+previous cell, which lets source-level forward references be shown
+uninitialized after an arbitrary successful prefix. -/
+theorem initializeValues_success_preserves_slots_after
+    (program : List Definition) (fuel : Nat) (store : Store) (start : Nat)
+    (expressions : List Term) (result : Store) (index : Nat)
+    (success : initializeValues program fuel store start expressions = .ok result)
+    (afterPrefix : start + expressions.length ≤ index) :
+    result[index]? = store[index]? := by
+  induction fuel generalizing store start expressions with
+  | zero => simp [initializeValues] at success
+  | succ fuel ih =>
+      cases expressions with
+      | nil =>
+          have same : store = result := by
+            simpa [initializeValues, pure, Except.pure] using success
+          simpa [same]
+      | cons head tail =>
+          cases step : evaluate program store fuel [] head with
+          | error fault => simp [initializeValues, step, bind, Except.bind] at success
+          | ok value =>
+              have restSuccess :
+                  initializeValues program fuel (store.set start (some value))
+                    (start + 1) tail = .ok result := by
+                simpa [initializeValues, step, bind, Except.bind] using success
+              have afterRest : (start + 1) + tail.length ≤ index := by
+                simp only [List.length_cons] at afterPrefix
+                omega
+              have restAgreement := ih (store := store.set start (some value))
+                (start := start + 1) (expressions := tail) restSuccess afterRest
+              have different : index ≠ start := by omega
+              rw [restAgreement]
+              exact set_other_lookup store start index (some value) different
 
 theorem StoreWellTyped.set (globals : List Surface.Signature) (slotTypes : List Surface.Ty)
     (store : Store) (slot : Nat) (value : PolyIR.Value) (type : Surface.Ty)
@@ -3155,6 +4901,121 @@ theorem initializeValues_arithmetic_preserves_typed
                 omega
               · exact restSuccess
 
+/- Initializer rows may refer to typed global functions as well as use the
+local arithmetic/constructor fragment. Their declared cell type is carried
+along with the term typing, so each successful write preserves the complete
+GlobalIR store invariant. -/
+def ContextualGlobalInitializerTypesAgree (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (slotTypes : List Surface.Ty) :
+    Nat → List Term → Prop
+  | _, [] => True
+  | slot, expression :: tail =>
+      ∃ type, slotTypes.get? slot = some type ∧
+        ContextualGlobalArithmeticTerm globals assignment [] expression type ∧
+        ContextualGlobalInitializerTypesAgree globals assignment slotTypes (slot + 1) tail
+
+/-- A stronger initializer row invariant for lowered value declarations that
+may read already initialized top-level slots through generated getters. -/
+def ContextualGlobalRuntimeInitializerTypesAgree (globals : List Surface.Signature)
+    (assignment : Nat → Surface.Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Surface.Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) : Nat → List Term → Prop
+  | _, [] => True
+  | slot, expression :: tail =>
+      ∃ type, slotTypes.get? slot = some type ∧
+        ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+          functionSources program [] expression type ∧
+        ContextualGlobalRuntimeInitializerTypesAgree globals assignment definitions
+          slotTypes functionSources program (slot + 1) tail
+
+theorem initializeValues_contextualGlobal_preserves_typed
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (fuel : Nat) (store : Store) (slot : Nat) (expressions : List Term) (result : Store)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (typesAgree : ContextualGlobalInitializerTypesAgree globals assignment slotTypes
+      slot expressions)
+    (slotsFit : ∀ offset, offset < expressions.length → slot + offset < store.length)
+    (success : initializeValues program fuel store slot expressions = .ok result) :
+    StoreWellTyped globals slotTypes result := by
+  induction fuel generalizing store slot expressions with
+  | zero => simp [initializeValues] at success
+  | succ fuel ih =>
+      cases expressions with
+      | nil =>
+          have same : store = result := by
+            simpa [initializeValues, pure, Except.pure] using success
+          simpa [same] using storeTyped
+      | cons head tail =>
+          rcases typesAgree with ⟨type, typeAtSlot, headTyped, tailTypesAgree⟩
+          cases step : evaluate program store fuel [] head with
+          | error fault => simp [initializeValues, step, bind, Except.bind] at success
+          | ok value =>
+              have valueTyped := evaluate_contextualGlobalArithmeticTerm_preserves_type
+                globals assignment definitions slotTypes functionSources program programTyped
+                store [] fuel [] .nil head type headTyped value step
+              have slotFits : slot < store.length := slotsFit 0 (by simp)
+              have nextStoreTyped := StoreWellTyped.set globals slotTypes store slot value type
+                storeTyped slotFits typeAtSlot valueTyped
+              have restSuccess :
+                  initializeValues program fuel (store.set slot (some value)) (slot + 1) tail =
+                    .ok result := by
+                simpa [initializeValues, step, bind, Except.bind] using success
+              apply ih (store := store.set slot (some value)) (slot := slot + 1)
+                (expressions := tail) nextStoreTyped tailTypesAgree
+              · intro offset below
+                have shifted := slotsFit (offset + 1) (by simp; omega)
+                rw [List.length_set]
+                omega
+              · exact restSuccess
+
+theorem initializeValues_contextualGlobalRuntime_preserves_typed
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (fuel : Nat) (store : Store) (slot : Nat) (expressions : List Term) (result : Store)
+    (storeLayout : store.length = slotTypes.length)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (typesAgree : ContextualGlobalRuntimeInitializerTypesAgree globals assignment definitions
+      slotTypes functionSources program slot expressions)
+    (slotsFit : ∀ offset, offset < expressions.length → slot + offset < store.length)
+    (success : initializeValues program fuel store slot expressions = .ok result) :
+    StoreWellTyped globals slotTypes result := by
+  induction fuel generalizing store slot expressions with
+  | zero => simp [initializeValues] at success
+  | succ fuel ih =>
+      cases expressions with
+      | nil =>
+          have same : store = result := by
+            simpa [initializeValues, pure, Except.pure] using success
+          simpa [same] using storeTyped
+      | cons head tail =>
+          rcases typesAgree with ⟨type, typeAtSlot, headTyped, tailTypesAgree⟩
+          cases step : evaluate program store fuel [] head with
+          | error fault => simp [initializeValues, step, bind, Except.bind] at success
+          | ok value =>
+              have valueTyped := evaluate_contextualGlobalRuntimeTerm_preserves_type
+                globals assignment definitions slotTypes functionSources program programTyped
+                store storeLayout storeTyped [] fuel [] ValuesTyped.nil head type
+                headTyped value step
+              have slotFits : slot < store.length := slotsFit 0 (by simp)
+              have nextStoreTyped := StoreWellTyped.set globals slotTypes store slot value type
+                storeTyped slotFits typeAtSlot valueTyped
+              have restSuccess :
+                  initializeValues program fuel (store.set slot (some value)) (slot + 1) tail =
+                    .ok result := by
+                simpa [initializeValues, step, bind, Except.bind] using success
+              apply ih (store := store.set slot (some value)) (slot := slot + 1)
+                (expressions := tail) (by simpa using storeLayout) nextStoreTyped tailTypesAgree
+              · intro offset below
+                have shifted := slotsFit (offset + 1) (by simp; omega)
+                rw [List.length_set]
+                omega
+              · exact restSuccess
+
 theorem initializeValues_preserves_typed (globals : List Surface.Signature)
     (program : List Definition) (slotTypes : List Surface.Ty) (fuel : Nat)
     (store : Store) (slot : Nat) (expressions : List Term) (result : Store)
@@ -3228,6 +5089,74 @@ theorem initializeValues_from_empty_preserves_typed (globals : List Surface.Sign
   · exact evaluationTyped
   · exact success
 
+/-- A successful typed initializer batch followed by a typed zero-argument
+entry call preserves both the initialized-store invariant and the entry result
+type. This composes the initializer loop with the observable `run` path; the
+remaining evaluator premise is the contextual GlobalIR fragment for each
+initializer and the entry body. -/
+theorem run_zero_arity_entry_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (runtimeDefinitions : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources
+      runtimeDefinitions)
+    (program : Program) (fuel entry : Nat) (initializedStore : Store)
+    (runtime : RuntimeDefinition) (resultType : Surface.Ty) (result : Value)
+    (initializerTypes : ContextualGlobalInitializerTypesAgree globals assignment
+      slotTypes 0 program.initializers)
+    (entryRuntime : runtimeDefinitions[entry]? = some (.function runtime))
+    (entryArity : runtime.arity = 0)
+    (entryBodyTyped : ContextualGlobalArithmeticTerm globals assignment []
+      runtime.body resultType)
+    (initialization : initializeValues runtimeDefinitions (fuel + 1)
+      (List.replicate program.initializers.length none) 0 program.initializers =
+      .ok initializedStore)
+    (runSuccess : run ⟨runtimeDefinitions, program.initializers, entry⟩ (fuel + 1) =
+      .ok result)
+    (fuelPositive : 0 < fuel) :
+    StoreWellTyped globals slotTypes initializedStore ∧
+      PolyIR.ValueTyped globals result resultType := by
+  have initializedTyped := initializeValues_contextualGlobal_preserves_typed
+    globals assignment definitions slotTypes functionSources runtimeDefinitions programTyped
+    (fuel + 1) (List.replicate program.initializers.length none) 0 program.initializers
+    initializedStore (empty_store_well_typed globals slotTypes program.initializers.length)
+    initializerTypes (by
+      intro offset below
+      simpa [List.length_replicate] using below) initialization
+  have entryStep : evaluate runtimeDefinitions initializedStore (fuel + 1) []
+      (.app (.global entry) []) = .ok result := by
+    have runExpanded : (initializeValues runtimeDefinitions (fuel + 1)
+        (List.replicate program.initializers.length none) 0 program.initializers).bind
+        (fun store => evaluate runtimeDefinitions store (fuel + 1) []
+          (.app (.global entry) [])) = .ok result := by
+      simpa [run] using runSuccess
+    rw [initialization] at runExpanded
+    exact runExpanded
+  have globalSuccess : evaluate runtimeDefinitions initializedStore fuel []
+      (.global entry) = .ok (.global entry) := by
+    cases fuel with
+    | zero => omega
+    | succ remaining => simp [evaluate, entryRuntime, pure, Except.pure]
+  have argumentsSuccess : evaluateArgs runtimeDefinitions initializedStore fuel [] [] =
+      .ok [] := by
+    cases fuel with
+    | zero => omega
+    | succ remaining => simp [evaluateArgs, pure, Except.pure]
+  have bodySuccess : evaluate runtimeDefinitions initializedStore fuel [] runtime.body =
+      .ok result := by
+    have callEq : evaluate runtimeDefinitions initializedStore (fuel + 1) []
+        (.app (.global entry) []) =
+        evaluate runtimeDefinitions initializedStore fuel [] runtime.body := by
+      simp [evaluate, globalSuccess, argumentsSuccess, entryRuntime, entryArity,
+        bind, Except.bind, Except.pure, pure]
+    rw [callEq] at entryStep
+    exact entryStep
+  have typedResult := evaluate_contextual_zero_arity_global_call_preserves_type
+    globals assignment definitions slotTypes functionSources runtimeDefinitions programTyped
+    initializedStore fuel entry runtime fuelPositive entryRuntime entryArity resultType
+    entryBodyTyped bodySuccess entryStep
+  exact ⟨initializedTyped, typedResult⟩
+
 theorem initialized_prefix_unchanged {fuel : Nat}
     (success : initializeValues program fuel store slot expressions = .ok result)
     (earlier : index < slot) : result[index]? = store[index]? := by
@@ -3273,6 +5202,141 @@ theorem initialized_cells_present {fuel : Nat}
         · apply ih rest
           · simpa only [List.length_set] using (show slot + 1 + tail.length ≤ store.length by omega)
           · constructor <;> omega
+
+/-- A top-level getter can also be the program entry. If its slot occurs in the
+successfully initialized batch, typed initializer preservation makes the
+store well typed and the successful `run` result has the getter's declared
+type. -/
+theorem run_getter_entry_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (runtimeDefinitions : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources
+      runtimeDefinitions)
+    (program : Program) (fuel entry slot : Nat) (initializedStore : Store)
+    (result : Value)
+    (initializerTypes : ContextualGlobalInitializerTypesAgree globals assignment
+      slotTypes 0 program.initializers)
+    (entryGetter : runtimeDefinitions[entry]? = some (.getter slot))
+    (slotInitializedByBatch : slot < program.initializers.length)
+    (initialization : initializeValues runtimeDefinitions (fuel + 2)
+      (List.replicate program.initializers.length none) 0 program.initializers =
+      .ok initializedStore)
+    (runSuccess : run ⟨runtimeDefinitions, program.initializers, entry⟩ (fuel + 2) =
+      .ok result) :
+    ∃ type, PolyIR.ValueTyped globals result type := by
+  have initializedTyped := initializeValues_contextualGlobal_preserves_typed
+    globals assignment definitions slotTypes functionSources runtimeDefinitions programTyped
+    (fuel + 2) (List.replicate program.initializers.length none) 0 program.initializers
+    initializedStore (empty_store_well_typed globals slotTypes program.initializers.length)
+    initializerTypes (by
+      intro offset below
+      simpa [List.length_replicate] using below) initialization
+  have slotPopulated : ∃ value,
+      initializedStore[slot]? = some (some value) :=
+    initialized_cells_present initialization (by simp) (by constructor <;> omega)
+  obtain ⟨storedValue, populated⟩ := slotPopulated
+  obtain ⟨type, getterResult, _signature, _wellFormed, _slotType,
+      getterEvaluation, resultTyped⟩ :=
+    typed_getter_call_preserves_type runtimeDefinitions globals definitions slotTypes
+      functionSources initializedStore fuel entry slot storedValue programTyped entryGetter
+      initializedTyped populated
+  have runStep : evaluate runtimeDefinitions initializedStore (fuel + 2) []
+      (.app (.global entry) []) = .ok result := by
+    have runExpanded : (initializeValues runtimeDefinitions (fuel + 2)
+        (List.replicate program.initializers.length none) 0 program.initializers).bind
+        (fun store => evaluate runtimeDefinitions store (fuel + 2) []
+          (.app (.global entry) [])) = .ok result := by
+      simpa [run] using runSuccess
+    rw [initialization] at runExpanded
+    exact runExpanded
+  rw [getterEvaluation] at runStep
+  injection runStep with resultEq
+  subst result
+  exact ⟨type, resultTyped⟩
+
+/-- With layout-aligned initializer and slot counts, a typed getter entry after
+successful initialization either returns a value of its declared type or
+reports exactly the `beforeInitialization` fault for its slot. -/
+theorem run_getter_entry_type_safe_or_early_read
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (runtimeDefinitions : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources
+      runtimeDefinitions)
+    (program : Program) (fuel entry slot : Nat) (initializedStore : Store)
+    (initializerTypes : ContextualGlobalInitializerTypesAgree globals assignment
+      slotTypes 0 program.initializers)
+    (initializerCount : program.initializers.length = slotTypes.length)
+    (entryGetter : runtimeDefinitions[entry]? = some (.getter slot))
+    (initialization : initializeValues runtimeDefinitions (fuel + 2)
+      (List.replicate program.initializers.length none) 0 program.initializers =
+      .ok initializedStore) :
+    ∃ type, globals[entry]? = some ⟨0, [], type⟩ ∧ slotTypes[slot]? = some type ∧
+      ((∃ value, run ⟨runtimeDefinitions, program.initializers, entry⟩ (fuel + 2) =
+          .ok value ∧ PolyIR.ValueTyped globals value type) ∨
+        run ⟨runtimeDefinitions, program.initializers, entry⟩ (fuel + 2) =
+          .error (.beforeInitialization slot)) := by
+  have initializedTyped := initializeValues_contextualGlobal_preserves_typed
+    globals assignment definitions slotTypes functionSources runtimeDefinitions programTyped
+    (fuel + 2) (List.replicate program.initializers.length none) 0 program.initializers
+    initializedStore (empty_store_well_typed globals slotTypes program.initializers.length)
+    initializerTypes (by
+      intro offset below
+      simpa [List.length_replicate] using below) initialization
+  have storeLayout : initializedStore.length = slotTypes.length := by
+    calc
+      initializedStore.length = (List.replicate program.initializers.length
+          (none : Option Value)).length := initialization_length initialization
+      _ = program.initializers.length := List.length_replicate _ _
+      _ = slotTypes.length := initializerCount
+  obtain ⟨type, signature, slotType, result⟩ :=
+    typed_getter_call_type_safe_or_early_read runtimeDefinitions globals definitions slotTypes
+      functionSources initializedStore fuel entry slot programTyped entryGetter storeLayout
+      initializedTyped
+  have runEq : run ⟨runtimeDefinitions, program.initializers, entry⟩ (fuel + 2) =
+      evaluate runtimeDefinitions initializedStore (fuel + 2) []
+        (.app (.global entry) []) := by
+    change (initializeValues runtimeDefinitions (fuel + 2)
+      (List.replicate program.initializers.length none) 0 program.initializers).bind
+      (fun store => evaluate runtimeDefinitions store (fuel + 2) []
+        (.app (.global entry) [])) = _
+    rw [initialization]
+    rfl
+  refine ⟨type, signature, slotType, ?_⟩
+  rcases result with success | early
+  · rcases success with ⟨value, evaluated, valueTyped⟩
+    exact Or.inl ⟨value, by simpa [runEq] using evaluated, valueTyped⟩
+  · exact Or.inr (by simpa [runEq] using early)
+
+theorem initializeValues_contextualGlobal_then_getter_preserves_type
+    (globals : List Surface.Signature) (assignment : Nat → Surface.Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Surface.Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (programTyped : GlobalProgramTyped globals definitions slotTypes functionSources program)
+    (fuel readFuel : Nat) (store : Store) (base slot : Nat)
+    (expressions : List Term) (initializedStore : Store) (type : Surface.Ty)
+    (getterIndex : Nat)
+    (storeTyped : StoreWellTyped globals slotTypes store)
+    (typesAgree : ContextualGlobalInitializerTypesAgree globals assignment slotTypes
+      base expressions)
+    (slotsFit : ∀ offset, offset < expressions.length → base + offset < store.length)
+    (batchFits : base + expressions.length ≤ store.length)
+    (selected : base ≤ slot ∧ slot < base + expressions.length)
+    (slotType : slotTypes[slot]? = some type)
+    (getter : program[getterIndex]? = some (.getter slot))
+    (initialized : initializeValues program fuel store base expressions =
+      .ok initializedStore) :
+    ∃ result,
+      evaluate program initializedStore (readFuel + 2) []
+        (.app (.global getterIndex) []) = .ok result ∧
+      PolyIR.ValueTyped globals result type := by
+  have storeAfterTyped := initializeValues_contextualGlobal_preserves_typed
+    globals assignment definitions slotTypes functionSources program programTyped fuel store
+    base expressions initializedStore storeTyped typesAgree slotsFit initialized
+  obtain ⟨storedValue, populated⟩ := initialized_cells_present initialized batchFits selected
+  exact getter_call_preserves_type program globals slotTypes initializedStore readFuel
+    getterIndex slot storedValue type getter slotType storeAfterTyped populated
 
 /-- Successful initialization of a decoded mixed top-level program populates
 every value slot in the layout established by the decoder. This connects the

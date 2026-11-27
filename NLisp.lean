@@ -1,6 +1,7 @@
 import NLisp.Lexical
 import NLisp.Core
 import NLisp.TypedExpansion
+import NLisp.LocalCertificateReuse
 import NLisp.ScopedSyntax
 import NLisp.CNameResolution
 import NLisp.CMacroCopy
@@ -36,7 +37,10 @@ import NLisp.CTypeArguments
 import NLisp.CTypeArgumentInference
 import NLisp.PolymorphicSafety
 import NLisp.GlobalIR
+import NLisp.BuiltinSemantics
+import NLisp.BuiltinStringSemantics
 import NLisp.GlobalIRErrorCorrespondence
 import NLisp.GlobalProgramEntry
 import NLisp.GlobalSourceLowering
+import NLisp.IntegerOptionalCorrespondence
 import NLisp.CheckerCompleteness

@@ -1301,6 +1301,45 @@ def inferTypeArguments (fuel callerCount : Nat) (header : Header) (actuals : Lis
     else none
   else none
 
+/-- A successful inference must have passed through its left-to-right
+constraint collector. Expose that intermediate result so representations of
+the C matcher can simulate the actual inference procedure, rather than only a
+candidate substitution. -/
+theorem inferTypeArguments_success_collectArguments
+    (fuel callerCount : Nat) (header : Header) (actuals : List Ty)
+    (solution : TypeArgumentSolution callerCount header actuals)
+    (accepted : inferTypeArguments fuel callerCount header actuals = some solution) :
+    ∃ assignments,
+      collectArguments fuel (header.parameters.map Prod.snd) actuals
+        (List.replicate header.variables.length none) = some assignments ∧
+      assignments.mapM (fun value => value) = some solution.arguments := by
+  unfold inferTypeArguments at accepted
+  split at accepted
+  · rename_i covered
+    cases collected : collectArguments fuel (header.parameters.map Prod.snd) actuals
+        (List.replicate header.variables.length none) with
+    | none => simp [collected] at accepted
+    | some assignments =>
+      cases mapped : assignments.mapM (fun value => value) with
+      | none => simp [collected, mapped] at accepted
+      | some arguments =>
+        cases checked : checkTypesWF fuel callerCount arguments with
+        | none => simp [collected, mapped, checked] at accepted
+        | some valid =>
+          by_cases arity : arguments.length = header.variables.length
+          · by_cases matchOk : instantiateTypes arguments
+                (header.parameters.map Prod.snd) = actuals
+            · simp [collected, mapped, checked, arity, matchOk] at accepted
+              have solutionEq : solution.arguments = arguments := by
+                exact (congrArg
+                  (fun result : TypeArgumentSolution callerCount header actuals => result.arguments)
+                  accepted).symm
+              exact ⟨assignments, rfl,
+                mapped.trans (congrArg some solutionEq.symm)⟩
+            · simp [collected, mapped, checked, arity, matchOk] at accepted
+          · simp [collected, mapped, checked, arity] at accepted
+  · simp at accepted
+
 /-- Boundary theorem for C `check_call`: successful left-to-right argument
 constraint collection yields the unique substitution, and only then is that
 substitution applied to the declared result type. No expected result type is

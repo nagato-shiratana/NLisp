@@ -208,6 +208,220 @@ theorem checkWithLookupCost_le_checkWithLookupCostBitsBound
   | none => simp
   | some sites => exact checkSitesWithLookupCost_le_siteLookupBitsBound sites
 
+def siteFullCostBitsBound (site : NLisp.CBindingWalk.Site) : Nat :=
+  site.environment.length * (byteStringBits site.name + 16) +
+    2 * cBindingEnvironmentBits site.environment +
+    1 + cBindingEnvironmentBits site.caller +
+    cBindingEnvironmentBits site.environment * cBindingEnvironmentBits site.environment +
+    cBindingEnvironmentBits site.caller * cBindingEnvironmentBits site.caller
+
+def bindingWalkSiteBits (site : NLisp.CBindingWalk.Site) : Nat :=
+  1 + byteStringBits site.name + naturalBits site.selected +
+    cBindingEnvironmentBits site.environment + cBindingEnvironmentBits site.caller
+
+def bindingWalkSitesBits (sites : List NLisp.CBindingWalk.Site) : Nat :=
+  sites.foldr (fun site rest => bindingWalkSiteBits site + rest) 0
+
+theorem siteFullCostBitsBound_le_siteBits_squared (site : NLisp.CBindingWalk.Site) :
+    siteFullCostBitsBound site ≤ 23 * (bindingWalkSiteBits site *
+      bindingWalkSiteBits site) := by
+  let bits := bindingWalkSiteBits site
+  have bitsPositive : 1 ≤ bits := by
+    dsimp [bits, bindingWalkSiteBits]
+    omega
+  have nameBound : byteStringBits site.name ≤ bits := by
+    simp only [bits, bindingWalkSiteBits]
+    omega
+  have environmentBound : cBindingEnvironmentBits site.environment ≤ bits := by
+    simp only [bits, bindingWalkSiteBits]
+    omega
+  have callerBound : cBindingEnvironmentBits site.caller ≤ bits := by
+    simp only [bits, bindingWalkSiteBits]
+    omega
+  have environmentLengthBound : site.environment.length ≤ bits :=
+    Nat.le_trans (cBindingEnvironmentLength_le_bits site.environment) environmentBound
+  have callerLengthBound : site.caller.length ≤ bits :=
+    Nat.le_trans (cBindingEnvironmentLength_le_bits site.caller) callerBound
+  have namePlusConstantBound : byteStringBits site.name + 16 ≤ 17 * bits := by
+    have constantBound := Nat.mul_le_mul_left 16 bitsPositive
+    simp only [Nat.mul_one] at constantBound
+    omega
+  have firstTermBound := Nat.mul_le_mul environmentLengthBound namePlusConstantBound
+  have firstTermBound' : site.environment.length * (byteStringBits site.name + 16) ≤
+      17 * (bits * bits) := by
+    calc
+      _ ≤ bits * (17 * bits) := by simpa [bits] using firstTermBound
+      _ = (bits * 17) * bits := by rw [Nat.mul_assoc]
+      _ = (17 * bits) * bits := by rw [Nat.mul_comm bits 17]
+      _ = 17 * (bits * bits) := by rw [← Nat.mul_assoc]
+  have bitsLeSquare : bits ≤ bits * bits := by
+    have bound := Nat.mul_le_mul_left bits bitsPositive
+    simpa using bound
+  have environmentLinearBound : 2 * cBindingEnvironmentBits site.environment ≤
+      2 * (bits * bits) := by
+    exact Nat.le_trans (Nat.mul_le_mul_left 2 environmentBound)
+      (Nat.mul_le_mul_left 2 bitsLeSquare)
+  have callerLinearBound : cBindingEnvironmentBits site.caller ≤ bits * bits :=
+    Nat.le_trans callerBound bitsLeSquare
+  have environmentSquareBound := Nat.mul_le_mul environmentBound environmentBound
+  have callerSquareBound := Nat.mul_le_mul callerBound callerBound
+  have oneBound : 1 ≤ bits * bits := Nat.le_trans (by omega) bitsLeSquare
+  unfold siteFullCostBitsBound
+  change site.environment.length * (byteStringBits site.name + 16) +
+      2 * cBindingEnvironmentBits site.environment + 1 + cBindingEnvironmentBits site.caller +
+      cBindingEnvironmentBits site.environment * cBindingEnvironmentBits site.environment +
+      cBindingEnvironmentBits site.caller * cBindingEnvironmentBits site.caller ≤
+    23 * (bits * bits)
+  omega
+
+def siteFullCostBitsBounds (sites : List NLisp.CBindingWalk.Site) : Nat :=
+  sites.foldr (fun site rest => siteFullCostBitsBound site + rest) 0
+
+theorem siteFullCostBitsBounds_le_sitesBits_squared
+    (sites : List NLisp.CBindingWalk.Site) :
+    siteFullCostBitsBounds sites ≤ 23 * (bindingWalkSitesBits sites *
+      bindingWalkSitesBits sites) := by
+  induction sites with
+  | nil => simp [siteFullCostBitsBounds, bindingWalkSitesBits]
+  | cons site rest ih =>
+      have siteBound := siteFullCostBitsBound_le_siteBits_squared site
+      change siteFullCostBitsBound site + siteFullCostBitsBounds rest ≤
+        23 * ((bindingWalkSiteBits site + bindingWalkSitesBits rest) *
+          (bindingWalkSiteBits site + bindingWalkSitesBits rest))
+      have squaresBound : bindingWalkSiteBits site * bindingWalkSiteBits site +
+          bindingWalkSitesBits rest * bindingWalkSitesBits rest ≤
+          (bindingWalkSiteBits site + bindingWalkSitesBits rest) *
+            (bindingWalkSiteBits site + bindingWalkSitesBits rest) := by
+        calc
+          _ ≤ bindingWalkSiteBits site * bindingWalkSiteBits site +
+              bindingWalkSiteBits site * bindingWalkSitesBits rest +
+              bindingWalkSitesBits rest * bindingWalkSiteBits site +
+              bindingWalkSitesBits rest * bindingWalkSitesBits rest := by
+                have cross := Nat.zero_le
+                  (bindingWalkSiteBits site * bindingWalkSitesBits rest)
+                have cross' := Nat.zero_le
+                  (bindingWalkSitesBits rest * bindingWalkSiteBits site)
+                omega
+          _ = (bindingWalkSiteBits site + bindingWalkSitesBits rest) *
+              (bindingWalkSiteBits site + bindingWalkSitesBits rest) := by
+                simp [Nat.add_mul, Nat.mul_add, Nat.add_assoc, Nat.add_left_comm,
+                  Nat.add_comm]
+      calc
+        _ ≤ 23 * (bindingWalkSiteBits site * bindingWalkSiteBits site) +
+            23 * (bindingWalkSitesBits rest * bindingWalkSitesBits rest) :=
+              Nat.add_le_add (by simpa [Nat.mul_assoc] using siteBound)
+                (by simpa [Nat.mul_assoc] using ih)
+        _ = 23 * (bindingWalkSiteBits site * bindingWalkSiteBits site +
+            bindingWalkSitesBits rest * bindingWalkSitesBits rest) := by
+              rw [Nat.mul_add]
+        _ ≤ 23 * ((bindingWalkSiteBits site + bindingWalkSitesBits rest) *
+            (bindingWalkSiteBits site + bindingWalkSitesBits rest)) :=
+              Nat.mul_le_mul_left 23 squaresBound
+        _ = 23 * ((bindingWalkSiteBits site + bindingWalkSitesBits rest) *
+            (bindingWalkSiteBits site + bindingWalkSitesBits rest)) := rfl
+
+private theorem environmentNamePayloadBytes_le_bits
+    (environment : List NLisp.CNameResolution.Entry) :
+    8 * NLisp.CBindingWalk.environmentNameBytes environment ≤
+      environment.foldr (fun entry rest => byteStringBits entry.name + rest) 0 := by
+  induction environment with
+  | nil => simp [NLisp.CBindingWalk.environmentNameBytes]
+  | cons entry rest ih =>
+      simp only [NLisp.CBindingWalk.environmentNameBytes, List.foldr]
+      have payload : 8 * entry.name.toUTF8.data.size ≤ byteStringBits entry.name := by
+        unfold byteStringBits
+        exact Nat.le_add_left _ _
+      have ih' := ih
+      simp [NLisp.CBindingWalk.environmentNameBytes] at ih'
+      omega
+
+private theorem acceptsLookupBudget_le_siteLookupBitsBound
+    (site : NLisp.CBindingWalk.Site) :
+    NLisp.CBindingWalk.acceptsLookupBudget site ≤
+      site.environment.length * (byteStringBits site.name + 16) +
+        cBindingEnvironmentBits site.environment := by
+  rw [NLisp.CBindingWalk.acceptsLookupBudget_expanded]
+  have payloadBound := environmentNamePayloadBytes_le_bits site.environment
+  have namesBound := cBindingKeyBits_le_encoding site.environment
+  have queryBound : 8 * (site.name.toUTF8.data.size + 1) ≤ byteStringBits site.name + 16 := by
+    unfold byteStringBits
+    omega
+  have environmentPayloadBound :
+      8 * NLisp.CBindingWalk.environmentNameBytes site.environment ≤
+        cBindingEnvironmentBits site.environment := by
+    have keyPayloadBound := Nat.le_trans payloadBound namesBound
+    unfold cBindingEnvironmentBits
+    omega
+  have scaledQueryBound := Nat.mul_le_mul_left site.environment.length queryBound
+  calc
+    _ = site.environment.length * (8 * (site.name.toUTF8.data.size + 1)) +
+        8 * NLisp.CBindingWalk.environmentNameBytes site.environment := by
+          simp [Nat.mul_add, Nat.mul_comm, Nat.mul_left_comm, Nat.mul_assoc]
+    _ ≤ site.environment.length * (byteStringBits site.name + 16) +
+        cBindingEnvironmentBits site.environment :=
+          Nat.add_le_add scaledQueryBound environmentPayloadBound
+
+theorem acceptsWithFullCost_le_siteFullCostBitsBound
+    (site : NLisp.CBindingWalk.Site) :
+    (NLisp.CBindingWalk.acceptsWithFullCost site).2 ≤ siteFullCostBitsBound site := by
+  have localBound := NLisp.CBindingWalk.acceptsWithFullCost_cost_le site
+  have lookupBound := findNameByteCost_le_query_and_environment_bits site.name site.environment
+  have environmentLengthBound := cBindingEnvironmentLength_le_bits site.environment
+  have callerLengthBound := cBindingEnvironmentLength_le_bits site.caller
+  have environmentSquareBound := Nat.mul_le_mul environmentLengthBound environmentLengthBound
+  have callerSquareBound := Nat.mul_le_mul callerLengthBound callerLengthBound
+  have lookupBudgetBound := acceptsLookupBudget_le_siteLookupBitsBound site
+  unfold NLisp.CBindingWalk.acceptsFullCostBudget at localBound
+  calc
+    _ ≤ NLisp.CBindingWalk.acceptsLookupBudget site +
+        (1 + site.caller.length + site.environment.length * site.environment.length +
+          site.caller.length * site.caller.length) := localBound
+    _ ≤ siteFullCostBitsBound site := by
+      unfold siteFullCostBitsBound
+      omega
+
+theorem checkSitesWithFullCost_le_siteFullCostBitsBounds
+    (sites : List NLisp.CBindingWalk.Site) :
+    (NLisp.CBindingWalk.checkSitesWithFullCost sites).2 ≤ siteFullCostBitsBounds sites := by
+  induction sites with
+  | nil => simp [NLisp.CBindingWalk.checkSitesWithFullCost, siteFullCostBitsBounds]
+  | cons site rest ih =>
+      have localBound := acceptsWithFullCost_le_siteFullCostBitsBound site
+      change (NLisp.CBindingWalk.acceptsWithFullCost site).2 +
+          (NLisp.CBindingWalk.checkSitesWithFullCost rest).2 ≤
+        siteFullCostBitsBound site + siteFullCostBitsBounds rest
+      exact Nat.add_le_add localBound ih
+
+def checkWithFullCostBitsBound (fuel : Nat) (forms : List NLisp.CBindingWalk.Node)
+    (builtins : List NLisp.CNameResolution.Entry) : Nat :=
+  match NLisp.CBindingWalk.references fuel forms builtins with
+  | none => 0
+  | some sites => siteFullCostBitsBounds sites
+
+theorem checkWithFullCost_le_checkWithFullCostBitsBound
+    (fuel : Nat) (forms : List NLisp.CBindingWalk.Node)
+    (builtins : List NLisp.CNameResolution.Entry) :
+    (NLisp.CBindingWalk.checkWithFullCost fuel forms builtins).2 ≤
+      checkWithFullCostBitsBound fuel forms builtins := by
+  unfold NLisp.CBindingWalk.checkWithFullCost checkWithFullCostBitsBound
+  cases NLisp.CBindingWalk.references fuel forms builtins with
+  | none => simp
+  | some sites => exact checkSitesWithFullCost_le_siteFullCostBitsBounds sites
+
+theorem checkWithFullCost_le_referencedSitesBits_squared
+    (fuel : Nat) (forms : List NLisp.CBindingWalk.Node)
+    (builtins : List NLisp.CNameResolution.Entry) :
+    (NLisp.CBindingWalk.checkWithFullCost fuel forms builtins).2 ≤
+      match NLisp.CBindingWalk.references fuel forms builtins with
+      | none => 0
+      | some sites => 23 * (bindingWalkSitesBits sites * bindingWalkSitesBits sites) := by
+  unfold NLisp.CBindingWalk.checkWithFullCost
+  cases NLisp.CBindingWalk.references fuel forms builtins with
+  | none => simp
+  | some sites =>
+      exact Nat.le_trans (checkSitesWithFullCost_le_siteFullCostBitsBounds sites)
+        (siteFullCostBitsBounds_le_sitesBits_squared sites)
+
 /- The verifier receives the UTF-8 process-certificate artifact as a file.
 This is its raw input length in bits; it includes embedded JSON, source,
 identifiers, numerals, generated Lean text, and proof terms as serialized. -/
@@ -605,6 +819,67 @@ theorem expressionBits_app_nil (function : Surface.Expr) :
   simp [expressionBits]
   omega
 
+theorem expressionBits_app_one (function argument : Surface.Expr) :
+    expressionBits (.app function [argument]) =
+      3 + expressionBits function + expressionBits argument := by
+  simp [expressionBits]
+  omega
+
+noncomputable def expressionListTreeBits (expressions : List Surface.Expr) : Nat :=
+  Surface.Expr.rec_1
+    (motive_1 := fun _ => Nat)
+    (motive_2 := fun _ => Nat)
+    (fun index => 1 + naturalBits index)
+    (fun index arguments => 1 + naturalBits index + typeListBits arguments)
+    (fun _ => 2)
+    (fun value => 1 + integerBits value)
+    (fun _ => 1 + floatBits 0)
+    (fun value => 1 + value.toUTF8.data.size * 8)
+    (fun value => 1 + naturalBits value.toNat)
+    1
+    (fun parameters result _ bodyBits =>
+      1 + typeListBits parameters + typeBits result + bodyBits)
+    (fun _ _ functionBits argumentsBits => 1 + functionBits + argumentsBits)
+    (fun _ _ _ conditionBits yesBits noBits => 1 + conditionBits + yesBits + noBits)
+    (fun _ _ leftBits rightBits => 1 + leftBits + rightBits)
+    (fun _ _ leftBits rightBits => 1 + leftBits + rightBits)
+    (fun _ _ leftBits rightBits => 1 + leftBits + rightBits)
+    (fun _ _ leftBits rightBits => 1 + leftBits + rightBits)
+    (fun _ _ leftBits rightBits => 1 + leftBits + rightBits)
+    (fun types _ _ initializersBits bodyBits =>
+      1 + typeListBits types + initializersBits + bodyBits)
+    (fun _ _ firstBits restBits => 1 + firstBits + restBits)
+    (fun type => 1 + typeBits type)
+    (fun type _ _ headBits tailBits => 1 + typeBits type + headBits + tailBits)
+    (fun type => 1 + typeBits type)
+    (fun type _ valueBits => 1 + typeBits type + valueBits)
+    (fun _ _ _ targetBits emptyBits fullBits => 1 + targetBits + emptyBits + fullBits)
+    (fun _ _ _ targetBits emptyBits fullBits => 1 + targetBits + emptyBits + fullBits)
+    (fun _ _ _ leftBits rightBits => 1 + leftBits + rightBits)
+    1
+    (fun head tail headBits tailBits => 1 + headBits + tailBits)
+    expressions
+
+theorem expressionBits_app_arguments (function : Surface.Expr)
+    (arguments : List Surface.Expr) :
+    expressionBits (.app function arguments) =
+      1 + expressionBits function + expressionListTreeBits arguments := by
+  induction arguments with
+  | nil => simp [expressionListTreeBits, expressionBits_app_nil] <;> omega
+  | cons _ _ _ => rfl
+
+theorem expressionBits_letMany_arguments (types : List Surface.Ty)
+    (initializers : List Surface.Expr) (body : Surface.Expr) :
+    expressionBits (.letMany types initializers body) =
+      1 + typeListBits types + expressionListTreeBits initializers + expressionBits body := by
+  rfl
+
+theorem expressionBits_begin_arguments (first : Surface.Expr)
+    (rest : List Surface.Expr) :
+    expressionBits (.begin first rest) =
+      1 + expressionBits first + expressionListTreeBits rest := by
+  rfl
+
 
 noncomputable def expressionListPayloadBits (expressions : List Surface.Expr) : Nat :=
   expressions.foldr (fun expression rest => expressionBits expression + rest) 1
@@ -961,6 +1236,9 @@ inductive CheckerBinaryTreeExpression : Surface.Expr → Prop where
       CheckerBinaryTreeExpression (.lam parameters result body)
   | appZero (function : Surface.Expr) : CheckerBinaryTreeExpression function →
       CheckerBinaryTreeExpression (.app function [])
+  | appOne (function argument : Surface.Expr) :
+      CheckerBinaryTreeExpression function → CheckerBinaryTreeExpression argument →
+      CheckerBinaryTreeExpression (.app function [argument])
   | letManyNil (types : List Surface.Ty) (body : Surface.Expr) :
       CheckerBinaryTreeExpression body →
       CheckerBinaryTreeExpression (.letMany types [] body)
@@ -1200,6 +1478,31 @@ theorem checkerBinaryTreeExpression_fuel_bound (globals : List Surface.Signature
         _ = (2 + expressionBits function) * expressionCheckerScale globals := by
             rw [Nat.add_mul]
             omega
+  | appOne function argument functionTree argumentTree functionIH argumentIH =>
+      have children := Nat.add_le_add functionIH argumentIH
+      have scaleLower : 2 ≤ expressionCheckerScale globals := by
+        simp [expressionCheckerScale]
+      rw [expressionBits_app_one]
+      simp only [Surface.checkerExprFuel, Surface.checkerExprsFuel]
+      calc
+        _ = (Surface.checkerExprFuel globals function + 1) +
+            (Surface.checkerExprFuel globals argument + 1) + 2 := by omega
+        _ ≤ expressionBits function * expressionCheckerScale globals +
+            expressionBits argument * expressionCheckerScale globals + 2 := by omega
+        _ ≤ (expressionBits function + expressionBits argument + 2) *
+            expressionCheckerScale globals := by
+              rw [Nat.add_mul]
+              have sumsFactor : (expressionBits function + expressionBits argument) *
+                  expressionCheckerScale globals =
+                    expressionBits function * expressionCheckerScale globals +
+                    expressionBits argument * expressionCheckerScale globals := Nat.add_mul _ _ _
+              rw [sumsFactor]
+              have overhead := Nat.mul_le_mul_left (expressionCheckerScale globals) scaleLower
+              omega
+        _ ≤ (3 + expressionBits function + expressionBits argument) *
+            expressionCheckerScale globals := by
+              apply Nat.mul_le_mul_right
+              omega
   | letManyNil types body bodyTree bodyIH =>
       have parts := Nat.add_le_add
         (checkerTypesFuel_le_scaled_typeListBits globals types) bodyIH
@@ -1547,6 +1850,128 @@ theorem checkerBinaryTreeExpressions_fuel_plus_one_bound
     _ = (naturalBits expressions.length + expressionListPayloadBits expressions) *
           expressionCheckerScale globals := by rw [Nat.add_mul]; omega
 
+theorem checkerBinaryTreeExpressions_treeFuel_bound
+    (globals : List Surface.Signature) (expressions : List Surface.Expr)
+    (trees : CheckerBinaryTreeExpressions expressions) :
+    Surface.checkerExprsFuel globals expressions + 1 ≤
+      expressionListTreeBits expressions * expressionCheckerScale globals := by
+  induction trees with
+  | nil =>
+      have scaleLower : 2 ≤ expressionCheckerScale globals := by
+        simp [expressionCheckerScale]
+      simp [Surface.checkerExprsFuel, expressionListTreeBits]
+      omega
+  | cons head tail headTree tailTrees tailIH =>
+      simp only [Surface.checkerExprsFuel, expressionListTreeBits, List.foldr]
+      have headBound := checkerBinaryTreeExpression_fuel_bound globals head headTree
+      have childBound := Nat.add_le_add headBound tailIH
+      calc
+        Surface.checkerExprFuel globals head +
+            Surface.checkerExprsFuel globals tail + 1 + 1 =
+            (Surface.checkerExprFuel globals head + 1) +
+              (Surface.checkerExprsFuel globals tail + 1) := by omega
+        _ ≤ expressionBits head * expressionCheckerScale globals +
+            expressionListTreeBits tail * expressionCheckerScale globals := childBound
+        _ = (expressionBits head + expressionListTreeBits tail) *
+            expressionCheckerScale globals := by rw [Nat.add_mul]
+        _ ≤ (1 + expressionBits head + expressionListTreeBits tail) *
+            expressionCheckerScale globals := by
+              apply Nat.mul_le_mul_right
+              omega
+
+inductive CheckerBinaryTreeApplication : Surface.Expr → Prop where
+  | app (function : Surface.Expr) (arguments : List Surface.Expr) :
+      CheckerBinaryTreeExpression function → CheckerBinaryTreeExpressions arguments →
+      CheckerBinaryTreeApplication (.app function arguments)
+
+theorem checkerBinaryTreeApplication_fuel_bound (globals : List Surface.Signature)
+    (expression : Surface.Expr) (application : CheckerBinaryTreeApplication expression) :
+    Surface.checkerExprFuel globals expression + 1 ≤
+      expressionBits expression * expressionCheckerScale globals := by
+  cases application with
+  | app function arguments functionTree argumentTrees =>
+      have functionBound := checkerBinaryTreeExpression_fuel_bound globals function functionTree
+      have argumentsBound := checkerBinaryTreeExpressions_treeFuel_bound globals arguments
+        argumentTrees
+      rw [expressionBits_app_arguments]
+      simp only [Surface.checkerExprFuel]
+      have children := Nat.add_le_add functionBound argumentsBound
+      calc
+        _ = (Surface.checkerExprFuel globals function + 1) +
+            (Surface.checkerExprsFuel globals arguments + 1) := by omega
+        _ ≤ expressionBits function * expressionCheckerScale globals +
+            expressionListTreeBits arguments * expressionCheckerScale globals := children
+        _ = (expressionBits function + expressionListTreeBits arguments) *
+            expressionCheckerScale globals := by rw [Nat.add_mul]
+        _ ≤ (1 + expressionBits function + expressionListTreeBits arguments) *
+            expressionCheckerScale globals := by
+              apply Nat.mul_le_mul_right
+              omega
+
+inductive CheckerBinaryTreeLetMany : Surface.Expr → Prop where
+  | letMany (types : List Surface.Ty) (initializers : List Surface.Expr)
+      (body : Surface.Expr) :
+      CheckerBinaryTreeExpression body → CheckerBinaryTreeExpressions initializers →
+      CheckerBinaryTreeLetMany (.letMany types initializers body)
+
+theorem checkerBinaryTreeLetMany_fuel_bound (globals : List Surface.Signature)
+    (expression : Surface.Expr) (letMany : CheckerBinaryTreeLetMany expression) :
+    Surface.checkerExprFuel globals expression + 1 ≤
+      expressionBits expression * expressionCheckerScale globals := by
+  cases letMany with
+  | letMany types initializers body bodyTree initializerTrees =>
+      have typesBound := checkerTypesFuel_le_scaled_typeListBits globals types
+      have initializerBound := checkerBinaryTreeExpressions_treeFuel_bound globals
+        initializers initializerTrees
+      have bodyBound := checkerBinaryTreeExpression_fuel_bound globals body bodyTree
+      have children := Nat.add_le_add (Nat.add_le_add typesBound initializerBound) bodyBound
+      have scalePositive : 0 < expressionCheckerScale globals := by
+        simp [expressionCheckerScale]
+      rw [expressionBits_letMany_arguments]
+      simp only [Surface.checkerExprFuel]
+      calc
+        _ ≤ (Surface.checkerTypesFuel types + 1) +
+            (Surface.checkerExprsFuel globals initializers + 1) +
+            (Surface.checkerExprFuel globals body + 1) := by omega
+        _ ≤ typeListBits types * expressionCheckerScale globals +
+            expressionListTreeBits initializers * expressionCheckerScale globals +
+            expressionBits body * expressionCheckerScale globals := children
+        _ = (typeListBits types + expressionListTreeBits initializers +
+            expressionBits body) * expressionCheckerScale globals := by
+          rw [Nat.add_mul, Nat.add_mul]
+        _ ≤ (1 + typeListBits types + expressionListTreeBits initializers +
+            expressionBits body) * expressionCheckerScale globals := by
+          apply Nat.mul_le_mul_right
+          omega
+
+inductive CheckerBinaryTreeBegin : Surface.Expr → Prop where
+  | sequence (first : Surface.Expr) (rest : List Surface.Expr) :
+      CheckerBinaryTreeExpression first → CheckerBinaryTreeExpressions rest →
+      CheckerBinaryTreeBegin (.begin first rest)
+
+theorem checkerBinaryTreeBegin_fuel_bound (globals : List Surface.Signature)
+    (expression : Surface.Expr) (beginTree : CheckerBinaryTreeBegin expression) :
+    Surface.checkerExprFuel globals expression + 1 ≤
+      expressionBits expression * expressionCheckerScale globals := by
+  cases beginTree with
+  | sequence first rest firstTree restTrees =>
+      have firstBound := checkerBinaryTreeExpression_fuel_bound globals first firstTree
+      have restBound := checkerBinaryTreeExpressions_treeFuel_bound globals rest restTrees
+      have children := Nat.add_le_add firstBound restBound
+      rw [expressionBits_begin_arguments]
+      simp only [Surface.checkerExprFuel]
+      calc
+        _ = (Surface.checkerExprFuel globals first + 1) +
+            (Surface.checkerExprsFuel globals rest + 1) := by omega
+        _ ≤ expressionBits first * expressionCheckerScale globals +
+            expressionListTreeBits rest * expressionCheckerScale globals := children
+        _ = (expressionBits first + expressionListTreeBits rest) *
+            expressionCheckerScale globals := by rw [Nat.add_mul]
+        _ ≤ (1 + expressionBits first + expressionListTreeBits rest) *
+            expressionCheckerScale globals := by
+              apply Nat.mul_le_mul_right
+              omega
+
 theorem signatureBits_positive (signature : Surface.Signature) :
     0 < signatureBits signature := by
   unfold signatureBits
@@ -1603,6 +2028,72 @@ theorem typedProgramSignatureValidationAndScanCost_le_bits
         simp [typedProgramBits]
         omega
   omega
+
+/-- Combined verifier cost for the portions whose recursive syntax bounds are
+available: signature WF checking, checking every supported top-level body,
+and visiting the top-level signature/body rows. The global-reference lookup
+rechecks the signature table, so the body term carries that scale factor and
+the resulting whole-program bound is quadratic in encoded program bits. -/
+def typedProgramCheckerCost (signatures : List Surface.Signature)
+    (bodies : List Surface.Expr) : Nat :=
+  Surface.checkerSignaturesFuel signatures +
+    Surface.checkerExprsFuel signatures bodies +
+    typedProgramTopLevelScanCost signatures bodies
+
+theorem typedProgramCheckerCost_le_bits_squared
+    (signatures : List Surface.Signature) (bodies : List Surface.Expr) (entry : Nat)
+    (bodyTrees : CheckerBinaryTreeExpressions bodies) :
+    typedProgramCheckerCost signatures bodies ≤
+      5 * typedProgramBits signatures bodies entry ^ 2 := by
+  let inputBits := typedProgramBits signatures bodies entry
+  have inputPositive : 1 ≤ inputBits := by
+    simp [inputBits, typedProgramBits]
+    omega
+  have signatureValidation := checkerSignaturesFuel_le_signatureListBits signatures
+  have signaturePart : Surface.checkerSignaturesFuel signatures ≤ inputBits := by
+    dsimp [inputBits, typedProgramBits]
+    simp only [signatureListBits] at signatureValidation ⊢
+    omega
+  have scanPart : typedProgramTopLevelScanCost signatures bodies ≤ inputBits :=
+    typedProgramTopLevelScanCost_le_bits signatures bodies entry
+  have bodyPart : expressionListBits bodies ≤ inputBits := by
+    dsimp [inputBits, typedProgramBits]
+    omega
+  have scalePart : expressionCheckerScale signatures ≤ inputBits + 2 := by
+    unfold expressionCheckerScale
+    omega
+  have bodyCheck := checkerBinaryTreeExpressions_fuel_plus_one_bound
+    signatures bodies bodyTrees
+  have bodyScaled : Surface.checkerExprsFuel signatures bodies + 1 ≤
+      inputBits * (inputBits + 2) := by
+    calc
+      _ ≤ expressionListBits bodies * expressionCheckerScale signatures := bodyCheck
+      _ ≤ inputBits * (inputBits + 2) := by
+        exact Nat.mul_le_mul bodyPart scalePart
+  have additivePart :
+      Surface.checkerSignaturesFuel signatures +
+        typedProgramTopLevelScanCost signatures bodies ≤ 2 * inputBits := by omega
+  unfold typedProgramCheckerCost
+  have bodyBound : Surface.checkerExprsFuel signatures bodies ≤
+      inputBits * (inputBits + 2) := by omega
+  have squareDominates : inputBits ≤ inputBits * inputBits := by
+    calc
+      inputBits = inputBits * 1 := (Nat.mul_one _).symm
+      _ ≤ inputBits * inputBits := Nat.mul_le_mul_left _ inputPositive
+  have fourSquareDominates : 4 * inputBits ≤ 4 * (inputBits * inputBits) :=
+    Nat.mul_le_mul_left 4 squareDominates
+  have arithmeticBound : 2 * inputBits + inputBits * (inputBits + 2) ≤
+      5 * (inputBits * inputBits) := by
+    rw [Nat.mul_add]
+    calc
+      2 * inputBits + (inputBits * inputBits + inputBits * 2) =
+          4 * inputBits + inputBits * inputBits := by omega
+      _ ≤ 4 * (inputBits * inputBits) + inputBits * inputBits := by
+        omega
+      _ = 5 * (inputBits * inputBits) := by omega
+  calc
+    _ ≤ 2 * inputBits + inputBits * (inputBits + 2) := by omega
+    _ ≤ 5 * inputBits ^ 2 := by simpa [Nat.pow_two] using arithmeticBound
 
 noncomputable def rulesBits (rules : List (Nat × Tree)) : Nat :=
   naturalBits rules.length + rules.foldr
@@ -1860,5 +2351,47 @@ theorem checkFreshWithMatchCost_le_processBits_quadratic
     simpa [Nat.mul_assoc] using finalBound'
   have combined := Nat.le_trans costBound finalBound
   simpa [inputBits, Nat.pow_succ, Nat.mul_assoc] using combined
+
+/-- Combined quadratic bound for typed-program checking and expansion
+certificate checking. The signature check, supported expression-body check,
+top-level row scan, and measured certificate/matcher traversal share the same
+complete process input-size measure. -/
+noncomputable def measuredProcessCheckCost (source : String) (rules : List (Nat × Tree))
+    (certificate : Certificate) (signatures : List Surface.Signature)
+    (bodies : List Surface.Expr) : Nat :=
+  typedProgramCheckerCost signatures bodies +
+    (checkFreshWithMatchCost rules certificate).2
+
+theorem measuredProcessCheckCost_le_processBits_squared
+    (source : String) (rules : List (Nat × Tree)) (certificate : Certificate)
+    (signatures : List Surface.Signature) (bodies : List Surface.Expr) (entry : Nat)
+    (bodyTrees : CheckerBinaryTreeExpressions bodies) :
+    measuredProcessCheckCost source rules certificate signatures bodies ≤
+      13 * processDataBits source rules certificate signatures bodies entry ^ 2 := by
+  let processBits := processDataBits source rules certificate signatures bodies entry
+  have typedIncluded : typedProgramBits signatures bodies entry ≤ processBits := by
+    dsimp [processBits, processDataBits, checkedExpansionBits]
+    omega
+  have typedSquareIncluded :
+      typedProgramBits signatures bodies entry * typedProgramBits signatures bodies entry ≤
+        processBits * processBits := Nat.mul_le_mul typedIncluded typedIncluded
+  have typedCost := typedProgramCheckerCost_le_bits_squared signatures bodies entry bodyTrees
+  have typedCostIncluded : typedProgramCheckerCost signatures bodies ≤
+      5 * (processBits * processBits) := by
+    calc
+      _ ≤ 5 * (typedProgramBits signatures bodies entry *
+          typedProgramBits signatures bodies entry) := by
+        simpa [Nat.pow_two, Nat.mul_assoc] using typedCost
+      _ ≤ 5 * (processBits * processBits) := Nat.mul_le_mul_left 5 typedSquareIncluded
+  have expansionCost := checkFreshWithMatchCost_le_processBits_quadratic
+    source rules certificate signatures bodies entry
+  have expansionCostIncluded : (checkFreshWithMatchCost rules certificate).2 ≤
+      8 * (processBits * processBits) := by
+    simpa [processBits, Nat.pow_two] using expansionCost
+  have sumBound : typedProgramCheckerCost signatures bodies +
+      (checkFreshWithMatchCost rules certificate).2 ≤
+      13 * (processBits * processBits) := by omega
+  unfold measuredProcessCheckCost
+  simpa [processBits, Nat.pow_two] using sumBound
 
 end NLisp.CertificateSize

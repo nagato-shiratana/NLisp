@@ -66,6 +66,10 @@ structure Header where
   parameters : List (Nat × Ty)
   result : Ty
   body : Node
+  /- Original mixed top-level declaration position. Function-only readers use
+  the default; `readProgramHeaders` records the actual position. -/
+  order : Nat
+  name : String
 
 /- A top-level value keeps its annotated source identity and declaration
 position. `order` is the position among all normalized top-level forms, so
@@ -75,6 +79,7 @@ structure GlobalHeader where
   type : Ty
   initializer : Node
   order : Nat
+  name : String
 
 def Header.signature (h : Header) : Signature :=
   ⟨h.variables.length, h.parameters.map Prod.snd, h.result⟩
@@ -82,19 +87,21 @@ def Header.signature (h : Header) : Signature :=
 def readHeader (fuel : Nat) : Node → Option Header
   | .list [head, id, .list parameters, result, body] => do
     if name head ≠ some "defun" then none else
-    return ⟨← binder id, [], ← readParameters fuel [] parameters, ← readType fuel [] result, body⟩
+    return ⟨← binder id, [], ← readParameters fuel [] parameters, ← readType fuel [] result, body,
+      0, (← name id)⟩
   | .list [head, id, .list [quantifier, .list variables, .list parameters, result], body] => do
     if name head ≠ some "defun" ∨ name quantifier ≠ some "forall" then none else
     let variables ← variables.mapM name
     if !Lexical.distinctNames variables then none else
     return ⟨← binder id, variables, ← readParameters fuel variables parameters,
-      ← readType fuel variables result, body⟩
+      ← readType fuel variables result, body, 0, (← name id)⟩
   | _ => none
 
 def readGlobalHeader (fuel order : Nat) : Node → Option GlobalHeader
   | .list [head, .list [identifier, annotation], initializer] => do
       if name head ≠ some "define" then none else
-      return ⟨← binder identifier, ← readType fuel [] annotation, initializer, order⟩
+      return ⟨← binder identifier, ← readType fuel [] annotation, initializer, order,
+        (← name identifier)⟩
   | _ => none
 
 def readGlobalHeaders (fuel : Nat) : Nat → List Node → Option (List GlobalHeader)
@@ -107,21 +114,143 @@ def readGlobalHeaders (fuel : Nat) : Nat → List Node → Option (List GlobalHe
             readGlobalHeaders fuel (order + 1) tail
           else none
 
+inductive TopLevelDeclaration where
+  | function (header : Header)
+  | global (header : GlobalHeader)
+
+def TopLevelDeclaration.identity : TopLevelDeclaration → Nat
+  | .function header => header.identity
+  | .global header => header.identity
+
+def TopLevelDeclaration.name : TopLevelDeclaration → String
+  | .function header => header.name
+  | .global header => header.name
+
+def TopLevelDeclaration.sourceOrder : TopLevelDeclaration → Nat
+  | .function header => header.order
+  | .global header => header.order
+
+def TopLevelDeclaration.toNameEntry (declaration : TopLevelDeclaration) :
+    CNameResolution.Entry :=
+  ⟨declaration.name, declaration.identity, 0⟩
+
+def TopLevelDeclaration.functions : List TopLevelDeclaration → List Header
+  | [] => []
+  | .function header :: rest => header :: functions rest
+  | .global _ :: rest => functions rest
+
+def TopLevelDeclaration.globals : List TopLevelDeclaration → List GlobalHeader
+  | [] => []
+  | .function _ :: rest => globals rest
+  | .global header :: rest => header :: globals rest
+
 structure ProgramHeaders where
   functions : List Header
   globals : List GlobalHeader
+  declarations : List TopLevelDeclaration
+
+def ProgramHeaders.namedEnvironment (headers : ProgramHeaders) : List CNameResolution.Entry :=
+  headers.declarations.map TopLevelDeclaration.toNameEntry
+
+theorem ProgramHeaders.findNameIndex_selects_declaration
+    (headers : ProgramHeaders) (name : String) (binding : CNameResolution.Entry)
+    (found : CNameResolution.findName headers.namedEnvironment name = some binding) :
+    ∃ index declaration,
+      CNameResolution.findNameIndex headers.namedEnvironment name = some index ∧
+      headers.declarations.get? index = some declaration ∧
+      declaration.identity = binding.identity := by
+  obtain ⟨index, indexFound, namedAt⟩ :=
+    CNameResolution.findNameIndex_complete headers.namedEnvironment name binding found
+  cases declarationAt : headers.declarations.get? index with
+  | none =>
+      have namedNone : headers.namedEnvironment.get? index = none := by
+        simp [ProgramHeaders.namedEnvironment, List.get?_map, declarationAt]
+      rw [namedAt] at namedNone
+      contradiction
+  | some declaration =>
+      have selectedEntry : TopLevelDeclaration.toNameEntry declaration = binding := by
+        have mapped : (headers.declarations.get? index).map
+            TopLevelDeclaration.toNameEntry = some binding := by
+          simpa [ProgramHeaders.namedEnvironment, List.get?_map] using namedAt
+        have mapped' := mapped
+        rw [declarationAt] at mapped'
+        exact Option.some.inj (by simpa using mapped')
+      have identityAgreement : declaration.identity = binding.identity := by
+        have entryIdentity := congrArg CNameResolution.Entry.identity selectedEntry
+        simpa [TopLevelDeclaration.toNameEntry] using entryIdentity
+      exact ⟨index, declaration, indexFound, declarationAt, identityAgreement⟩
 
 /- Read mixed top-level declarations in one pass. Each output list preserves
 its source order, and every define retains its original form position. -/
 def readProgramHeaders (fuel : Nat) : Nat → List Node → Option ProgramHeaders
-  | _, [] => some ⟨[], []⟩
+  | _, [] => some ⟨[], [], []⟩
   | order, form :: tail => do
       let rest ← readProgramHeaders fuel (order + 1) tail
       match readHeader fuel form with
-      | some function => pure ⟨function :: rest.functions, rest.globals⟩
+      | some function =>
+          let ordered := { function with order := order }
+          pure ⟨ordered :: rest.functions, rest.globals,
+            TopLevelDeclaration.function ordered :: rest.declarations⟩
       | none => do
           let global ← readGlobalHeader fuel order form
-          pure ⟨rest.functions, global :: rest.globals⟩
+          pure ⟨rest.functions, global :: rest.globals,
+            TopLevelDeclaration.global global :: rest.declarations⟩
+
+/-- A function found at the head of a mixed top-level source list keeps that
+source position in its Header while the recursive tail remains in source
+order. -/
+theorem readProgramHeaders_cons_function (fuel start : Nat) (form : Node)
+    (tail : List Node) (header : Header) (rest : ProgramHeaders)
+    (headRead : readHeader fuel form = some header)
+    (tailRead : readProgramHeaders fuel (start + 1) tail = some rest) :
+    readProgramHeaders fuel start (form :: tail) =
+      some ⟨{ header with order := start } :: rest.functions, rest.globals,
+        TopLevelDeclaration.function { header with order := start } :: rest.declarations⟩ := by
+  simp [readProgramHeaders, headRead, tailRead]
+
+/-- A value found at the head of a mixed top-level source list retains its
+source position, and remains ahead of later values in the globals list. -/
+theorem readProgramHeaders_cons_global (fuel start : Nat) (form : Node)
+    (tail : List Node) (global : GlobalHeader) (rest : ProgramHeaders)
+    (headNotFunction : readHeader fuel form = none)
+    (headRead : readGlobalHeader fuel start form = some global)
+    (tailRead : readProgramHeaders fuel (start + 1) tail = some rest) :
+    readProgramHeaders fuel start (form :: tail) =
+      some ⟨rest.functions, global :: rest.globals,
+        TopLevelDeclaration.global global :: rest.declarations⟩ := by
+  simp [readProgramHeaders, headNotFunction, headRead, tailRead]
+
+theorem readProgramHeaders_declarations_project (fuel start : Nat)
+    (forms : List Node) (headers : ProgramHeaders)
+    (decoded : readProgramHeaders fuel start forms = some headers) :
+    TopLevelDeclaration.functions headers.declarations = headers.functions ∧
+      TopLevelDeclaration.globals headers.declarations = headers.globals := by
+  induction forms generalizing start headers with
+  | nil =>
+      simp [readProgramHeaders] at decoded
+      cases decoded
+      simp [TopLevelDeclaration.functions, TopLevelDeclaration.globals]
+  | cons form tail ih =>
+      unfold readProgramHeaders at decoded
+      cases tailRead : readProgramHeaders fuel (start + 1) tail with
+      | none => simp [tailRead] at decoded
+      | some rest =>
+          cases functionRead : readHeader fuel form with
+          | some function =>
+              simp [tailRead, functionRead] at decoded
+              cases decoded
+              obtain ⟨functions, globals⟩ := ih (start + 1) rest tailRead
+              simp [TopLevelDeclaration.functions, TopLevelDeclaration.globals,
+                functions, globals]
+          | none =>
+              cases globalRead : readGlobalHeader fuel start form with
+              | none => simp [tailRead, functionRead, globalRead] at decoded
+              | some global =>
+                  simp [tailRead, functionRead, globalRead] at decoded
+                  cases decoded
+                  obtain ⟨functions, globals⟩ := ih (start + 1) rest tailRead
+                  simp [TopLevelDeclaration.functions, TopLevelDeclaration.globals,
+                    functions, globals]
 
 /- Global values use their position among value declarations for store slots;
 the source token remains the key used to resolve references. `order` on the

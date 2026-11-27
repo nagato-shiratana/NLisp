@@ -1,3 +1,5 @@
+import NLisp.TypedExpansion
+
 namespace NLisp
 
 /-! # NLisp-Core
@@ -33,6 +35,8 @@ inductive Expr : List Ty → Ty → Type where
   | add : Expr Γ .integer → Expr Γ .integer → Expr Γ .integer
   | sub : Expr Γ .integer → Expr Γ .integer → Expr Γ .integer
   | mul : Expr Γ .integer → Expr Γ .integer → Expr Γ .integer
+  | quotient : Expr Γ .integer → Expr Γ .integer → Expr Γ (.option .integer)
+  | remainder : Expr Γ .integer → Expr Γ .integer → Expr Γ (.option .integer)
   | eqInt : Expr Γ .integer → Expr Γ .integer → Expr Γ .boolean
   | leq : Expr Γ .integer → Expr Γ .integer → Expr Γ .boolean
   | nil : Expr Γ (.list a)
@@ -71,6 +75,8 @@ def Expr.rename (ρ : Ren Γ Δ) : Expr Γ t → Expr Δ t
   | .add left right => .add (left.rename ρ) (right.rename ρ)
   | .sub left right => .sub (left.rename ρ) (right.rename ρ)
   | .mul left right => .mul (left.rename ρ) (right.rename ρ)
+  | .quotient left right => .quotient (left.rename ρ) (right.rename ρ)
+  | .remainder left right => .remainder (left.rename ρ) (right.rename ρ)
   | .eqInt left right => .eqInt (left.rename ρ) (right.rename ρ)
   | .leq left right => .leq (left.rename ρ) (right.rename ρ)
   | .nil => .nil
@@ -113,6 +119,8 @@ def Expr.subst (σ : Sub Γ Δ) : Expr Γ t → Expr Δ t
   | .add left right => .add (left.subst σ) (right.subst σ)
   | .sub left right => .sub (left.subst σ) (right.subst σ)
   | .mul left right => .mul (left.subst σ) (right.subst σ)
+  | .quotient left right => .quotient (left.subst σ) (right.subst σ)
+  | .remainder left right => .remainder (left.subst σ) (right.subst σ)
   | .eqInt left right => .eqInt (left.subst σ) (right.subst σ)
   | .leq left right => .leq (left.subst σ) (right.subst σ)
   | .nil => .nil
@@ -236,6 +244,21 @@ inductive Value : {t : Ty} → Expr [] t → Prop where
   | none : Value (.none : Expr [] (.option a))
   | some : Value value → Value (.some value)
 
+/-- Embed the independent GMP-compatible integer option semantics into the
+intrinsically typed core's Option Integer values. -/
+def integerOptionalResult (operation : TypedExpansion.Primitive) (left right : Int) :
+    Expr [] (.option .integer) :=
+  match TypedExpansion.integerOptional operation left right with
+  | some value => .some (.int value)
+  | none => .none
+
+theorem integerOptionalResult_isValue (operation : TypedExpansion.Primitive)
+    (left right : Int) : Value (integerOptionalResult operation left right) := by
+  unfold integerOptionalResult
+  cases TypedExpansion.integerOptional operation left right with
+  | none => exact .none
+  | some value => exact .some .int
+
 inductive Step : {t : Ty} → Expr [] t → Expr [] t → Prop where
   | appFn : Step f f' → Step (.app f x) (.app f' x)
   | appArg : Value f → Step x x' → Step (.app f x) (.app f x')
@@ -252,6 +275,17 @@ inductive Step : {t : Ty} → Expr [] t → Expr [] t → Prop where
   | mulLeft : Step left left' → Step (.mul left right) (.mul left' right)
   | mulRight : Value left → Step right right' → Step (.mul left right) (.mul left right')
   | mulInt : Step (.mul (.int left) (.int right)) (.int (left * right))
+  | quotientLeft : Step left left' → Step (.quotient left right) (.quotient left' right)
+  | quotientRight : Value left → Step right right' →
+      Step (.quotient left right) (.quotient left right')
+  | quotientInt : Step (.quotient (.int left) (.int right))
+      (integerOptionalResult .quotient left right)
+  | remainderLeft : Step left left' → Step (.remainder left right) (.remainder left' right)
+  | remainderRight : Value left → Step right right' →
+      Step (.remainder left right) (.remainder left right')
+  | remainderInt : Step (.remainder (.int left) (.int right))
+      (integerOptionalResult .remainder left right)
+
   | eqIntLeft : Step left left' → Step (.eqInt left right) (.eqInt left' right)
   | eqIntRight : Value left → Step right right' → Step (.eqInt left right) (.eqInt left right')
   | eqIntValue : Step (.eqInt (.int left) (.int right)) (.bool (decide (left = right)))
@@ -279,6 +313,60 @@ inductive Step : {t : Ty} → Expr [] t → Expr [] t → Prop where
       Value value →
       Step (.matchOption (.some value) noneCase someCase) (someCase.instantiate value)
   | unfoldFix : Step (.fix body) (body.instantiate (.fix body))
+
+inductive Steps : {t : Ty} → Expr [] t → Expr [] t → Prop where
+  | refl : Steps term term
+  | tail : Step first second → Steps second last → Steps first last
+
+def quotientBuiltin : Expr [] (.fn .integer (.fn .integer (.option .integer))) :=
+  .lam (.lam (.quotient (.var (.succ .zero)) (.var .zero)))
+
+def remainderBuiltin : Expr [] (.fn .integer (.fn .integer (.option .integer))) :=
+  .lam (.lam (.remainder (.var (.succ .zero)) (.var .zero)))
+
+theorem quotientBuiltin_partial_application (dividend : Int) :
+    Step (.app quotientBuiltin (.int dividend))
+      (.lam (.quotient (.int dividend) (.var .zero))) := by
+  simpa [quotientBuiltin, Expr.instantiate, Expr.subst, oneSub, liftSub,
+    Expr.rename] using (Step.beta (Value.int (n := dividend)))
+
+theorem remainderBuiltin_partial_application (dividend : Int) :
+    Step (.app remainderBuiltin (.int dividend))
+      (.lam (.remainder (.int dividend) (.var .zero))) := by
+  simpa [remainderBuiltin, Expr.instantiate, Expr.subst, oneSub, liftSub,
+    Expr.rename] using (Step.beta (Value.int (n := dividend)))
+
+theorem quotientBuiltin_application_steps (dividend divisor : Int) :
+    Steps (.app (.app quotientBuiltin (.int dividend)) (.int divisor))
+      (integerOptionalResult .quotient dividend divisor) := by
+  have first : Step
+      (.app (.app quotientBuiltin (.int dividend)) (.int divisor))
+      (.app (.lam (.quotient (.int dividend) (.var .zero))) (.int divisor)) :=
+    .appFn (quotientBuiltin_partial_application dividend)
+  have second : Step
+      (.app (.lam (.quotient (.int dividend) (.var .zero))) (.int divisor))
+      (.quotient (.int dividend) (.int divisor)) := by
+    simpa [Expr.instantiate, Expr.subst, oneSub] using
+      (Step.beta (Value.int (n := divisor)) :
+        Step (.app (.lam (.quotient (.int dividend) (.var .zero))) (.int divisor))
+          ((.quotient (.int dividend) (.int divisor) : Expr [] (.option .integer))))
+  exact .tail first (.tail second (.tail .quotientInt .refl))
+
+theorem remainderBuiltin_application_steps (dividend divisor : Int) :
+    Steps (.app (.app remainderBuiltin (.int dividend)) (.int divisor))
+      (integerOptionalResult .remainder dividend divisor) := by
+  have first : Step
+      (.app (.app remainderBuiltin (.int dividend)) (.int divisor))
+      (.app (.lam (.remainder (.int dividend) (.var .zero))) (.int divisor)) :=
+    .appFn (remainderBuiltin_partial_application dividend)
+  have second : Step
+      (.app (.lam (.remainder (.int dividend) (.var .zero))) (.int divisor))
+      (.remainder (.int dividend) (.int divisor)) := by
+    simpa [Expr.instantiate, Expr.subst, oneSub] using
+      (Step.beta (Value.int (n := divisor)) :
+        Step (.app (.lam (.remainder (.int dividend) (.var .zero))) (.int divisor))
+          ((.remainder (.int dividend) (.int divisor) : Expr [] (.option .integer))))
+  exact .tail first (.tail second (.tail .remainderInt .refl))
 
 theorem progress : (term : Expr [] t) → Value term ∨ ∃ next, Step term next
   | .var v => nomatch v
@@ -326,6 +414,22 @@ theorem progress : (term : Expr [] t) → Value term ∨ ∃ next, Step term nex
           exact Or.inr ⟨_, .mulInt⟩
         · exact Or.inr ⟨_, .mulRight hl hr⟩
       · exact Or.inr ⟨_, .mulLeft hl⟩
+  | .quotient left right => by
+      rcases progress left with hl | ⟨left', hl⟩
+      · rcases progress right with hr | ⟨right', hr⟩
+        · cases hl
+          cases hr
+          exact Or.inr ⟨_, .quotientInt⟩
+        · exact Or.inr ⟨_, .quotientRight hl hr⟩
+      · exact Or.inr ⟨_, .quotientLeft hl⟩
+  | .remainder left right => by
+      rcases progress left with hl | ⟨left', hl⟩
+      · rcases progress right with hr | ⟨right', hr⟩
+        · cases hl
+          cases hr
+          exact Or.inr ⟨_, .remainderInt⟩
+        · exact Or.inr ⟨_, .remainderRight hl hr⟩
+      · exact Or.inr ⟨_, .remainderLeft hl⟩
   | .eqInt left right => by
       rcases progress left with hl | ⟨left', hl⟩
       · rcases progress right with hr | ⟨right', hr⟩
@@ -374,6 +478,55 @@ theorem progress : (term : Expr [] t) → Value term ∨ ∃ next, Step term nex
 theorem preservation {term next : Expr [] t} (_ : Step term next) :
     ∃ preserved : Expr [] t, preserved = next :=
   ⟨next, rfl⟩
+
+theorem quotient_by_zero_returns_none (dividend : Int) :
+    integerOptionalResult .quotient dividend 0 = (.none : Expr [] (.option .integer)) := by
+  simp [integerOptionalResult, TypedExpansion.integerOptional]
+
+theorem remainder_by_zero_returns_none (dividend : Int) :
+    integerOptionalResult .remainder dividend 0 = (.none : Expr [] (.option .integer)) := by
+  simp [integerOptionalResult, TypedExpansion.integerOptional]
+
+theorem quotient_zero_step (dividend : Int) :
+    Step (.quotient (.int dividend) (.int 0))
+      (.none : Expr [] (.option .integer)) := by
+  simpa [integerOptionalResult, TypedExpansion.integerOptional] using
+    (Step.quotientInt (left := dividend) (right := 0))
+
+theorem remainder_zero_step (dividend : Int) :
+    Step (.remainder (.int dividend) (.int 0))
+      (.none : Expr [] (.option .integer)) := by
+  simpa [integerOptionalResult, TypedExpansion.integerOptional] using
+    (Step.remainderInt (left := dividend) (right := 0))
+
+theorem quotient_nonzero_step (dividend divisor : Int) (nonzero : divisor ≠ 0) :
+    Step (.quotient (.int dividend) (.int divisor))
+      (.some (.int (TypedExpansion.truncQuotient dividend divisor))) := by
+  simpa [integerOptionalResult, TypedExpansion.integerOptional, nonzero] using
+    (Step.quotientInt (left := dividend) (right := divisor))
+
+theorem remainder_nonzero_step (dividend divisor : Int) (nonzero : divisor ≠ 0) :
+    Step (.remainder (.int dividend) (.int divisor))
+      (.some (.int (dividend - TypedExpansion.truncQuotient dividend divisor * divisor))) := by
+  simpa [integerOptionalResult, TypedExpansion.integerOptional, nonzero] using
+    (Step.remainderInt (left := dividend) (right := divisor))
+
+theorem quotient_remainder_steps_reconstruct (dividend divisor : Int)
+    (nonzero : divisor ≠ 0) :
+    (∃ quotient remainder,
+      Step (.quotient (.int dividend) (.int divisor)) (.some (.int quotient)) ∧
+      Step (.remainder (.int dividend) (.int divisor)) (.some (.int remainder)) ∧
+      dividend = quotient * divisor + remainder) := by
+  obtain ⟨quotient, remainder, quotientSpec, remainderSpec, equation⟩ :=
+    TypedExpansion.integerOptional_division_equation dividend divisor nonzero
+  have qStep := quotient_nonzero_step dividend divisor nonzero
+  have rStep := remainder_nonzero_step dividend divisor nonzero
+  simp [integerOptionalResult, TypedExpansion.integerOptional, nonzero] at quotientSpec remainderSpec
+  subst quotient
+  subst remainder
+  exact ⟨TypedExpansion.truncQuotient dividend divisor,
+    dividend - TypedExpansion.truncQuotient dividend divisor * divisor,
+    qStep, rStep, equation⟩
 
 theorem valueCannotStep {term next : Expr [] t} (isValue : Value term) :
     ¬ Step term next := by

@@ -2,6 +2,7 @@ import NLisp.GlobalIR
 import NLisp.ExpansionLowering
 import NLisp.SurfaceChecker
 import NLisp.CheckerCompleteness
+import NLisp.CNameResolution
 
 namespace NLisp.GlobalProgramEntry
 
@@ -42,8 +43,132 @@ def functionIdentities : List Entry → List Nat
   | .function id _ _ _ :: rest => id :: functionIdentities rest
   | .value _ _ _ _ :: rest => functionIdentities rest
 
+/- Runtime-table positions count both functions and values, while Surface
+Definitions contains functions only. This map records the correspondence. -/
+def functionSourcesFromEntries (runtimeIndex sourceIndex : Nat) : List Entry →
+    List (Nat × Nat)
+  | [] => []
+  | .function _ _ _ _ :: rest =>
+      (runtimeIndex, sourceIndex) ::
+        functionSourcesFromEntries (runtimeIndex + 1) (sourceIndex + 1) rest
+  | .value _ _ _ _ :: rest =>
+      functionSourcesFromEntries (runtimeIndex + 1) sourceIndex rest
+
+theorem functionSourcesFromEntries_length (runtimeIndex sourceIndex : Nat)
+    (entries : List Entry) :
+    (functionSourcesFromEntries runtimeIndex sourceIndex entries).length =
+      (functionIdentities entries).length := by
+  induction entries generalizing runtimeIndex sourceIndex with
+  | nil => rfl
+  | cons entry rest ih =>
+      cases entry <;> simp [functionSourcesFromEntries, functionIdentities, ih]
+
+theorem functionSourcesFromEntries_mem_bounds
+    (runtimeIndex sourceIndex : Nat) (entries : List Entry) (pair : Nat × Nat)
+    (member : pair ∈ functionSourcesFromEntries runtimeIndex sourceIndex entries) :
+    pair.1 < runtimeIndex + entries.length ∧
+      pair.2 < sourceIndex + (functionIdentities entries).length := by
+  induction entries generalizing runtimeIndex sourceIndex with
+  | nil => simp [functionSourcesFromEntries] at member
+  | cons entry rest ih =>
+      cases entry with
+      | function identity signature valid definition =>
+          simp only [functionSourcesFromEntries, List.mem_cons] at member
+          rcases member with head | tail
+          · have pairEq : pair = (runtimeIndex, sourceIndex) := by
+              exact head
+            subst pair
+            simp only [List.length_cons, functionIdentities]
+            omega
+          · have bounds := ih (runtimeIndex + 1) (sourceIndex + 1) tail
+            simp only [List.length_cons, functionIdentities] at bounds ⊢
+            omega
+      | value identity type valid initializer =>
+          have bounds := ih (runtimeIndex + 1) sourceIndex
+            (by simpa [functionSourcesFromEntries] using member)
+          simp only [List.length_cons, functionIdentities] at bounds ⊢
+          omega
+
+theorem functionSourcesFromEntries_mem_lower_bounds
+    (runtimeIndex sourceIndex : Nat) (entries : List Entry) (pair : Nat × Nat)
+    (member : pair ∈ functionSourcesFromEntries runtimeIndex sourceIndex entries) :
+    runtimeIndex ≤ pair.1 ∧ sourceIndex ≤ pair.2 := by
+  induction entries generalizing runtimeIndex sourceIndex with
+  | nil => simp [functionSourcesFromEntries] at member
+  | cons entry rest ih =>
+      cases entry with
+      | function identity signature valid definition =>
+          simp only [functionSourcesFromEntries, List.mem_cons] at member
+          rcases member with head | tail
+          · have pairEq : pair = (runtimeIndex, sourceIndex) := head
+            subst pair
+            simp
+          · have lower := ih (runtimeIndex + 1) (sourceIndex + 1) tail
+            omega
+      | value identity type valid initializer =>
+          have lower := ih (runtimeIndex + 1) sourceIndex
+            (by simpa [functionSourcesFromEntries] using member)
+          omega
+
 def identities : List Entry → List Nat
   := List.map identity
+
+/- Position-preserving relation between the C-style named environment and
+the mixed source declaration layout. The decoder must establish this relation
+from parsed names and scoped identities. -/
+def NamedGlobalLayout (named : List CNameResolution.Entry) (entries : List Entry) : Prop :=
+  named.length = entries.length ∧
+    ∀ index namedEntry sourceEntry,
+      named.get? index = some namedEntry → entries.get? index = some sourceEntry →
+        namedEntry.identity = identity sourceEntry
+
+theorem namedGlobalLayout_of_identity_map
+    (declarations : List ExpansionLowering.TopLevelDeclaration) (entries : List Entry)
+    (aligned : declarations.map ExpansionLowering.TopLevelDeclaration.identity =
+      identities entries) :
+    NamedGlobalLayout
+      (declarations.map ExpansionLowering.TopLevelDeclaration.toNameEntry) entries := by
+  constructor
+  · simpa [identities] using congrArg List.length aligned
+  · intro index namedEntry sourceEntry namedAt sourceAt
+    have namedIdentityAt :
+        (declarations.map ExpansionLowering.TopLevelDeclaration.identity).get? index =
+          some namedEntry.identity := by
+      have mapped := congrArg (Option.map CNameResolution.Entry.identity) namedAt
+      simpa [List.get?_map, ExpansionLowering.TopLevelDeclaration.toNameEntry] using mapped
+    have sourceIdentityAt : (identities entries).get? index = some (identity sourceEntry) := by
+      have mapped := congrArg (Option.map identity) sourceAt
+      simpa [identities, List.get?_map] using mapped
+    have atIndex := congrArg (fun values : List Nat => values.get? index) aligned
+    have selectedIdentity : some namedEntry.identity = some (identity sourceEntry) := by
+      calc
+        some namedEntry.identity =
+            (declarations.map ExpansionLowering.TopLevelDeclaration.identity).get? index :=
+              namedIdentityAt.symm
+        _ = (identities entries).get? index := atIndex
+        _ = some (identity sourceEntry) := sourceIdentityAt
+    exact Option.some.inj selectedIdentity
+
+theorem programHeaders_namedGlobalLayout
+    (headers : ExpansionLowering.ProgramHeaders) (entries : List Entry)
+    (aligned : headers.declarations.map ExpansionLowering.TopLevelDeclaration.identity =
+      identities entries) :
+    NamedGlobalLayout headers.namedEnvironment entries := by
+  simpa [ExpansionLowering.ProgramHeaders.namedEnvironment] using
+    namedGlobalLayout_of_identity_map headers.declarations entries aligned
+
+theorem decodedTopLevelProgram_namedGlobalLayout
+    (fuel : Nat) (forms : List CBindingWalk.Node)
+    (headers : ExpansionLowering.ProgramHeaders) (definitions : NLisp.Named.Definitions)
+    (slotTypes : List Ty) (initializers : List NLisp.Named.Expr) (entries : List Entry)
+    (decoded : NLisp.Named.decodeTopLevelProgramWithHeaders fuel forms =
+      some (headers, definitions, slotTypes, initializers))
+    (aligned : headers.declarations.map ExpansionLowering.TopLevelDeclaration.identity =
+      identities entries) :
+    NLisp.Named.decodeTopLevelProgramWithHeaders fuel forms =
+        some (headers, definitions, slotTypes, initializers) ∧
+      NamedGlobalLayout headers.namedEnvironment entries :=
+  ⟨decoded, programHeaders_namedGlobalLayout headers entries aligned⟩
 
 def valueTypes : List Entry → List Ty
   | [] => []
@@ -130,6 +255,46 @@ theorem globalIndexOf_get?_unique (entries : List Entry) (index : Nat)
           simp only [globalIndexOf, beq_iff_eq, if_neg headDifferent]
           simpa using ih index unique.2 tailFound
 
+theorem findNameIndex_matches_globalIndexOf
+    (named : List CNameResolution.Entry) (entries : List Entry)
+    (name : String) (binding : CNameResolution.Entry)
+    (layout : NamedGlobalLayout named entries)
+    (unique : DistinctIds (identities entries))
+    (found : CNameResolution.findName named name = some binding) :
+    ∃ index, CNameResolution.findNameIndex named name = some index ∧
+      globalIndexOf binding.identity entries = some index := by
+  obtain ⟨index, indexFound, namedAtIndex⟩ :=
+    CNameResolution.findNameIndex_complete named name binding found
+  have indexBound : index < named.length := (List.get?_eq_some.mp namedAtIndex).1
+  have sourceBound : index < entries.length := by rw [← layout.1]; exact indexBound
+  let sourceEntry : Entry := entries[index]
+  have sourceAtIndex : entries.get? index = some sourceEntry :=
+    (List.get?_eq_some).mpr ⟨sourceBound, rfl⟩
+  have identityAgreement := layout.2 index binding sourceEntry namedAtIndex sourceAtIndex
+  have globalFound := globalIndexOf_get?_unique entries index sourceEntry binding.identity
+    unique sourceAtIndex identityAgreement.symm
+  exact ⟨index, indexFound, globalFound⟩
+
+theorem decodedTopLevelProgram_resolves_name_to_globalIndex
+    (fuel : Nat) (forms : List CBindingWalk.Node)
+    (headers : ExpansionLowering.ProgramHeaders) (definitions : NLisp.Named.Definitions)
+    (slotTypes : List Ty) (initializers : List NLisp.Named.Expr)
+    (entries : List Entry) (name : String) (binding : CNameResolution.Entry)
+    (decoded : NLisp.Named.decodeTopLevelProgramWithHeaders fuel forms =
+      some (headers, definitions, slotTypes, initializers))
+    (aligned : headers.declarations.map ExpansionLowering.TopLevelDeclaration.identity =
+      identities entries)
+    (unique : DistinctIds (identities entries))
+    (nameFound : CNameResolution.findName headers.namedEnvironment name = some binding) :
+    NLisp.Named.decodeTopLevelProgramWithHeaders fuel forms =
+        some (headers, definitions, slotTypes, initializers) ∧
+      ∃ index, CNameResolution.findNameIndex headers.namedEnvironment name = some index ∧
+        globalIndexOf binding.identity entries = some index := by
+  have namedLayout := programHeaders_namedGlobalLayout headers entries aligned
+  exact ⟨decoded,
+    findNameIndex_matches_globalIndexOf headers.namedEnvironment entries name binding
+      namedLayout unique nameFound⟩
+
 /- C indexes its `value_slots` pointer array by the original Program
 declaration index. GlobalIR stores values densely, so this function translates
 that mixed declaration index to the dense value-slot ordinal. -/
@@ -140,6 +305,113 @@ def sourceValueSlotOrdinal : List Entry → Nat → Option Nat
   | .function _ _ _ _ :: rest, index + 1 => sourceValueSlotOrdinal rest index
   | .value _ _ _ _ :: rest, index + 1 =>
       (sourceValueSlotOrdinal rest index).map Nat.succ
+
+/- C stores an RBind-cell pointer at each mixed Program.data index, leaving
+function declarations empty. Assigning each allocated cell its dense ordinal
+gives a small executable model of the `value_slots` pointer array. -/
+def cValueSlotOrdinalsFrom (next : Nat) : List Entry → List (Option Nat)
+  | [] => []
+  | .function _ _ _ _ :: rest => none :: cValueSlotOrdinalsFrom next rest
+  | .value _ _ _ _ :: rest => some next :: cValueSlotOrdinalsFrom (next + 1) rest
+
+def cValueSlotOrdinals (entries : List Entry) : List (Option Nat) :=
+  cValueSlotOrdinalsFrom 0 entries
+
+/- Interpret a C `value_slots` pointer as an address in the abstract shared
+cell heap. Both a missing pointer and a null `RBind.value` read as no value. -/
+def cValueSlotCellRead (slots : List (Option Nat)) (cells : GlobalIR.Store)
+    (sourceIndex : Nat) : Option PolyIR.Value :=
+  match slots[sourceIndex]? with
+  | some (some address) =>
+      match cells[address]? with
+      | some value => value
+      | none => none
+  | _ => none
+
+/-- Once a mixed declaration's C `value_slots` entry points at a dense cell,
+reading through that shared-cell pointer has exactly the successful behavior
+of GlobalIR's getter read, for every store state. -/
+theorem cValueSlotCellRead_success_iff_readGlobal
+    (slots : List (Option Nat)) (cells : GlobalIR.Store)
+    (sourceIndex slot : Nat) (pointer : slots[sourceIndex]? = some (some slot))
+    (value : PolyIR.Value) :
+    cValueSlotCellRead slots cells sourceIndex = some value ↔
+      GlobalIR.readGlobal cells slot = .ok value := by
+  cases cell : cells[slot]? with
+  | none => simp [cValueSlotCellRead, pointer, GlobalIR.readGlobal, cell]
+  | some stored =>
+      cases stored with
+      | none => simp [cValueSlotCellRead, pointer, GlobalIR.readGlobal, cell]
+      | some storedValue =>
+          simp [cValueSlotCellRead, pointer, GlobalIR.readGlobal, cell]
+
+/-- A non-null C cell pointer observes the same early-initialization fault as
+the corresponding GlobalIR getter when its shared cell has not been filled. -/
+theorem cValueSlotCellRead_beforeInitialization_iff
+    (slots : List (Option Nat)) (cells : GlobalIR.Store)
+    (sourceIndex slot : Nat) (pointer : slots[sourceIndex]? = some (some slot)) :
+    cells[slot]? = some none ↔
+      GlobalIR.readGlobal cells slot = .error (.beforeInitialization slot) := by
+  cases cell : cells[slot]? with
+  | none => simp [GlobalIR.readGlobal, cell]
+  | some stored =>
+      cases stored with
+      | none => simp [GlobalIR.readGlobal, cell]
+      | some value => simp [GlobalIR.readGlobal, cell]
+
+/-- In the mixed-table model, a live C `value_slots` pointer to an
+uninitialized shared cell and the corresponding GlobalIR getter report the
+same early-read state: C's cell read is empty and the getter raises the
+slot-specific before-initialization fault. -/
+theorem cValueSlotCellRead_and_getter_beforeInitialization
+    (slots : List (Option Nat)) (cells : GlobalIR.Store)
+    (sourceIndex slot fuel : Nat) (pointer : slots[sourceIndex]? = some (some slot))
+    (program : List GlobalIR.Definition)
+    (getter : program[sourceIndex]? = some (.getter slot))
+    (uninitialized : cells[slot]? = some none) :
+    cValueSlotCellRead slots cells sourceIndex = none ∧
+      GlobalIR.evaluate program cells (fuel + 2) []
+        (.app (.global sourceIndex) []) = .error (.beforeInitialization slot) := by
+  constructor
+  · simp [cValueSlotCellRead, pointer, uninitialized]
+  · simp [GlobalIR.evaluate, GlobalIR.evaluateArgs, getter, GlobalIR.readGlobal,
+      uninitialized, List.isEmpty]
+
+/-- At an in-range mixed declaration index, the C `value_slots` array model
+contains exactly the dense GlobalIR ordinal for a value declaration and an
+empty cell for a function declaration. -/
+theorem cValueSlotOrdinalsFrom_get (entries : List Entry) (index next : Nat)
+    (inRange : index < entries.length) :
+    (cValueSlotOrdinalsFrom next entries)[index]? =
+      some ((sourceValueSlotOrdinal entries index).map (· + next)) := by
+  induction entries generalizing index next with
+  | nil =>
+      have impossible : index < 0 := by simpa using inRange
+      exact False.elim ((Nat.not_lt_zero index) impossible)
+  | cons entry rest ih =>
+      cases entry with
+      | function identity signature signatureValid definition =>
+          cases index with
+          | zero => simp [cValueSlotOrdinalsFrom, sourceValueSlotOrdinal]
+          | succ index =>
+              have tailRange : index < rest.length := by simp at inRange; omega
+              simpa [cValueSlotOrdinalsFrom, sourceValueSlotOrdinal] using
+                ih index next tailRange
+      | value identity type valid initializer =>
+          cases index with
+          | zero => simp [cValueSlotOrdinalsFrom, sourceValueSlotOrdinal]
+          | succ index =>
+              have tailRange : index < rest.length := by simp at inRange; omega
+              simpa [cValueSlotOrdinalsFrom, sourceValueSlotOrdinal, Nat.add_comm,
+                Nat.add_left_comm, Nat.add_assoc] using
+                ih index (next + 1) tailRange
+
+theorem cValueSlotOrdinals_get (entries : List Entry) (index : Nat)
+    (inRange : index < entries.length) :
+    (cValueSlotOrdinals entries)[index]? =
+      some (sourceValueSlotOrdinal entries index) := by
+  have mapped := cValueSlotOrdinalsFrom_get entries index 0 inRange
+  simpa [cValueSlotOrdinals, Nat.zero_add] using mapped
 
 theorem valueSlotOf_shift (target start offset : Nat) (entries : List Entry) :
     valueSlotOf target (start + offset) entries =
@@ -412,6 +684,135 @@ theorem sourceValueSlotOrdinal_layout (entries : List Entry) (sourceIndex start 
                   have offset : start + 1 + tailSlot = start + slot := by omega
                   simpa [compiledLayout, offset] using layout
 
+/-- The C-style mixed-indexed cell pointer and the compiled GlobalIR getter
+at that same source declaration index select the same dense value slot. -/
+theorem cValueSlotOrdinal_matches_compiledGetter
+    (entries : List Entry) (sourceIndex start slot : Nat)
+    (inRange : sourceIndex < entries.length)
+    (ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot) :
+    (cValueSlotOrdinalsFrom start entries)[sourceIndex]? =
+        some (some (start + slot)) ∧
+      ∃ type,
+        (compiledLayout start entries).get? sourceIndex =
+          some (⟨0, [], type⟩, Definition.getter (start + slot)) := by
+  have cSlot := cValueSlotOrdinalsFrom_get entries sourceIndex start inRange
+  rw [ordinal] at cSlot
+  have layout := sourceValueSlotOrdinal_layout entries sourceIndex start slot ordinal
+  exact ⟨by simpa [Nat.add_comm] using cSlot, layout⟩
+
+/-- Compose declaration lookup, generated getter layout, and successful
+initializer storage: the same dense slot is selected by the declaration's
+source index and contains a value after initialization. -/
+theorem sourceValueSlotOrdinal_layout_and_initialized
+    (entries : List Entry) (sourceIndex slot start identityValue : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (program : List GlobalIR.Definition) (fuel : Nat) (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues program fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    ∃ getterType,
+      (compiledLayout start entries).get? sourceIndex =
+        some (⟨0, [], getterType⟩, GlobalIR.Definition.getter (start + slot)) ∧
+      ∃ value, result[slot]? = some (some value) := by
+  obtain ⟨getterType, getterLayout⟩ :=
+    sourceValueSlotOrdinal_layout entries sourceIndex start slot ordinal
+  obtain ⟨value, stored⟩ := sourceValueSlotOrdinal_successful_initialization_populates
+    entries sourceIndex slot identityValue type typeValid initializer entryAt ordinal
+    program fuel result initialized
+  exact ⟨getterType, getterLayout, value, stored⟩
+
+/-- A source-order value declaration's compiled getter reads the value in its
+dense store slot after all initializers complete. -/
+theorem sourceValueSlotOrdinal_getter_returns_initialized_value
+    (entries : List Entry) (sourceIndex slot start identityValue fuel : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (startZero : start = 0)
+    (program : List GlobalIR.Definition)
+    (programLayout : program = (compiledLayout start entries).map Prod.snd)
+    (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues program fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    ∃ value,
+      GlobalIR.evaluate program result (fuel + 2) [] (.app (.global sourceIndex) []) =
+        .ok value ∧ result[slot]? = some (some value) := by
+  obtain ⟨_, getterLayout, value, stored⟩ :=
+    sourceValueSlotOrdinal_layout_and_initialized entries sourceIndex slot start
+      identityValue type typeValid initializer entryAt ordinal program fuel result initialized
+  obtain ⟨indexBound, getterAt⟩ := List.get?_eq_some.mp getterLayout
+  have mappedBound : sourceIndex < ((compiledLayout start entries).map Prod.snd).length := by
+    simpa using indexBound
+  have getterMapped :
+      ((compiledLayout start entries).map Prod.snd)[sourceIndex]? =
+        some (GlobalIR.Definition.getter (start + slot)) := by
+    simp only [getElem?_def, List.length_map, dif_pos indexBound]
+    change some (((compiledLayout start entries).map Prod.snd).get
+      ⟨sourceIndex, mappedBound⟩) = _
+    rw [List.get_map]
+    simpa using congrArg Prod.snd getterAt
+  have getter : program[sourceIndex]? =
+      some (GlobalIR.Definition.getter (start + slot)) := by
+    rw [programLayout]
+    exact getterMapped
+  have getterStored : result[start + slot]? = some (some value) := by
+    simpa [startZero] using stored
+  exact ⟨value, GlobalIR.getter_call_reads_current_store program result fuel sourceIndex
+    (start + slot) value getter getterStored, stored⟩
+
+/-- Starting initializer stores at the same base offset used by compiled
+getters aligns a source-order value declaration with its actual GlobalIR
+store cell for every `start`. -/
+theorem sourceValueSlotOrdinal_getter_returns_initialized_value_from_start
+    (entries : List Entry) (sourceIndex slot start identityValue fuel : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (program : List GlobalIR.Definition)
+    (programLayout : program = (compiledLayout start entries).map Prod.snd)
+    (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues program fuel
+      (List.replicate (start + (initializerTerms entries).length)
+        (none : Option PolyIR.Value)) start (initializerTerms entries) = .ok result) :
+    ∃ value,
+      GlobalIR.evaluate program result (fuel + 2) [] (.app (.global sourceIndex) []) =
+        .ok value ∧ result[start + slot]? = some (some value) := by
+  obtain ⟨layoutType, getterLayout⟩ :=
+    sourceValueSlotOrdinal_layout entries sourceIndex start slot ordinal
+  obtain ⟨indexBound, getterAt⟩ := List.get?_eq_some.mp getterLayout
+  have getterBound : sourceIndex < ((compiledLayout start entries).map Prod.snd).length := by
+    simpa using indexBound
+  have getterMapped :
+      ((compiledLayout start entries).map Prod.snd)[sourceIndex]? =
+        some (GlobalIR.Definition.getter (start + slot)) := by
+    simp only [getElem?_def, List.length_map, dif_pos indexBound]
+    change some (((compiledLayout start entries).map Prod.snd).get
+      ⟨sourceIndex, getterBound⟩) = _
+    rw [List.get_map]
+    simpa using congrArg Prod.snd getterAt
+  have getter : program[sourceIndex]? =
+      some (GlobalIR.Definition.getter (start + slot)) := by
+    rw [programLayout]
+    exact getterMapped
+  have initializerFound := sourceValueSlotOrdinal_initializer_lookup entries sourceIndex
+    slot identityValue type typeValid initializer entryAt ordinal
+  have slotBound : slot < (initializerTerms entries).length :=
+    (List.get?_eq_some.mp initializerFound).1
+  have fits : start + (initializerTerms entries).length ≤
+      (List.replicate (start + (initializerTerms entries).length)
+        (none : Option PolyIR.Value)).length := by simp
+  have selected : start ≤ start + slot ∧
+      start + slot < start + (initializerTerms entries).length := by omega
+  obtain ⟨value, stored⟩ := GlobalIR.initialized_cells_present initialized fits selected
+  exact ⟨value, GlobalIR.getter_call_reads_current_store program result fuel sourceIndex
+    (start + slot) value getter stored, stored⟩
+
 theorem sourceValueSlotOrdinal_complete (entries : List Entry) (sourceIndex start : Nat)
     (signature : Signature) (globalSlot : Nat)
     (found : (compiledLayout start entries).get? sourceIndex =
@@ -649,6 +1050,105 @@ def ArithmeticInitializerRows (slotTypes : List Ty) : Nat → List Entry → Pro
         ArithmeticSurfaceExpr initializer type ∧
         ArithmeticInitializerRows slotTypes (slot + 1) rest
 
+/- Source-order initializer rows typed by the contextual GlobalIR fragment.
+This admits typed global function and getter references as well as the local
+arithmetic fragment. -/
+def ContextualGlobalInitializerRows (globals : List Signature)
+    (assignment : Nat → Ty) (slotTypes : List Ty) : Nat → List Entry → Prop
+  | _, [] => True
+  | slot, .function _ _ _ _ :: rest =>
+      ContextualGlobalInitializerRows globals assignment slotTypes slot rest
+  | slot, .value _ type _ initializer :: rest =>
+      slotTypes.get? slot = some type ∧
+        GlobalIR.ContextualGlobalArithmeticTerm globals assignment []
+          (PolyIR.erase initializer) type ∧
+        ContextualGlobalInitializerRows globals assignment slotTypes (slot + 1) rest
+
+/- Source-order initializer rows typed by the runtime GlobalIR fragment. This
+includes generated getter reads, so later values may depend on earlier slots
+while preserving the declared slot types. -/
+def ContextualGlobalRuntimeInitializerRows (globals : List Signature)
+    (assignment : Nat → Ty) (definitions : Surface.Definitions)
+    (slotTypes : List Ty) (functionSources : List (Nat × Nat))
+    (program : List Definition) : Nat → List Entry → Prop
+  | _, [] => True
+  | slot, .function _ _ _ _ :: rest =>
+      ContextualGlobalRuntimeInitializerRows globals assignment definitions
+        slotTypes functionSources program slot rest
+  | slot, .value _ type _ initializer :: rest =>
+      slotTypes.get? slot = some type ∧
+        GlobalIR.ContextualGlobalRuntimeTerm globals assignment definitions slotTypes
+          functionSources program [] (PolyIR.erase initializer) type ∧
+        ContextualGlobalRuntimeInitializerRows globals assignment definitions
+          slotTypes functionSources program (slot + 1) rest
+
+theorem ContextualGlobalInitializerRows.toTypesAgree
+    (globals : List Signature) (assignment : Nat → Ty) (slotTypes : List Ty)
+    (slot : Nat) (rows : List Entry)
+    (contextual : ContextualGlobalInitializerRows globals assignment slotTypes slot rows) :
+    GlobalIR.ContextualGlobalInitializerTypesAgree globals assignment slotTypes slot
+      (initializerTerms rows) := by
+  induction rows generalizing slot with
+  | nil => simp [initializerTerms, GlobalIR.ContextualGlobalInitializerTypesAgree]
+  | cons row tail ih =>
+      cases row with
+      | function identity signature valid definition =>
+          simpa [initializerTerms, ContextualGlobalInitializerRows,
+            GlobalIR.ContextualGlobalInitializerTypesAgree] using
+            ih (slot := slot) (by simpa [ContextualGlobalInitializerRows] using contextual)
+      | value identity type valid initializer =>
+          rcases contextual with ⟨slotType, initializerTyped, tailTyped⟩
+          simp only [initializerTerms,
+            GlobalIR.ContextualGlobalInitializerTypesAgree]
+          exact ⟨type, slotType, initializerTyped, ih (slot := slot + 1) tailTyped⟩
+
+theorem ContextualGlobalInitializerRows.toRuntimeRows
+    (globals : List Signature) (assignment : Nat → Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (slot : Nat) (rows : List Entry)
+    (contextual : ContextualGlobalInitializerRows globals assignment slotTypes slot rows) :
+    ContextualGlobalRuntimeInitializerRows globals assignment definitions slotTypes
+      functionSources program slot rows := by
+  induction rows generalizing slot with
+  | nil => simp [ContextualGlobalRuntimeInitializerRows]
+  | cons row tail ih =>
+      cases row with
+      | function identity signature valid definition =>
+          simpa [ContextualGlobalRuntimeInitializerRows,
+            ContextualGlobalInitializerRows] using
+            ih (slot := slot) (by
+              simpa [ContextualGlobalInitializerRows] using contextual)
+      | value identity type valid initializer =>
+          rcases contextual with ⟨slotType, initializerTyped, tailTyped⟩
+          simp only [ContextualGlobalRuntimeInitializerRows]
+          exact ⟨slotType, .arithmetic initializerTyped,
+            ih (slot := slot + 1) tailTyped⟩
+
+theorem ContextualGlobalRuntimeInitializerRows.toRuntimeTypesAgree
+    (globals : List Signature) (assignment : Nat → Ty)
+    (definitions : Surface.Definitions) (slotTypes : List Ty)
+    (functionSources : List (Nat × Nat)) (program : List Definition)
+    (slot : Nat) (rows : List Entry)
+    (contextual : ContextualGlobalRuntimeInitializerRows globals assignment definitions
+      slotTypes functionSources program slot rows) :
+    GlobalIR.ContextualGlobalRuntimeInitializerTypesAgree globals assignment definitions
+      slotTypes functionSources program slot (initializerTerms rows) := by
+  induction rows generalizing slot with
+  | nil => simp [initializerTerms, GlobalIR.ContextualGlobalRuntimeInitializerTypesAgree]
+  | cons row tail ih =>
+      cases row with
+      | function identity signature valid definition =>
+          simpa [initializerTerms, ContextualGlobalRuntimeInitializerRows,
+            GlobalIR.ContextualGlobalRuntimeInitializerTypesAgree] using
+            ih (slot := slot) (by
+              simpa [ContextualGlobalRuntimeInitializerRows] using contextual)
+      | value identity type valid initializer =>
+          rcases contextual with ⟨slotType, initializerTyped, tailTyped⟩
+          simp only [initializerTerms,
+            GlobalIR.ContextualGlobalRuntimeInitializerTypesAgree]
+          exact ⟨type, slotType, initializerTyped, ih (slot := slot + 1) tailTyped⟩
+
 def toRuntimeProgram (entries : List Entry) (entry : Nat) : GlobalIR.Program :=
   ⟨toDefinitions 0 entries, initializerTerms entries, entry⟩
 
@@ -658,6 +1158,65 @@ theorem initializerTerms_length (entries : List Entry) :
   | nil => rfl
   | cons entry rest ih =>
       cases entry <;> simp [initializerTerms, valueTypes, ih]
+
+/-- A successful initialization of mixed top-level declarations preserves the
+whole typed GlobalIR store when each source initializer is typed in the runtime
+fragment. This admits generated getters and functions in initializer terms. -/
+theorem ContextualGlobalRuntimeInitializerRows.toRuntimeProgram_initialization_preserves_store
+    (entries : List Entry) (globals : List Signature) (assignment : Nat → Ty)
+    (definitions : Surface.Definitions) (functionSources : List (Nat × Nat))
+    (entryIndex fuel : Nat) (result : Store)
+    (programTyped : GlobalProgramTyped globals definitions (valueTypes entries)
+      functionSources (toRuntimeProgram entries entryIndex).definitions)
+    (rows : ContextualGlobalRuntimeInitializerRows globals assignment definitions
+      (valueTypes entries) functionSources
+      (toRuntimeProgram entries entryIndex).definitions 0 entries)
+    (initialization : initializeValues
+      (toRuntimeProgram entries entryIndex).definitions fuel
+      (List.replicate (toRuntimeProgram entries entryIndex).initializers.length none)
+      0 (toRuntimeProgram entries entryIndex).initializers = .ok result) :
+    StoreWellTyped globals (valueTypes entries) result := by
+  have typesAgree := ContextualGlobalRuntimeInitializerRows.toRuntimeTypesAgree
+    globals assignment definitions (valueTypes entries) functionSources
+    (toRuntimeProgram entries entryIndex).definitions 0 entries rows
+  have initializerTermsEq : (toRuntimeProgram entries entryIndex).initializers =
+      initializerTerms entries := rfl
+  rw [initializerTermsEq] at initialization
+  exact GlobalIR.initializeValues_contextualGlobalRuntime_preserves_typed
+    globals assignment definitions (valueTypes entries) functionSources
+    (toRuntimeProgram entries entryIndex).definitions programTyped fuel
+    (List.replicate (initializerTerms entries).length none) 0 (initializerTerms entries)
+    result (by simpa using initializerTerms_length entries)
+    (GlobalIR.empty_store_well_typed globals (valueTypes entries)
+      (initializerTerms entries).length) typesAgree
+    (by
+      intro offset below
+      simpa using below) initialization
+
+theorem ArithmeticInitializerRows.contextualGlobalTypesAgree
+    (globals : List Signature) (assignment : Nat → Ty) (slotTypes : List Ty)
+    (slot : Nat) (rows : List Entry)
+    (arithmetic : ArithmeticInitializerRows slotTypes slot rows) :
+    GlobalIR.ContextualGlobalInitializerTypesAgree globals assignment slotTypes slot
+      (initializerTerms rows) := by
+  induction rows generalizing slot with
+  | nil => simp [initializerTerms, GlobalIR.ContextualGlobalInitializerTypesAgree]
+  | cons row tail ih =>
+      cases row with
+      | function identity signature valid definition =>
+          simpa [initializerTerms, ArithmeticInitializerRows,
+            GlobalIR.ContextualGlobalInitializerTypesAgree] using
+            ih (slot := slot) (by simpa [ArithmeticInitializerRows] using arithmetic)
+      | value identity type valid initializer =>
+          have parts : slotTypes.get? slot = some type ∧
+              ArithmeticSurfaceExpr initializer type ∧
+              ArithmeticInitializerRows slotTypes (slot + 1) tail := by
+            simpa [ArithmeticInitializerRows] using arithmetic
+          simpa [initializerTerms, GlobalIR.ContextualGlobalInitializerTypesAgree] using
+            (⟨type, parts.1,
+              ContextualGlobalArithmeticTerm.arithmetic
+                (ContextualArithmeticTerm.closed parts.2.1.erase),
+              ih (slot := slot + 1) parts.2.2⟩)
 
 theorem toRuntimeProgram_layout (entries : List Entry) (entryIndex : Nat) :
     (toRuntimeProgram entries entryIndex).definitions = toDefinitions 0 entries ∧
@@ -704,6 +1263,83 @@ private theorem entry_getElem?_eq_get? {α : Type} (items : List α) (index : Na
     simp only [getElem?_def, dif_neg bound]
     exact (List.get?_eq_none).2 outside |>.symm
 
+/-- For a uniquely named mixed value declaration, identity lookup selects its
+source index, the C `value_slots` ordinal selects its shared cell, and the
+compiled GlobalIR getter at the same index observes the same
+before-initialization state. -/
+theorem mixed_value_identity_cell_and_getter_before_initialization
+    (entries : List Entry) (index identity : Nat) (type : Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr) (slot : Nat)
+    (unique : DistinctIds (identities entries))
+    (found : entries.get? index = some (.value identity type valid initializer))
+    (ordinal : sourceValueSlotOrdinal entries index = some slot)
+    (cells : GlobalIR.Store) (uninitialized : cells[slot]? = some none) :
+    globalIndexOf identity entries = some index ∧
+      GlobalIR.getterFor (getterMappingsFromEntries 0 entries) index = some index ∧
+      cValueSlotCellRead (cValueSlotOrdinals entries) cells index = none ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) cells 2 []
+        (.app (.global index) []) = .error (.beforeInitialization slot) := by
+  have nameLookup := globalIndexOf_get?_unique entries index
+    (.value identity type valid initializer) identity unique found rfl
+  have getterMapping := getterMappingsFromEntries_value_lookup 0 entries index identity type
+    valid initializer found
+  have inRange : index < entries.length := (List.get?_eq_some.mp found).1
+  have cOrdinal := cValueSlotOrdinals_get entries index inRange
+  have cPointer : (cValueSlotOrdinals entries)[index]? = some (some slot) := by
+    rw [cOrdinal, ordinal]
+  obtain ⟨getterType, getterLayout⟩ := sourceValueSlotOrdinal_layout entries index 0 slot ordinal
+  have getterLayout' : (compiledLayout 0 entries).get? index =
+      some (⟨0, [], getterType⟩, GlobalIR.Definition.getter slot) := by
+    simpa using getterLayout
+  have getterGet? := toDefinitions_getter_of_layout 0 entries index
+    ⟨0, [], getterType⟩ slot getterLayout'
+  have getter : (toDefinitions 0 entries)[index]? =
+      some (GlobalIR.Definition.getter slot) := by
+    rw [entry_getElem?_eq_get?]
+    exact getterGet?
+  have cellAndRead := cValueSlotCellRead_and_getter_beforeInitialization
+    (cValueSlotOrdinals entries) cells index slot 0 cPointer (toDefinitions 0 entries)
+    getter uninitialized
+  exact ⟨nameLookup, by simpa using getterMapping, cellAndRead.1, cellAndRead.2⟩
+
+/-- A successful C-style name lookup can be carried through its selected
+source index to the corresponding uninitialized value cell and GlobalIR
+getter, once the decoded named layout agrees positionally with the source
+declarations. -/
+theorem named_value_lookup_cell_and_getter_before_initialization
+    (named : List CNameResolution.Entry) (entries : List Entry)
+    (name : String) (binding : CNameResolution.Entry) (index slot sourceIdentity : Nat)
+    (type : Ty) (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (layout : NamedGlobalLayout named entries)
+    (unique : DistinctIds (identities entries))
+    (nameFound : CNameResolution.findName named name = some binding)
+    (nameIndex : CNameResolution.findNameIndex named name = some index)
+    (entryAt : entries.get? index = some (.value sourceIdentity type valid initializer))
+    (ordinal : sourceValueSlotOrdinal entries index = some slot)
+    (cells : GlobalIR.Store) (uninitialized : cells[slot]? = some none) :
+    CNameResolution.findNameIndex named name = some index ∧
+      globalIndexOf binding.identity entries = some index ∧
+      GlobalIR.getterFor (getterMappingsFromEntries 0 entries) index = some index ∧
+      cValueSlotCellRead (cValueSlotOrdinals entries) cells index = none ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) cells 2 []
+        (.app (.global index) []) = .error (.beforeInitialization slot) := by
+  obtain ⟨selected, selectedFound, namedAtIndex⟩ :=
+    CNameResolution.findNameIndex_sound named name index nameIndex
+  have selectedEq : binding = selected := Option.some.inj (by
+    rw [nameFound] at selectedFound
+    exact selectedFound)
+  have namedAtIndex' : named.get? index = some binding := by
+    rw [selectedEq]
+    exact namedAtIndex
+  have identityAgreement := layout.2 index binding
+    (.value sourceIdentity type valid initializer) namedAtIndex' entryAt
+  change binding.identity = sourceIdentity at identityAgreement
+  have base := mixed_value_identity_cell_and_getter_before_initialization entries index
+    sourceIdentity type valid initializer slot unique entryAt ordinal cells uninitialized
+  have namedIdentityLookup : globalIndexOf binding.identity entries = some index := by
+    simpa [identityAgreement] using base.1
+  exact ⟨nameIndex, namedIdentityLookup, base.2.1, base.2.2.1, base.2.2.2⟩
+
 /-- After successful initialization, a C-style mixed declaration index reads
 back the initialized value through its GlobalIR getter. This composes the
 source-index to dense-slot initializer mapping with the compiled getter table
@@ -737,6 +1373,402 @@ theorem sourceValueSlotOrdinal_successful_getter_reads
     (toDefinitions 0 entries) fuel result initialized
   exact ⟨value, GlobalIR.getter_call_reads_current_store (toDefinitions 0 entries)
     result fuel sourceIndex slot value getterIndexed stored⟩
+
+/-- The value reached through a mixed declaration index is the very value
+committed to its dense slot by initialization.  This joins the initializer
+slot map and the getter read in one result, rather than proving only that each
+side returns some value independently. -/
+theorem sourceValueSlotOrdinal_successful_getter_reads_same_value
+    (entries : List Entry) (sourceIndex slot identityValue fuel : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues (toDefinitions 0 entries) fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    ∃ value, result[slot]? = some (some value) ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) result (fuel + 2) []
+        (.app (.global sourceIndex) []) = .ok value := by
+  obtain ⟨value, stored⟩ := sourceValueSlotOrdinal_successful_initialization_populates
+    entries sourceIndex slot identityValue type typeValid initializer entryAt ordinal
+    (toDefinitions 0 entries) fuel result initialized
+  obtain ⟨getterType, layout⟩ :=
+    sourceValueSlotOrdinal_layout entries sourceIndex 0 slot ordinal
+  have layout' : (compiledLayout 0 entries).get? sourceIndex =
+      some (⟨0, [], getterType⟩, Definition.getter slot) := by
+    simpa [Nat.zero_add] using layout
+  have getter : (toDefinitions 0 entries)[sourceIndex]? =
+      some (Definition.getter slot) := by
+    rw [entry_getElem?_eq_get?]
+    exact toDefinitions_getter_of_layout 0 entries sourceIndex
+      ⟨0, [], getterType⟩ slot layout'
+  exact ⟨value, stored,
+    GlobalIR.getter_call_reads_current_store (toDefinitions 0 entries) result fuel
+      sourceIndex slot value getter stored⟩
+
+/-- Join the mixed-index C `value_slots` model with successful GlobalIR
+initialization and getter evaluation. A C cell pointer at a source declaration
+index resolves to the same dense ordinal that initialization commits and the
+compiled getter reads. -/
+theorem cValueSlotOrdinal_successful_getter_reads_same_value
+    (entries : List Entry) (sourceIndex slot identityValue fuel : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (cellPointer : (cValueSlotOrdinals entries)[sourceIndex]? = some (some slot))
+    (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues (toDefinitions 0 entries) fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    ∃ value, result[slot]? = some (some value) ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) result (fuel + 2) []
+        (.app (.global sourceIndex) []) = .ok value := by
+  have inRange : sourceIndex < entries.length :=
+    (List.get?_eq_some.mp entryAt).1
+  have slotMap := cValueSlotOrdinals_get entries sourceIndex inRange
+  rw [slotMap] at cellPointer
+  have ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot :=
+    Option.some.inj cellPointer
+  exact sourceValueSlotOrdinal_successful_getter_reads_same_value entries sourceIndex
+    slot identityValue fuel type typeValid initializer entryAt ordinal result initialized
+
+/-- A C closure environment that retains the pointer in `value_slots` sees
+the initialized value through that same shared cell; reading it agrees with
+the GlobalIR getter at the original mixed declaration index. -/
+theorem cValueSlotCellRead_matches_initialized_getter
+    (entries : List Entry) (sourceIndex slot identityValue fuel : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (cellPointer : (cValueSlotOrdinals entries)[sourceIndex]? = some (some slot))
+    (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues (toDefinitions 0 entries) fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    ∃ value, cValueSlotCellRead (cValueSlotOrdinals entries) result sourceIndex =
+      some value ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) result (fuel + 2) []
+        (.app (.global sourceIndex) []) = .ok value := by
+  obtain ⟨value, stored, getterEval⟩ := cValueSlotOrdinal_successful_getter_reads_same_value
+    entries sourceIndex slot identityValue fuel type typeValid initializer entryAt cellPointer
+    result initialized
+  refine ⟨value, ?_, getterEval⟩
+  simp [cValueSlotCellRead, cellPointer, stored]
+
+/-- End-to-end layout theorem for a mixed top-level value after successful
+initialization: C-style name lookup, its selected mixed declaration index,
+the shared `value_slots` cell, and the compiled GlobalIR getter all identify
+and return the same value. -/
+theorem named_value_lookup_matches_initialized_getter
+    (named : List CNameResolution.Entry) (entries : List Entry)
+    (name : String) (binding : CNameResolution.Entry) (index slot sourceIdentity : Nat)
+    (type : Ty) (valid : type.wellFormed 0) (initializer : Expr)
+    (layout : NamedGlobalLayout named entries)
+    (unique : DistinctIds (identities entries))
+    (nameFound : CNameResolution.findName named name = some binding)
+    (nameIndex : CNameResolution.findNameIndex named name = some index)
+    (entryAt : entries.get? index = some (.value sourceIdentity type valid initializer))
+    (ordinal : sourceValueSlotOrdinal entries index = some slot)
+    (fuel : Nat) (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues (toDefinitions 0 entries) fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    CNameResolution.findNameIndex named name = some index ∧
+      globalIndexOf binding.identity entries = some index ∧
+      GlobalIR.getterFor (getterMappingsFromEntries 0 entries) index = some index ∧
+      ∃ value, cValueSlotCellRead (cValueSlotOrdinals entries) result index = some value ∧
+        GlobalIR.evaluate (toDefinitions 0 entries) result (fuel + 2) []
+          (.app (.global index) []) = .ok value := by
+  obtain ⟨selected, selectedFound, namedAtIndex⟩ :=
+    CNameResolution.findNameIndex_sound named name index nameIndex
+  have selectedEq : binding = selected := Option.some.inj (by
+    rw [nameFound] at selectedFound
+    exact selectedFound)
+  have namedAtIndex' : named.get? index = some binding := by
+    rw [selectedEq]
+    exact namedAtIndex
+  have identityMatches := layout.2 index binding
+    (.value sourceIdentity type valid initializer) namedAtIndex' entryAt
+  change binding.identity = sourceIdentity at identityMatches
+  have globalIndexResult := globalIndexOf_get?_unique entries index
+    (.value sourceIdentity type valid initializer) binding.identity unique entryAt
+    identityMatches.symm
+  have getterResult :
+      GlobalIR.getterFor (getterMappingsFromEntries 0 entries) index = some index := by
+    simpa using getterMappingsFromEntries_value_lookup 0 entries index sourceIdentity type
+      valid initializer entryAt
+  have inRange : index < entries.length := (List.get?_eq_some.mp entryAt).1
+  have cellPointer : (cValueSlotOrdinals entries)[index]? = some (some slot) := by
+    rw [cValueSlotOrdinals_get entries index inRange, ordinal]
+  have valuesAgree := cValueSlotCellRead_matches_initialized_getter entries index slot
+    sourceIdentity fuel type valid initializer entryAt cellPointer result initialized
+  exact ⟨nameIndex, globalIndexResult, getterResult, valuesAgree⟩
+
+private theorem sourceValueSlotOrdinal_exists_of_value_lookup (entries : List Entry)
+    (sourceIndex identityValue : Nat) (type : Ty) (typeValid : type.wellFormed 0)
+    (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer)) :
+    ∃ slot, sourceValueSlotOrdinal entries sourceIndex = some slot := by
+  induction entries generalizing sourceIndex with
+  | nil => simp at entryAt
+  | cons entry rest ih =>
+      cases entry with
+      | function functionId signature signatureValid definition =>
+          cases sourceIndex with
+          | zero => simp at entryAt
+          | succ sourceIndex =>
+              have tailEntry : rest.get? sourceIndex =
+                  some (.value identityValue type typeValid initializer) := by
+                simpa using entryAt
+              obtain ⟨slot, ordinal⟩ := ih sourceIndex tailEntry
+              exact ⟨slot, by simpa [sourceValueSlotOrdinal] using ordinal⟩
+      | value valueId valueType valueValid valueInitializer =>
+          cases sourceIndex with
+          | zero =>
+              have entryEq : Entry.value valueId valueType valueValid valueInitializer =
+                  Entry.value identityValue type typeValid initializer := Option.some.inj entryAt
+              exact ⟨0, by simp [sourceValueSlotOrdinal, congrArg identity entryEq]⟩
+          | succ sourceIndex =>
+              have tailEntry : rest.get? sourceIndex =
+                  some (.value identityValue type typeValid initializer) := by
+                simpa using entryAt
+              obtain ⟨slot, ordinal⟩ := ih sourceIndex tailEntry
+              exact ⟨slot + 1, by simp [sourceValueSlotOrdinal, ordinal]⟩
+
+private theorem replicate_lookup_eq_some_value {α : Type} (count index : Nat)
+    (value : α) (bound : index < count) :
+    (List.replicate count value)[index]? = some value := by
+  induction count generalizing index with
+  | zero => omega
+  | succ count ih =>
+      cases index with
+      | zero => simp [List.replicate, getElem?_def]
+      | succ index =>
+          have tailBound : index < count := by omega
+          simpa [List.replicate, getElem?_def, Nat.succ_lt_succ_iff] using
+            ih index tailBound
+
+/-- Compose identity-based C lookup, the mixed declaration index, the dense
+`value_slots` ordinal, the shared cell read, and the compiled GlobalIR getter
+for one initialized top-level value. -/
+theorem cIdentityLookup_value_reads_initialized_getter
+    (entries : List Entry) (sourceIndex identityValue fuel : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (unique : DistinctIds (identities entries))
+    (result : GlobalIR.Store)
+    (initialized : GlobalIR.initializeValues (toDefinitions 0 entries) fuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (initializerTerms entries) = .ok result) :
+    globalIndexOf identityValue entries = some sourceIndex ∧
+    ∃ slot value,
+      valueSlotOf identityValue 0 entries = some slot ∧
+      cValueSlotCellRead (cValueSlotOrdinals entries) result sourceIndex = some value ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) result (fuel + 2) []
+        (.app (.global sourceIndex) []) = .ok value := by
+  have identityAndGetter := mixed_value_identity_and_getter_index entries sourceIndex
+    identityValue type typeValid initializer unique entryAt
+  have ordinalMatches := sourceValueSlotOrdinal_matches_identity_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt unique
+  cases slotResult : valueSlotOf identityValue 0 entries with
+  | none =>
+      rw [slotResult] at ordinalMatches
+      obtain ⟨slot, ordinal⟩ := sourceValueSlotOrdinal_exists_of_value_lookup
+        entries sourceIndex identityValue type typeValid initializer entryAt
+      rw [ordinalMatches] at ordinal
+      simp at ordinal
+  | some slot =>
+      have ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot := by
+        rw [ordinalMatches, slotResult]
+      have cellPointer : (cValueSlotOrdinals entries)[sourceIndex]? = some (some slot) := by
+        rw [cValueSlotOrdinals_get entries sourceIndex (List.get?_eq_some.mp entryAt).1,
+          ordinal]
+      obtain ⟨value, cellRead, getterRead⟩ :=
+        cValueSlotCellRead_matches_initialized_getter entries sourceIndex slot identityValue
+          fuel type typeValid initializer entryAt cellPointer result initialized
+      exact ⟨identityAndGetter.1, ⟨slot, value, rfl, cellRead, getterRead⟩⟩
+
+/-- The same identity-to-slot path preserves the before-initialization state:
+the C shared-cell model observes an empty value and the compiled GlobalIR
+getter reports the matching slot fault. -/
+theorem cIdentityLookup_value_before_initialization
+    (entries : List Entry) (sourceIndex identityValue : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (unique : DistinctIds (identities entries))
+    (store : GlobalIR.Store)
+    (uninitialized : ∀ slot, valueSlotOf identityValue 0 entries = some slot →
+      store[slot]? = some none) :
+    globalIndexOf identityValue entries = some sourceIndex ∧
+    ∃ slot, valueSlotOf identityValue 0 entries = some slot ∧
+      store[slot]? = some none ∧
+      cValueSlotCellRead (cValueSlotOrdinals entries) store sourceIndex = none ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) store 2 []
+        (.app (.global sourceIndex) []) = .error (.beforeInitialization slot) := by
+  have identityAndGetter := mixed_value_identity_and_getter_index entries sourceIndex
+    identityValue type typeValid initializer unique entryAt
+  have ordinalMatches := sourceValueSlotOrdinal_matches_identity_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt unique
+  have ordinalExists := sourceValueSlotOrdinal_exists_of_value_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt
+  cases slotResult : valueSlotOf identityValue 0 entries with
+  | none =>
+      rw [slotResult] at ordinalMatches
+      obtain ⟨someSlot, ordinal⟩ := ordinalExists
+      rw [ordinalMatches] at ordinal
+      simp at ordinal
+  | some foundSlot =>
+      have ordinal : sourceValueSlotOrdinal entries sourceIndex = some foundSlot := by
+        rw [ordinalMatches, slotResult]
+      have emptyCell : store[foundSlot]? = some none :=
+        uninitialized foundSlot slotResult
+      have cellPointer : (cValueSlotOrdinals entries)[sourceIndex]? =
+          some (some foundSlot) := by
+        rw [cValueSlotOrdinals_get entries sourceIndex (List.get?_eq_some.mp entryAt).1,
+          ordinal]
+      obtain ⟨getterType, layout⟩ := sourceValueSlotOrdinal_layout entries sourceIndex
+        0 foundSlot ordinal
+      have layout' : (compiledLayout 0 entries).get? sourceIndex =
+          some (⟨0, [], getterType⟩, Definition.getter foundSlot) := by
+        simpa using layout
+      have getter : (toDefinitions 0 entries)[sourceIndex]? =
+          some (Definition.getter foundSlot) := by
+        rw [entry_getElem?_eq_get?]
+        exact toDefinitions_getter_of_layout 0 entries sourceIndex
+          ⟨0, [], getterType⟩ foundSlot layout'
+      have beforeInitialization := cValueSlotCellRead_and_getter_beforeInitialization
+        (cValueSlotOrdinals entries) store sourceIndex foundSlot 0 cellPointer
+        (toDefinitions 0 entries) getter emptyCell
+      exact ⟨identityAndGetter.1, ⟨foundSlot, rfl, emptyCell, beforeInitialization.1,
+        by simpa [GlobalIR.evaluate, GlobalIR.evaluateArgs, getter, GlobalIR.readGlobal,
+          emptyCell, List.isEmpty] using beforeInitialization.2⟩⟩
+
+/-- Specialize the identity-to-getter fault correspondence to GlobalIR's
+actual initial store: every declared value slot begins as `none`, so a
+source-order value reference before its initializer commits reports the
+matching early-read fault. -/
+theorem cIdentityLookup_value_faults_from_initial_store
+    (entries : List Entry) (sourceIndex identityValue : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (unique : DistinctIds (identities entries)) :
+    globalIndexOf identityValue entries = some sourceIndex ∧
+    ∃ slot,
+      valueSlotOf identityValue 0 entries = some slot ∧
+      cValueSlotCellRead (cValueSlotOrdinals entries)
+        (List.replicate (initializerTerms entries).length
+          (none : Option PolyIR.Value)) sourceIndex = none ∧
+      GlobalIR.evaluate (toDefinitions 0 entries)
+        (List.replicate (initializerTerms entries).length
+          (none : Option PolyIR.Value)) 2 []
+        (.app (.global sourceIndex) []) = .error (.beforeInitialization slot) := by
+  have ordinalMatches := sourceValueSlotOrdinal_matches_identity_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt unique
+  have ordinalExists := sourceValueSlotOrdinal_exists_of_value_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt
+  cases slotResult : valueSlotOf identityValue 0 entries with
+  | none =>
+      rw [slotResult] at ordinalMatches
+      obtain ⟨slot, ordinal⟩ := ordinalExists
+      rw [ordinalMatches] at ordinal
+      simp at ordinal
+  | some slot =>
+      have ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot := by
+        rw [ordinalMatches, slotResult]
+      have initializerFound := sourceValueSlotOrdinal_initializer_lookup entries sourceIndex
+        slot identityValue type typeValid initializer entryAt ordinal
+      have slotBound : slot < (initializerTerms entries).length :=
+        (List.get?_eq_some.mp initializerFound).1
+      have emptyAtSlot :
+          (List.replicate (initializerTerms entries).length
+            (none : Option PolyIR.Value))[slot]? = some none := by
+        exact replicate_lookup_eq_some_value (initializerTerms entries).length slot
+          none slotBound
+      have general := cIdentityLookup_value_before_initialization entries sourceIndex
+        identityValue type typeValid initializer entryAt unique
+        (List.replicate (initializerTerms entries).length
+          (none : Option PolyIR.Value)) (fun other found => by
+            have otherOrdinal : sourceValueSlotOrdinal entries sourceIndex = some other :=
+              ordinalMatches.trans found
+            have otherInitializer := sourceValueSlotOrdinal_initializer_lookup entries
+              sourceIndex other identityValue type typeValid initializer entryAt otherOrdinal
+            have otherBound : other < (initializerTerms entries).length :=
+              (List.get?_eq_some.mp otherInitializer).1
+            exact replicate_lookup_eq_some_value (initializerTerms entries).length other
+              none otherBound)
+      rcases general with ⟨globalIndex, selectedSlot, selected, _emptyCell,
+        cellRead, getterRead⟩
+      have selectedEq : selectedSlot = slot := Option.some.inj (selected.symm.trans slotResult)
+      subst selectedSlot
+      exact ⟨globalIndex, slot, rfl, cellRead, getterRead⟩
+
+/-- After an arbitrary successful prefix that ends before a referenced value's
+dense slot, the committed store still contains `none` at that slot. Identity
+lookup, the prefix frame property, and getter evaluation then agree on the
+same before-initialization fault. -/
+theorem cIdentityLookup_value_faults_after_prefix
+    (entries : List Entry) (sourceIndex identityValue : Nat) (type : Ty)
+    (typeValid : type.wellFormed 0) (initializer : Expr)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identityValue type typeValid initializer))
+    (unique : DistinctIds (identities entries)) (prefixFuel : Nat)
+    (prefixTerms : List PolyIR.Term) (after : GlobalIR.Store)
+    (prefixSuccess : GlobalIR.initializeValues (toDefinitions 0 entries) prefixFuel
+      (List.replicate (initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 prefixTerms = .ok after)
+    (prefixBeforeValueSlot : ∀ slot,
+      valueSlotOf identityValue 0 entries = some slot → prefixTerms.length ≤ slot) :
+    globalIndexOf identityValue entries = some sourceIndex ∧
+    ∃ slot,
+      valueSlotOf identityValue 0 entries = some slot ∧
+      cValueSlotCellRead (cValueSlotOrdinals entries) after sourceIndex = none ∧
+      GlobalIR.evaluate (toDefinitions 0 entries) after 2 []
+        (.app (.global sourceIndex) []) = .error (.beforeInitialization slot) := by
+  have ordinalMatches := sourceValueSlotOrdinal_matches_identity_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt unique
+  have ordinalExists := sourceValueSlotOrdinal_exists_of_value_lookup entries sourceIndex
+    identityValue type typeValid initializer entryAt
+  cases slotResult : valueSlotOf identityValue 0 entries with
+  | none =>
+      rw [slotResult] at ordinalMatches
+      obtain ⟨slot, ordinal⟩ := ordinalExists
+      rw [ordinalMatches] at ordinal
+      simp at ordinal
+  | some slot =>
+      have ordinal : sourceValueSlotOrdinal entries sourceIndex = some slot := by
+        rw [ordinalMatches, slotResult]
+      have initializerFound := sourceValueSlotOrdinal_initializer_lookup entries sourceIndex
+        slot identityValue type typeValid initializer entryAt ordinal
+      have slotBound : slot < (initializerTerms entries).length :=
+        (List.get?_eq_some.mp initializerFound).1
+      have initialEmpty := replicate_lookup_eq_some_value
+        (initializerTerms entries).length slot (none : Option PolyIR.Value) slotBound
+      have selectedStillEmpty : after[slot]? = some none := by
+        have unchanged := GlobalIR.initializeValues_success_preserves_slots_after
+          (toDefinitions 0 entries) prefixFuel
+          (List.replicate (initializerTerms entries).length
+            (none : Option PolyIR.Value)) 0 prefixTerms after slot prefixSuccess
+          (by simpa using prefixBeforeValueSlot slot slotResult)
+        exact unchanged.trans initialEmpty
+      have everyResolvedSlotEmpty : ∀ other,
+          valueSlotOf identityValue 0 entries = some other → after[other]? = some none := by
+        intro other found
+        have sameSlot : slot = other := Option.some.inj (slotResult.symm.trans found)
+        subst other
+        exact selectedStillEmpty
+      obtain ⟨globalLookup, selectedSlot, selected, _emptyCell, cellRead, getterRead⟩ :=
+        cIdentityLookup_value_before_initialization entries sourceIndex identityValue
+          type typeValid initializer entryAt unique after everyResolvedSlotEmpty
+      have selectedEq : selectedSlot = slot :=
+        Option.some.inj (selected.symm.trans slotResult)
+      subst selectedSlot
+      exact ⟨globalLookup, ⟨slot, rfl, cellRead, getterRead⟩⟩
 
 theorem compiledGetterTypes_compiledLayout (start : Nat) (entries : List Entry) :
     compiledGetterTypes (compiledLayout start entries) = valueTypes entries := by
@@ -1369,6 +2401,83 @@ theorem TypedInitializerRows.toRuntimeProgram_initialization_preserves_store
       (valueTypes entries) 0 (initializerTerms entries) initialized
     simpa [List.length_replicate] using initializerCount
 
+/-- Contextual GlobalIR initializer typing, which also admits typed global
+function/getter calls, is enough to preserve the initialized store type. This
+avoids passing a separate evaluator-safety theorem for every initializer. -/
+theorem toRuntimeProgram_contextualGlobal_initialization_preserves_store
+    (entries : List Entry) (globals : List Signature) (definitions : Surface.Definitions)
+    (functionSources : List (Nat × Nat)) (entryIndex fuel : Nat) (result : Store)
+    (contextualRows : ContextualGlobalInitializerRows globals
+      (fun _ => Ty.unit) (valueTypes entries) 0 entries)
+    (programTyped : GlobalIR.GlobalProgramTyped globals definitions
+      (valueTypes entries) functionSources
+      (toRuntimeProgram entries entryIndex).definitions)
+    (success : initializeValues (toRuntimeProgram entries entryIndex).definitions fuel
+      (List.replicate (toRuntimeProgram entries entryIndex).initializers.length none)
+      0 (toRuntimeProgram entries entryIndex).initializers = .ok result) :
+    StoreWellTyped globals (valueTypes entries) result ∧
+      result.length = (valueTypes entries).length := by
+  have runtimeRows := contextualRows.toRuntimeRows globals (fun _ => Ty.unit)
+    definitions (valueTypes entries) functionSources
+    (toRuntimeProgram entries entryIndex).definitions 0 entries
+  have initializerTypes := runtimeRows.toRuntimeTypesAgree globals (fun _ => Ty.unit)
+    definitions (valueTypes entries) functionSources
+    (toRuntimeProgram entries entryIndex).definitions 0 entries
+  have initialized : initializeValues (toDefinitions 0 entries) fuel
+      (List.replicate (initializerTerms entries).length none) 0
+      (initializerTerms entries) = .ok result := by
+    simpa [toRuntimeProgram] using success
+  constructor
+  · exact GlobalIR.initializeValues_contextualGlobalRuntime_preserves_typed globals
+      (fun _ => Ty.unit) definitions (valueTypes entries) functionSources
+      (toRuntimeProgram entries entryIndex).definitions programTyped fuel
+      (List.replicate (initializerTerms entries).length none) 0
+      (initializerTerms entries) result
+      (by simpa using initializerTerms_length entries)
+      (GlobalIR.empty_store_well_typed globals (valueTypes entries)
+        (initializerTerms entries).length)
+      initializerTypes
+      (by
+        intro offset below
+        simpa [List.length_replicate] using below)
+      initialized
+  · apply GlobalIR.initializeValues_preserves_layout_length
+      (program := (toRuntimeProgram entries entryIndex).definitions)
+      (List.replicate (initializerTerms entries).length none) result
+      (valueTypes entries) 0 (initializerTerms entries) initialized
+    simpa [List.length_replicate, initializerTerms_length]
+
+/-- The getter-aware runtime initializer fragment also establishes both the
+typed store invariant and slot-layout length for the generated mixed-entry
+program. The source rows may read previously initialized value slots. -/
+theorem toRuntimeProgram_runtimeContextual_initialization_preserves_store
+    (entries : List Entry) (globals : List Signature) (assignment : Nat → Ty)
+    (definitions : Surface.Definitions) (functionSources : List (Nat × Nat))
+    (entryIndex fuel : Nat) (result : Store)
+    (runtimeRows : ContextualGlobalRuntimeInitializerRows globals assignment definitions
+      (valueTypes entries) functionSources
+      (toRuntimeProgram entries entryIndex).definitions 0 entries)
+    (programTyped : GlobalProgramTyped globals definitions (valueTypes entries)
+      functionSources (toRuntimeProgram entries entryIndex).definitions)
+    (success : initializeValues (toRuntimeProgram entries entryIndex).definitions fuel
+      (List.replicate (toRuntimeProgram entries entryIndex).initializers.length none)
+      0 (toRuntimeProgram entries entryIndex).initializers = .ok result) :
+    StoreWellTyped globals (valueTypes entries) result ∧
+      result.length = (valueTypes entries).length := by
+  have storeTyped := ContextualGlobalRuntimeInitializerRows.toRuntimeProgram_initialization_preserves_store
+    entries globals assignment definitions
+    functionSources entryIndex fuel result programTyped runtimeRows success
+  have initialized : initializeValues (toRuntimeProgram entries entryIndex).definitions fuel
+      (List.replicate (initializerTerms entries).length none) 0
+      (initializerTerms entries) = .ok result := by
+    simpa [toRuntimeProgram] using success
+  refine ⟨storeTyped, ?_⟩
+  apply GlobalIR.initializeValues_preserves_layout_length
+    (program := (toRuntimeProgram entries entryIndex).definitions)
+    (List.replicate (initializerTerms entries).length none) result
+    (valueTypes entries) 0 (initializerTerms entries) initialized
+  simpa [List.length_replicate, initializerTerms_length]
+
 /-- A checker-accepted mixed declaration table directly establishes the
 initialized store's type and slot-count invariants, given evaluator safety. -/
 theorem InitializerCheckerRows.toRuntimeProgram_initialization_preserves_store
@@ -1539,25 +2648,36 @@ theorem TypedInitializerRows.toRuntimeProgram_initialization_supports_typed_gett
       evaluate (toRuntimeProgram entries entryIndex).definitions initializedStore
         (getterFuel + 2) [] (.app (.global index) []) = .ok value ∧
       PolyIR.ValueTyped globals value type := by
-  have initialized : initializeValues (toDefinitions 0 entries) initializerFuel
-      (List.replicate (initializerTerms entries).length none) 0
-      (initializerTerms entries) = .ok initializedStore := by
-    simpa [toRuntimeProgram] using initialization
-  have storeTyped := TypedInitializerRows.initialization_preserves_store_arithmetic
-    entries globals (valueTypes entries) (toDefinitions 0 entries) initializerFuel entries
-    initializedStore typedRows arithmeticRows initialized
+  obtain ⟨type, signatureEntry, typeWellFormed, slotType⟩ := getter_layout_typed globals
+    definitions (valueTypes entries) functionSources
+    (toRuntimeProgram entries entryIndex).definitions programTyped index slot getter
   have initializerCount : (initializerTerms entries).length = (valueTypes entries).length :=
     initializerTerms_length entries
-  have populated : ∀ slot, slot < (valueTypes entries).length →
-      ∃ value, initializedStore[slot]? = some (some value) := by
-    intro slot slotBound
-    have initializerBound : slot < (initializerTerms entries).length := by omega
-    have present := GlobalIR.initialized_cells_present initialized (by simp)
-      ⟨Nat.zero_le _, by simpa using initializerBound⟩
-    exact present
-  exact typed_getter_call_preserves_type_of_populated_store
-    (toRuntimeProgram entries entryIndex).definitions globals definitions (valueTypes entries)
-    functionSources initializedStore getterFuel index slot programTyped getter storeTyped populated
+  have slotBound : slot < (initializerTerms entries).length := by
+    have sourceBound : slot < (valueTypes entries).length := by
+      simp only [getElem?_def] at slotType
+      split at slotType
+      · assumption
+      · contradiction
+    omega
+  have initialized : initializeValues (toRuntimeProgram entries entryIndex).definitions
+      initializerFuel
+      (List.replicate (initializerTerms entries).length none) 0 (initializerTerms entries) =
+        .ok initializedStore := by
+    simpa [toRuntimeProgram] using initialization
+  have typedGetter := GlobalIR.initializeValues_contextualGlobal_then_getter_preserves_type
+    globals (fun _ => .unit) definitions (valueTypes entries) functionSources
+    (toRuntimeProgram entries entryIndex).definitions programTyped initializerFuel getterFuel
+    (List.replicate (initializerTerms entries).length none) 0 slot
+    (initializerTerms entries) initializedStore type index
+    (empty_store_well_typed globals (valueTypes entries) (initializerTerms entries).length)
+    (arithmeticRows.contextualGlobalTypesAgree globals (fun _ => .unit)
+      (valueTypes entries) 0 entries)
+    (by intro offset below; simpa using below)
+    (by simp)
+    ⟨Nat.zero_le _, by omega⟩ slotType getter initialized
+  rcases typedGetter with ⟨value, evaluated, valueTyped⟩
+  exact ⟨type, value, signatureEntry, typeWellFormed, slotType, evaluated, valueTyped⟩
 
 /-- Arithmetic initializer certificates alone construct the row typing proof
 needed for the executable mixed-entry program and its typed getter. -/
@@ -1583,6 +2703,37 @@ theorem ArithmeticInitializerRows.toRuntimeProgram_initialization_supports_typed
     initializedStore index slot
     (arithmeticRows.toTypedInitializerRows entries (valueTypes entries) 0 entries)
     arithmeticRows initialization programTyped getter
+
+/-- Compose executable initializer checking with arithmetic initializer
+typing and the generated runtime getter path. Thus checker acceptance plus a
+successful initialization suffices for a typed getter result, without a
+separately supplied `TypedInitializerRows` witness. -/
+theorem checkInitializerRows_arithmetic_initialization_supports_typed_getter_call
+    (checkerFuel : Nat) (entries : List Entry) (globals : List Signature)
+    (definitions : Surface.Definitions) (functionSources : List (Nat × Nat))
+    (entryIndex initializerFuel getterFuel : Nat) (initializedStore : Store)
+    (index slot : Nat)
+    (accepted : checkInitializerRows checkerFuel entries (valueTypes entries) 0 entries = true)
+    (arithmeticRows : ArithmeticInitializerRows (valueTypes entries) 0 entries)
+    (initialization : initializeValues
+      (toRuntimeProgram entries entryIndex).definitions initializerFuel
+      (List.replicate (toRuntimeProgram entries entryIndex).initializers.length none)
+      0 (toRuntimeProgram entries entryIndex).initializers = .ok initializedStore)
+    (programTyped : GlobalProgramTyped globals definitions (valueTypes entries) functionSources
+      (toRuntimeProgram entries entryIndex).definitions)
+    (getter : (toRuntimeProgram entries entryIndex).definitions[index]? = some (.getter slot)) :
+    ∃ type value, globals[index]? = some ⟨0, [], type⟩ ∧ type.wellFormed 0 ∧
+      (valueTypes entries)[slot]? = some type ∧
+      evaluate (toRuntimeProgram entries entryIndex).definitions initializedStore
+        (getterFuel + 2) [] (.app (.global index) []) = .ok value ∧
+      PolyIR.ValueTyped globals value type := by
+  have checkedRows := checkInitializerRows_sound checkerFuel entries
+    (valueTypes entries) 0 entries accepted
+  have typedRows := checkedRows.toTypedInitializerRows checkerFuel entries
+    (valueTypes entries) 0 entries
+  exact TypedInitializerRows.toRuntimeProgram_initialization_supports_typed_getter_call_arithmetic
+    entries globals definitions functionSources entryIndex initializerFuel getterFuel
+    initializedStore index slot typedRows arithmeticRows initialization programTyped getter
 
 /- A typed source-order value table is sufficient to establish the slot/type
 agreement consumed by the sequential GlobalIR initializer proof. The only

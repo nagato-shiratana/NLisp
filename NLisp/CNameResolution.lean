@@ -14,6 +14,62 @@ def findName : List Entry → String → Option Entry
   | [], _ => none
   | entry :: tail, name => if name = entry.name then some entry else findName tail name
 
+/- Source index returned by the same left-to-right scan as C `rfind`. -/
+def findNameIndex : List Entry → String → Option Nat
+  | [], _ => none
+  | entry :: tail, name =>
+      if name = entry.name then some 0 else (findNameIndex tail name).map Nat.succ
+
+theorem findNameIndex_sound (environment : List Entry) (name : String) (index : Nat)
+    (found : findNameIndex environment name = some index) :
+    ∃ entry, findName environment name = some entry ∧ environment.get? index = some entry := by
+  induction environment generalizing index with
+  | nil => simp [findNameIndex] at found
+  | cons head tail ih =>
+      by_cases same : name = head.name
+      · simp [findNameIndex, same] at found
+        subst index
+        exact ⟨head, by simp [findName, same], by simp⟩
+      · cases index with
+        | zero => simp [findNameIndex, same] at found
+        | succ index =>
+            have tailFound : findNameIndex tail name = some index := by
+              simpa [findNameIndex, same] using found
+            obtain ⟨entry, selected, indexed⟩ := ih index tailFound
+            exact ⟨entry, by simp [findName, same, selected], by simpa using indexed⟩
+
+theorem findNameIndex_complete (environment : List Entry) (name : String) (entry : Entry)
+    (found : findName environment name = some entry) :
+    ∃ index, findNameIndex environment name = some index ∧
+      environment.get? index = some entry := by
+  induction environment with
+  | nil => simp [findName] at found
+  | cons head tail ih =>
+      by_cases same : name = head.name
+      · simp [findName, same] at found
+        subst entry
+        exact ⟨0, by simp [findNameIndex, same], by simp⟩
+      · have tailFound : findName tail name = some entry := by
+          simpa [findName, same] using found
+        obtain ⟨index, indexFound, indexedEntry⟩ := ih tailFound
+        refine ⟨index + 1, ?_, ?_⟩
+        · simpa [findNameIndex, same] using congrArg (Option.map Nat.succ) indexFound
+        · simpa using indexedEntry
+
+/-- C `rbind` prepends a cell and `rfind` returns the first string match.
+Therefore a newly prepended binding shadows every older binding with the same
+name, independent of their identities or type tags. -/
+theorem findName_prepend_shadows (entry : Entry) (tail : List Entry) :
+    findName (entry :: tail) entry.name = some entry := by
+  simp [findName]
+
+/-- A newly prepended binding with a different spelling leaves lookup of the
+requested spelling to the older environment. -/
+theorem findName_prepend_different (entry : Entry) (tail : List Entry)
+    (name : String) (different : name ≠ entry.name) :
+    findName (entry :: tail) name = findName tail name := by
+  simp [findName, different]
+
 /- Costed form of the same immutable-environment lookup. One unit is charged
 for each entry whose name is compared, including a successful final lookup. -/
 def findNameWithCost : List Entry → String → Option Entry × Nat

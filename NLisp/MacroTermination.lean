@@ -1,4 +1,5 @@
 import NLisp.CExpansion
+import NLisp.ExpansionCertificate
 
 namespace NLisp.MacroTermination
 open CMacroCopy CExpansion
@@ -277,6 +278,27 @@ theorem macroStep_has_static_call (rules : List (Nat × Tree))
     ∃ target, StaticCall rules [] input target := by
   exact macro_step_input_is_static_candidate rules origin rule input template holes
     member matched
+
+/-- Acceptance by the independent local expansion checker exposes both the
+exact copy derivation and a static candidate for the redex. This is the
+checker-to-call-graph boundary for an individual runtime macro step; relating
+the candidate to the enclosing template rank still requires the traversal
+simulation lemmas below. -/
+theorem certified_macroStep_has_static_call (rules : List (Nat × Tree))
+    (origin fuel fresh final : Nat) (rule input output : Tree)
+    (accepted : NLisp.ExpansionCertificate.checkStep rules origin fuel fresh final
+      rule input output = true) :
+    ∃ holes template target,
+      (origin, rule) ∈ rules ∧
+      matchRule rule input = some (holes, template) ∧
+      copyWithMacros (macroNames rules) fuel origin holes [] fresh template =
+        some (output, final) ∧
+      StaticCall rules [] input target := by
+  obtain ⟨holes, template, member, matched, copied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound accepted
+  obtain ⟨target, candidate⟩ := macro_step_input_is_static_candidate rules origin
+    rule input template holes member matched
+  exact ⟨holes, template, target, member, matched, copied, candidate⟩
 
 /-- Expose the binder, initializer, and tail operations of a successful
 single-head `copyBindings` scan. -/
@@ -641,6 +663,51 @@ theorem copyWithMacros_match_cases_parts (macros : List String) (fuel origin fre
   exact ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeAccepted, casesAccepted,
     copiedEq.symm⟩
 
+/-- Freshness of match case binders is derived from a successful full match
+dispatcher copy. The accepted match is first decomposed into its scrutinee
+and case phases; the latter's token sequence then gives uniqueness, source
+disjointness, and a bound by the final match counter. -/
+theorem copyWithMacros_match_case_tokens_fresh
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (matchHead : Atom)
+    (scrutineeItems : List Tree) (firstCase secondCase : Tree) (tail : List Tree)
+    (copied : Tree) (matchForm : matchHead.name = "match")
+    (matchNotMacro : macros.contains matchHead.name = false)
+    (matchNotHole : (lookup matchHead.name holes).isNone = true)
+    (safe : MacroCounterSafeCases macros (firstCase :: secondCase :: tail))
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: tail)) =
+        some (copied, final)) :
+    ∃ copiedScrutinee afterScrutinee copiedCases,
+      (operations macros fuel).copy origin holes renames fresh (.list scrutineeItems) =
+        some (copiedScrutinee, afterScrutinee) ∧
+      copyCasesWithMacros macros fuel origin holes renames afterScrutinee
+        (firstCase :: secondCase :: tail) = some (copiedCases, final) ∧
+      copied = .list (.atom matchHead :: copiedScrutinee :: copiedCases) ∧
+      Unique (counterPreservingCaseTokens copiedCases) ∧
+      (∀ sourceToken, sourceToken % 3 = 1 →
+        sourceToken ∉ counterPreservingCaseTokens copiedCases) ∧
+      (∀ token, token ∈ counterPreservingCaseTokens copiedCases →
+        ∃ counter, afterScrutinee < counter ∧ counter ≤ final ∧ token = 3 * counter + 2) := by
+  obtain ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeCopy, casesCopy, shape⟩ :=
+    copyWithMacros_match_cases_parts macros fuel origin fresh final holes renames matchHead
+      scrutineeItems firstCase secondCase tail copied matchForm matchNotMacro matchNotHole accepted
+  have casesCopy' : copyCasesWithMacros macros fuel origin holes renames afterScrutinee
+      (firstCase :: secondCase :: tail) = some (copiedCases, final) := by
+    simpa [copyCasesWithMacros] using casesCopy
+  have preserving := macroCounterSafeCases_preserving macros
+    (firstCase :: secondCase :: tail) safe
+  refine ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeCopy, casesCopy', shape, ?_, ?_, ?_⟩
+  · exact copyCasesWithMacros_preserving_tokens_unique macros fuel origin holes renames
+      afterScrutinee (firstCase :: secondCase :: tail) copiedCases final preserving casesCopy'
+  · intro sourceToken sourceClass
+    exact copyCasesWithMacros_preserving_tokens_avoid_source macros fuel origin holes renames
+      afterScrutinee sourceToken (firstCase :: secondCase :: tail) copiedCases final preserving
+      casesCopy' sourceClass
+  · intro token member
+    exact copyCasesWithMacros_preserving_tokens_within_interval macros fuel origin holes renames
+      afterScrutinee (firstCase :: secondCase :: tail) copiedCases final preserving casesCopy' token member
+
 /-- The multi-case match dispatcher also takes precedence when `match` is a
 hole name. The head remains literal and the complete case list is passed to
 `copyCases`, including the four-element/two-case syntax. -/
@@ -699,6 +766,51 @@ theorem copyWithMacros_match_hole_head_cases_parts (macros : List String)
   subst afterCases
   exact ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeAccepted, casesAccepted,
     copiedEq.symm⟩
+
+/-- Case binder freshness survives the match-hole dispatcher path as well as
+the literal-head path. Special-form dispatch still copies the complete case
+list before a hole head could be substituted. -/
+theorem copyWithMacros_match_hole_case_tokens_fresh
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (matchHead : Atom)
+    (scrutineeItems : List Tree) (firstCase secondCase : Tree) (tail : List Tree)
+    (copied : Tree) (substitutedHead : Tree)
+    (matchForm : matchHead.name = "match")
+    (matchHole : lookup matchHead.name holes = some substitutedHead)
+    (safe : MacroCounterSafeCases macros (firstCase :: secondCase :: tail))
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: tail)) =
+        some (copied, final)) :
+    ∃ copiedScrutinee afterScrutinee copiedCases,
+      (operations macros fuel).copy origin holes renames fresh (.list scrutineeItems) =
+        some (copiedScrutinee, afterScrutinee) ∧
+      copyCasesWithMacros macros fuel origin holes renames afterScrutinee
+        (firstCase :: secondCase :: tail) = some (copiedCases, final) ∧
+      copied = .list (.atom matchHead :: copiedScrutinee :: copiedCases) ∧
+      Unique (counterPreservingCaseTokens copiedCases) ∧
+      (∀ sourceToken, sourceToken % 3 = 1 →
+        sourceToken ∉ counterPreservingCaseTokens copiedCases) ∧
+      (∀ token, token ∈ counterPreservingCaseTokens copiedCases →
+        ∃ counter, afterScrutinee < counter ∧ counter ≤ final ∧ token = 3 * counter + 2) := by
+  obtain ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeCopy, casesCopy, shape⟩ :=
+    copyWithMacros_match_hole_head_cases_parts macros fuel origin fresh final holes renames
+      matchHead scrutineeItems firstCase secondCase tail copied substitutedHead matchForm matchHole
+      accepted
+  have casesCopy' : copyCasesWithMacros macros fuel origin holes renames afterScrutinee
+      (firstCase :: secondCase :: tail) = some (copiedCases, final) := by
+    simpa [copyCasesWithMacros] using casesCopy
+  have preserving := macroCounterSafeCases_preserving macros
+    (firstCase :: secondCase :: tail) safe
+  refine ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeCopy, casesCopy', shape, ?_, ?_, ?_⟩
+  · exact copyCasesWithMacros_preserving_tokens_unique macros fuel origin holes renames
+      afterScrutinee (firstCase :: secondCase :: tail) copiedCases final preserving casesCopy'
+  · intro sourceToken sourceClass
+    exact copyCasesWithMacros_preserving_tokens_avoid_source macros fuel origin holes renames
+      afterScrutinee sourceToken (firstCase :: secondCase :: tail) copiedCases final preserving
+      casesCopy' sourceClass
+  · intro token member
+    exact copyCasesWithMacros_preserving_tokens_within_interval macros fuel origin holes renames
+      afterScrutinee (firstCase :: secondCase :: tail) copiedCases final preserving casesCopy' token member
 
 /-- Once a copied special-form `match` with a hole-valued head is actually
 matched by a macro rule, its two-argument redex is represented by the
@@ -956,6 +1068,50 @@ theorem copyWithMacros_let_parts (macros : List String) (fuel origin fresh final
   · simpa using bodyCopied
   · simpa using copiedShape.symm
 
+/-- A successful let copy exposes its dedicated binding phase, whose binder
+tokens are fresh and bounded by the counter returned to the body phase. The
+initializer counter-preservation condition is exactly the condition used by
+the binding token sequence theorem. -/
+theorem copyWithMacros_let_binding_tokens_fresh
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (letHead : Atom) (bindings : List Tree)
+    (body copied : Tree) (originalNames : List String)
+    (letForm : letHead.name = "let")
+    (letNotMacro : macros.contains letHead.name = false)
+    (letNotHole : (lookup letHead.name holes).isNone = true)
+    (bindingNamesMatch : bindingNames bindings = some originalNames)
+    (bindingsDistinct : Lexical.distinctNames originalNames = true)
+    (safe : MacroCounterSafeBindingInputs macros bindings)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list [.atom letHead, .list bindings, body]) = some (copied, final)) :
+    ∃ copiedBindings names next copiedBody,
+      copyBindingsWithMacros macros fuel origin holes renames renames fresh bindings =
+          some (copiedBindings, names, next) ∧
+        Unique (bindingTokens copiedBindings) ∧
+        (∀ sourceToken, sourceToken % 3 = 1 →
+          sourceToken ∉ bindingTokens copiedBindings) ∧
+        (∀ token, token ∈ bindingTokens copiedBindings →
+          ∃ counter, fresh < counter ∧ counter ≤ next ∧ token = 3 * counter + 2) ∧
+        (operations macros fuel).copy origin holes names next body =
+          some (copiedBody, final) := by
+  obtain ⟨copiedBindings, names, next, copiedBody, bindingCopy, bodyCopy, _shape⟩ :=
+    copyWithMacros_let_parts macros fuel origin fresh final holes renames letHead bindings
+      body copied originalNames letForm letNotMacro letNotHole bindingNamesMatch
+      bindingsDistinct accepted
+  have bindingCopy' : copyBindingsWithMacros macros fuel origin holes renames renames fresh
+      bindings = some (copiedBindings, names, next) := by
+    simpa [copyBindingsWithMacros] using bindingCopy
+  have preserving := macroCounterSafeBindingInputs_preserving macros bindings safe
+  refine ⟨copiedBindings, names, next, copiedBody, bindingCopy', ?_, ?_, ?_, bodyCopy⟩
+  · exact copyBindingsWithMacros_preserving_tokens_unique macros fuel origin holes renames renames
+      fresh bindings copiedBindings names next preserving bindingCopy'
+  · intro sourceToken sourceClass
+    exact copyBindingsWithMacros_preserving_tokens_avoid_source macros fuel origin holes renames
+      renames fresh bindings copiedBindings names next sourceToken preserving bindingCopy' sourceClass
+  · intro token member
+    exact copyBindingsWithMacros_preserving_tokens_within_interval macros fuel origin holes renames
+      renames fresh bindings copiedBindings names next preserving bindingCopy' token member
+
 /-- A hole named `let` is dispatched as a special form before ordinary
 head substitution, so a successful copy keeps the literal `let` head and
 processes bindings and body through their dedicated operations. -/
@@ -987,6 +1143,48 @@ theorem copyWithMacros_let_hole_head_parts (macros : List String)
   refine ⟨copiedBindings, names, next, copiedBody, bindingsCopied, ?_, ?_⟩
   · simpa using bodyCopied
   · simpa using copiedShape.symm
+
+/-- Let binding freshness is independent of whether the literal `let` head is
+also present in the hole environment: the special-form dispatcher still
+selects the binding-copy phase before considering ordinary head substitution. -/
+theorem copyWithMacros_let_hole_binding_tokens_fresh
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (letHead : Atom) (bindings : List Tree)
+    (body copied : Tree) (originalNames : List String) (substitutedHead : Tree)
+    (letForm : letHead.name = "let")
+    (letHole : lookup letHead.name holes = some substitutedHead)
+    (bindingNamesMatch : bindingNames bindings = some originalNames)
+    (bindingsDistinct : Lexical.distinctNames originalNames = true)
+    (safe : MacroCounterSafeBindingInputs macros bindings)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list [.atom letHead, .list bindings, body]) = some (copied, final)) :
+    ∃ copiedBindings names next copiedBody,
+      copyBindingsWithMacros macros fuel origin holes renames renames fresh bindings =
+          some (copiedBindings, names, next) ∧
+        Unique (bindingTokens copiedBindings) ∧
+        (∀ sourceToken, sourceToken % 3 = 1 →
+          sourceToken ∉ bindingTokens copiedBindings) ∧
+        (∀ token, token ∈ bindingTokens copiedBindings →
+          ∃ counter, fresh < counter ∧ counter ≤ next ∧ token = 3 * counter + 2) ∧
+        (operations macros fuel).copy origin holes names next body =
+          some (copiedBody, final) := by
+  obtain ⟨copiedBindings, names, next, copiedBody, bindingCopy, bodyCopy, _shape⟩ :=
+    copyWithMacros_let_hole_head_parts macros fuel origin fresh final holes renames letHead
+      bindings body copied originalNames substitutedHead letForm letHole bindingNamesMatch
+      bindingsDistinct accepted
+  have bindingCopy' : copyBindingsWithMacros macros fuel origin holes renames renames fresh
+      bindings = some (copiedBindings, names, next) := by
+    simpa [copyBindingsWithMacros] using bindingCopy
+  have preserving := macroCounterSafeBindingInputs_preserving macros bindings safe
+  refine ⟨copiedBindings, names, next, copiedBody, bindingCopy', ?_, ?_, ?_, bodyCopy⟩
+  · exact copyBindingsWithMacros_preserving_tokens_unique macros fuel origin holes renames renames
+      fresh bindings copiedBindings names next preserving bindingCopy'
+  · intro sourceToken sourceClass
+    exact copyBindingsWithMacros_preserving_tokens_avoid_source macros fuel origin holes renames
+      renames fresh bindings copiedBindings names next sourceToken preserving bindingCopy' sourceClass
+  · intro token member
+    exact copyBindingsWithMacros_preserving_tokens_within_interval macros fuel origin holes renames
+      renames fresh bindings copiedBindings names next preserving bindingCopy' token member
 
 /-- A subsequent rule matching a copied `let` special form with a hole head
 is represented by the substituted-head edge from its source template. -/
@@ -1073,6 +1271,114 @@ theorem copyWithMacros_lambda_parts (macros : List String) (fuel origin fresh fi
   · simpa using bodyCopied
   · simpa using copiedShape.symm
 
+/-- A successful full lambda copy with an atomic body ends at the counter
+returned by parameter freshening. This exposes the exact dispatcher-to-phase
+counter relation for a real `copyWithMacros` call. -/
+theorem copyWithMacros_lambda_atomic_body_final_counter
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (lambdaHead : Atom)
+    (parameters : List Tree) (result : Tree) (bodyAtom : Atom) (copied : Tree)
+    (originalNames : List String)
+    (lambdaForm : lambdaHead.name = "lambda")
+    (lambdaNotMacro : macros.contains lambdaHead.name = false)
+    (lambdaNotHole : (lookup lambdaHead.name holes).isNone = true)
+    (parameterNamesMatch : parameterNames parameters = some originalNames)
+    (parametersDistinct : Lexical.distinctNames originalNames = true)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list [.atom lambdaHead, .list parameters, result, .atom bodyAtom]) =
+        some (copied, final)) :
+    final = fresh + parameters.length := by
+  obtain ⟨copiedParameters, names, next, copiedBody, parameterCopy, bodyCopy, _shape⟩ :=
+    copyWithMacros_lambda_parts macros fuel origin fresh final holes renames lambdaHead
+      parameters result (.atom bodyAtom) copied originalNames lambdaForm lambdaNotMacro
+      lambdaNotHole parameterNamesMatch parametersDistinct accepted
+  have parameterCounter := copyParameters_counter_with_macros macros fuel holes renames fresh
+    parameters copiedParameters names next parameterCopy
+  have bodyCounter := copyWithMacros_atom_keeps_counter macros fuel origin holes names next
+    bodyAtom copiedBody final bodyCopy
+  omega
+
+/-- A successful full let copy with counter-preserving initializers and body
+advances the counter by exactly the number of binding names. -/
+theorem copyWithMacros_let_counter_preserving_body_final_counter
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (letHead : Atom)
+    (bindings : List Tree) (body copied : Tree)
+    (originalNames : List String)
+    (letForm : letHead.name = "let")
+    (letNotMacro : macros.contains letHead.name = false)
+    (letNotHole : (lookup letHead.name holes).isNone = true)
+    (bindingNamesMatch : bindingNames bindings = some originalNames)
+    (bindingsDistinct : Lexical.distinctNames originalNames = true)
+    (safe : MacroCounterSafeBindingInputs macros bindings)
+    (bodyPreserving : CounterPreservingInitializer macros body)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list [.atom letHead, .list bindings, body]) =
+        some (copied, final)) :
+    final = fresh + bindings.length := by
+  obtain ⟨copiedBindings, names, next, copiedBody, bindingCopy, bodyCopy, _shape⟩ :=
+    copyWithMacros_let_parts macros fuel origin fresh final holes renames letHead
+      bindings body copied originalNames letForm letNotMacro letNotHole
+      bindingNamesMatch bindingsDistinct accepted
+  have bindingCounter := copyBindingsWithMacros_preserving_counter macros fuel origin
+    holes renames renames fresh bindings copiedBindings names next
+    (macroCounterSafeBindingInputs_preserving macros bindings safe) bindingCopy
+  have bodyCounter := bodyPreserving fuel origin holes names next copiedBody final bodyCopy
+  omega
+
+/-- Freshness of lambda parameters follows from an accepted full lambda copy,
+not merely from an isolated call to `copyParameters`. The dispatcher
+decomposition exposes the exact parameter-copy result consumed by the
+phase-level token sequence theorem. -/
+private theorem operations_copyParameters_macro_independent (macros : List String)
+    (fuel : Nat) :
+    (operations macros fuel).copyParameters = (operations [] fuel).copyParameters := by
+  induction fuel with
+  | zero => rfl
+  | succ fuel ih =>
+      funext holes renames fresh trees
+      simp [operations, ih]
+
+theorem copyWithMacros_lambda_parameter_tokens_fresh
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (lambdaHead : Atom)
+    (parameters : List Tree) (result body copied : Tree) (originalNames : List String)
+    (lambdaForm : lambdaHead.name = "lambda")
+    (lambdaNotMacro : macros.contains lambdaHead.name = false)
+    (lambdaNotHole : (lookup lambdaHead.name holes).isNone = true)
+    (parameterNamesMatch : parameterNames parameters = some originalNames)
+    (parametersDistinct : Lexical.distinctNames originalNames = true)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list [.atom lambdaHead, .list parameters, result, body]) = some (copied, final)) :
+    ∃ copiedParameters names next copiedBody,
+      copyParameters fuel holes renames fresh parameters =
+          some (copiedParameters, names, next) ∧
+        Unique (parameterTokens copiedParameters) ∧
+        (∀ sourceToken, sourceToken % 3 = 1 →
+          sourceToken ∉ parameterTokens copiedParameters) ∧
+        (∀ token, token ∈ parameterTokens copiedParameters →
+          ∃ counter, fresh < counter ∧ counter ≤ next ∧ token = 3 * counter + 2) ∧
+        (operations macros fuel).copy origin holes names next body =
+          some (copiedBody, final) := by
+  obtain ⟨copiedParameters, names, next, copiedBody, parameterCopy, bodyCopy, _shape⟩ :=
+    copyWithMacros_lambda_parts macros fuel origin fresh final holes renames lambdaHead
+      parameters result body copied originalNames lambdaForm lambdaNotMacro lambdaNotHole
+      parameterNamesMatch parametersDistinct accepted
+  have parameterCopyDefault : copyParameters fuel holes renames fresh parameters =
+      some (copiedParameters, names, next) := by
+    change (operations [] fuel).copyParameters holes renames fresh parameters = _
+    rw [← operations_copyParameters_macro_independent macros fuel]
+    exact parameterCopy
+  refine ⟨copiedParameters, names, next, copiedBody, parameterCopyDefault, ?_, ?_, ?_, bodyCopy⟩
+  · exact copyParameters_tokens_unique fuel holes renames fresh parameters copiedParameters
+      names next parameterCopyDefault
+  · intro sourceToken sourceClass
+    exact copyParameters_tokens_avoid_source fuel holes renames fresh parameters copiedParameters
+      names next sourceToken parameterCopyDefault sourceClass
+  · intro token member
+    exact copyParameters_tokens_within_interval fuel holes renames fresh parameters copiedParameters
+      names next parameterCopyDefault token member
+
 /-- A hole whose spelling is `lambda` is still interpreted by the special-form
 dispatcher before ordinary head substitution. The successful copy therefore
 retains the literal lambda head and copies its body under the freshened
@@ -1107,6 +1413,48 @@ theorem copyWithMacros_lambda_hole_head_parts (macros : List String)
   refine ⟨copiedParameters, names, next, copiedBody, parametersCopied, ?_, ?_⟩
   · simpa using bodyCopied
   · simpa using copiedShape.symm
+
+/-- Parameter binder freshness also holds when the literal `lambda` head is
+in the hole environment. Special-form dispatch keeps the head and runs the
+same binder phase, so the full accepted copy still yields the counter proof. -/
+theorem copyWithMacros_lambda_hole_parameter_tokens_fresh
+    (macros : List String) (fuel origin fresh final : Nat)
+    (holes : Holes) (renames : Renames) (lambdaHead : Atom)
+    (parameters : List Tree) (result body copied : Tree) (originalNames : List String)
+    (substitutedHead : Tree) (lambdaForm : lambdaHead.name = "lambda")
+    (lambdaHole : lookup lambdaHead.name holes = some substitutedHead)
+    (parameterNamesMatch : parameterNames parameters = some originalNames)
+    (parametersDistinct : Lexical.distinctNames originalNames = true)
+    (accepted : copyWithMacros macros (fuel + 1) origin holes renames fresh
+      (.list [.atom lambdaHead, .list parameters, result, body]) = some (copied, final)) :
+    ∃ copiedParameters names next copiedBody,
+      copyParameters fuel holes renames fresh parameters =
+          some (copiedParameters, names, next) ∧
+        Unique (parameterTokens copiedParameters) ∧
+        (∀ sourceToken, sourceToken % 3 = 1 →
+          sourceToken ∉ parameterTokens copiedParameters) ∧
+        (∀ token, token ∈ parameterTokens copiedParameters →
+          ∃ counter, fresh < counter ∧ counter ≤ next ∧ token = 3 * counter + 2) ∧
+        (operations macros fuel).copy origin holes names next body =
+          some (copiedBody, final) := by
+  obtain ⟨copiedParameters, names, next, copiedBody, parameterCopy, bodyCopy, _shape⟩ :=
+    copyWithMacros_lambda_hole_head_parts macros fuel origin fresh final holes renames lambdaHead
+      parameters result body copied originalNames substitutedHead lambdaForm lambdaHole
+      parameterNamesMatch parametersDistinct accepted
+  have parameterCopyDefault : copyParameters fuel holes renames fresh parameters =
+      some (copiedParameters, names, next) := by
+    change (operations [] fuel).copyParameters holes renames fresh parameters = _
+    rw [← operations_copyParameters_macro_independent macros fuel]
+    exact parameterCopy
+  refine ⟨copiedParameters, names, next, copiedBody, parameterCopyDefault, ?_, ?_, ?_, bodyCopy⟩
+  · exact copyParameters_tokens_unique fuel holes renames fresh parameters copiedParameters
+      names next parameterCopyDefault
+  · intro sourceToken sourceClass
+    exact copyParameters_tokens_avoid_source fuel holes renames fresh parameters copiedParameters
+      names next sourceToken parameterCopyDefault sourceClass
+  · intro token member
+    exact copyParameters_tokens_within_interval fuel holes renames fresh parameters copiedParameters
+      names next parameterCopyDefault token member
 
 /-- If a subsequent expansion step matches a copied lambda-shaped special
 form whose literal head is also a template hole, that step is represented by
@@ -1344,6 +1692,42 @@ theorem literal_call_at_list_index_to_next_macro_step (rules : List (Nat × Tree
     templateHoles copyHoles renames origin childOrigin fuel callStart callFinal head arguments copiedArguments
     childRule childTemplate copiedCall childHoles known notHole lookupNone argumentsCopied
     callCopy' childMember childMatched
+  refine ⟨target, StaticCall.nested ?_ sourceCall⟩
+  apply mem_append_right
+  simp
+
+/-- Certified local-copy variant for one sibling callsite. A successful copy
+of that source call plus an accepted child `checkStep` is enough to identify
+the source template's static edge; unrelated sibling match premises are not
+needed. This does not claim that the local counter came from a full parent
+copy traversal. -/
+theorem literal_call_at_list_index_to_certified_macro_step (rules : List (Nat × Tree))
+    (macros : List String) (templateHoles : List String) (copyHoles : Holes)
+    (renames : Renames) (origin childOrigin fuel callStart callFinal childFuel childFresh childFinal : Nat)
+    (head : Atom) (arguments beforeItems afterItems : List Tree) (copiedCall : Tree)
+    (childRule childOutput : Tree)
+    (known : macros.contains head.name = true)
+    (notHole : head.name ∉ templateHoles)
+    (lookupNone : (lookup head.name copyHoles).isNone = true)
+    (fuelMatches : childFuel = fuel + 1)
+    (callCopy : copyWithMacros macros childFuel origin copyHoles renames callStart
+      (.list (.atom head :: arguments)) = some (copiedCall, callFinal))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule copiedCall childOutput = true) :
+    ∃ target, StaticCall rules templateHoles
+      (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) target := by
+  obtain ⟨childHoles, childTemplate, _member, childMatched, _copied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound childStepAccepted
+  have callCopy' : copyWithMacros macros (fuel + 1) origin copyHoles renames callStart
+      (.list (.atom head :: arguments)) = some (copiedCall, callFinal) := by
+    simpa [fuelMatches] using callCopy
+  obtain ⟨copiedArguments, argumentsCopied, _callShape⟩ :=
+    copyWithMacros_root_macro_call_parts macros fuel origin copyHoles renames callStart callFinal
+      head arguments copiedCall known lookupNone callCopy'
+  obtain ⟨target, sourceCall⟩ := root_template_call_to_next_macro_step rules macros
+    templateHoles copyHoles renames origin childOrigin fuel callStart callFinal head arguments
+    copiedArguments childRule childTemplate copiedCall childHoles known notHole lookupNone
+    argumentsCopied callCopy' _member childMatched
   refine ⟨target, StaticCall.nested ?_ sourceCall⟩
   apply mem_append_right
   simp
@@ -2906,6 +3290,108 @@ theorem template_static_call_rank_decreases (fuel : Nat) (rules : List (Nat × T
     (graphRows_static_call_edge fuel rules index owner rule tail holes template target edges
       parsed dependencyCheck staticCall graphAccepted)
 
+/-- Add the accepted template graph rank to the certified local-copy result.
+The child certificate therefore determines a decreasing graph edge for this
+literal sibling callsite. -/
+theorem literal_call_at_list_index_certified_rank_decreases
+    (graphFuel : Nat) (rules : List (Nat × Tree)) (index owner childOrigin : Nat)
+    (rule : Tree) (tail : List (Nat × Tree)) (templateHoles : List String)
+    (head : Atom) (arguments beforeItems afterItems : List Tree)
+    (childRule copiedCall childOutput : Tree) (copyHoles : Holes) (renames : Renames)
+    (origin fuel callStart callFinal childFuel childFresh childFinal : Nat)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (known : (macroNames rules).contains head.name = true)
+    (notHole : head.name ∉ templateHoles)
+    (lookupNone : (lookup head.name copyHoles).isNone = true)
+    (fuelMatches : childFuel = fuel + 1)
+    (callCopy : copyWithMacros (macroNames rules) childFuel origin copyHoles renames callStart
+      (.list (.atom head :: arguments)) = some (copiedCall, callFinal))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule copiedCall childOutput = true)
+    (parsed : parameters rule = some (templateHoles,
+      .list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)))
+    (dependencyCheck : calls graphFuel rules templateHoles
+      (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) =
+        some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tail) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, StaticCall rules templateHoles
+      (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) target ∧
+      rank ranks target < rank ranks index := by
+  obtain ⟨target, staticCall⟩ := literal_call_at_list_index_to_certified_macro_step
+    rules (macroNames rules) templateHoles copyHoles renames origin childOrigin fuel callStart
+    callFinal childFuel childFresh childFinal head arguments beforeItems afterItems copiedCall
+    childRule childOutput known notHole lookupNone fuelMatches callCopy childStepAccepted
+  exact ⟨target, staticCall,
+    template_static_call_rank_decreases graphFuel rules index owner rule tail templateHoles
+      (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) target edges ranks
+      parsed dependencyCheck staticCall graphAccepted ranksAccepted⟩
+
+/-- Compose full parent-list copying with a child expansion certificate at a
+selected sibling position. The certificate is required for the exact element
+and counter interval extracted from the successful parent copy; no independent
+match premise for an unrelated copy result is needed. -/
+theorem literal_call_at_list_index_full_copy_certified_rank_decreases
+    (graphFuel rootFuel childFuel : Nat) (rules : List (Nat × Tree))
+    (index owner childOrigin origin fresh final : Nat)
+    (rule : Tree) (tail : List (Nat × Tree)) (templateHoles : List String)
+    (head : Atom) (arguments beforeItems afterItems copied : List Tree)
+    (childRule childOutput : Tree) (copyHoles : Holes)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (known : (macroNames rules).contains head.name = true)
+    (notHole : head.name ∉ templateHoles)
+    (lookupNone : (lookup head.name copyHoles).isNone = true)
+    (childFuelMatches : childFuel = rootFuel + 1)
+    (parentCopy : copyManyWithMacros (macroNames rules)
+      (childFuel + beforeItems.length + 1) origin copyHoles [] fresh
+      (beforeItems ++ .list (.atom head :: arguments) :: afterItems) = some (copied, final))
+    (selectedChildAccepted : ∀ copiedPrefix copiedCall copiedSuffix callStart callFinal,
+      copyWithMacros (macroNames rules) childFuel origin copyHoles [] callStart
+        (.list (.atom head :: arguments)) = some (copiedCall, callFinal) →
+      copyManyWithMacros (macroNames rules) childFuel origin copyHoles [] callFinal
+        afterItems = some (copiedSuffix, final) →
+      copied = copiedPrefix ++ copiedCall :: copiedSuffix →
+      ExpansionCertificate.checkStep rules childOrigin childFuel callStart callFinal
+        childRule copiedCall childOutput = true)
+    (parsed : parameters rule = some (templateHoles,
+      .list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)))
+    (dependencyCheck : calls graphFuel rules templateHoles
+      (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) =
+        some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tail) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ childTarget,
+      StaticCall rules templateHoles
+        (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) childTarget ∧
+      rank ranks childTarget < rank ranks index := by
+  obtain ⟨copiedPrefix, copiedCall, copiedSuffix, callStart, callFinal,
+      callCopy, suffixCopy, copiedEq⟩ :=
+    copyManyWithMacros_extract_element (macroNames rules) childFuel origin fresh copyHoles []
+      beforeItems (.list (.atom head :: arguments)) afterItems copied final parentCopy
+  have childAccepted := selectedChildAccepted copiedPrefix copiedCall copiedSuffix
+    callStart callFinal callCopy suffixCopy copiedEq
+  obtain ⟨childHoles, childTemplate, childMember, childMatched, _childCopy⟩ :=
+    ExpansionCertificate.checkStep_sound childAccepted
+  have callCopy' : copyWithMacros (macroNames rules) (rootFuel + 1) origin copyHoles []
+      callStart (.list (.atom head :: arguments)) = some (copiedCall, callFinal) := by
+    simpa [childFuelMatches] using callCopy
+  obtain ⟨copiedArguments, argumentsCopied, _callShape⟩ :=
+    copyWithMacros_root_macro_call_parts (macroNames rules) rootFuel origin copyHoles []
+      callStart callFinal head arguments copiedCall known lookupNone callCopy'
+  obtain ⟨childTarget, templateCall⟩ := root_template_call_to_next_macro_step rules
+    (macroNames rules) templateHoles copyHoles [] origin childOrigin rootFuel callStart callFinal
+    head arguments copiedArguments childRule childTemplate copiedCall childHoles known notHole
+    lookupNone argumentsCopied callCopy' childMember childMatched
+  have staticCall : StaticCall rules templateHoles
+      (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems)) childTarget := by
+    refine StaticCall.nested ?_ templateCall
+    apply mem_append_right
+    simp
+  exact ⟨childTarget, staticCall,
+    template_static_call_rank_decreases graphFuel rules index owner rule tail
+      templateHoles (.list (beforeItems ++ .list (.atom head :: arguments) :: afterItems))
+      childTarget edges ranks parsed dependencyCheck staticCall graphAccepted ranksAccepted⟩
+
 /- Special-form dispatch gives lambda and let hole heads their own copy
 branches. These two lemmas combine those branches with the already checked
 template graph row, so a real subsequent match has an explicit decreasing
@@ -2976,6 +3462,77 @@ theorem lambda_hole_head_copy_rank_decreases (graphFuel copyFuel : Nat)
   exact ⟨target, staticCall, template_static_call_rank_decreases graphFuel rules index owner
     rule tail templateHoles (.list [.atom lambdaHead, .list parameters, result, body]) target
     edges ranks parsed dependencyCheck staticCall graphAccepted ranksAccepted⟩
+
+/-- The let-special-form hole-head path also accepts the real child-step
+certificate: its checker proof supplies the child rule match used by the
+template edge and strict rank decrease. -/
+theorem let_hole_head_certified_rank_decreases (graphFuel copyFuel childFuel : Nat)
+    (rules : List (Nat × Tree)) (index owner childOrigin origin fresh final childFresh childFinal : Nat)
+    (rule template childRule output childOutput : Tree) (tail : List (Nat × Tree))
+    (templateHoles : List String) (copyHoles : Holes) (letHead : Atom)
+    (bindings : List Tree) (body : Tree) (originalNames : List String)
+    (substitutedHead : Tree) (dependencies : List Nat) (edges : List Edge)
+    (ranks : List Nat)
+    (letForm : letHead.name = "let")
+    (letHole : lookup letHead.name copyHoles = some substitutedHead)
+    (holesAgree : templateHoles = copyHoles.map Prod.fst)
+    (bindingNamesMatch : bindingNames bindings = some originalNames)
+    (bindingsDistinct : Lexical.distinctNames originalNames = true)
+    (copySucceeded : copyWithMacros (macroNames rules) (copyFuel + 1) origin copyHoles []
+      fresh (.list [.atom letHead, .list bindings, body]) = some (output, final))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule output childOutput = true)
+    (parsed : MacroTermination.parameters rule = some
+      (templateHoles, .list [.atom letHead, .list bindings, body]))
+    (dependencyCheck : calls graphFuel rules templateHoles
+      (.list [.atom letHead, .list bindings, body]) = some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tail) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, StaticCall rules templateHoles
+      (.list [.atom letHead, .list bindings, body]) target ∧
+      rank ranks target < rank ranks index := by
+  obtain ⟨childHoles, childTemplate, childMember, childMatched, _childCopied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound childStepAccepted
+  exact let_hole_head_copy_rank_decreases graphFuel copyFuel rules index owner childOrigin origin
+    fresh final rule template childRule childTemplate output tail templateHoles copyHoles letHead
+    bindings body originalNames substitutedHead childHoles dependencies edges ranks letForm letHole
+    holesAgree bindingNamesMatch bindingsDistinct copySucceeded childMember childMatched parsed
+    dependencyCheck graphAccepted ranksAccepted
+
+/-- The lambda-special-form hole-head path exposes the same certified child
+step connection as let, including its template edge and rank decrease. -/
+theorem lambda_hole_head_certified_rank_decreases (graphFuel copyFuel childFuel : Nat)
+    (rules : List (Nat × Tree)) (index owner childOrigin origin fresh final childFresh childFinal : Nat)
+    (rule template childRule output childOutput : Tree) (tail : List (Nat × Tree))
+    (templateHoles : List String) (copyHoles : Holes) (lambdaHead : Atom)
+    (parameters : List Tree) (result body : Tree) (originalNames : List String)
+    (substitutedHead : Tree) (dependencies : List Nat) (edges : List Edge)
+    (ranks : List Nat)
+    (lambdaForm : lambdaHead.name = "lambda")
+    (lambdaHole : lookup lambdaHead.name copyHoles = some substitutedHead)
+    (holesAgree : templateHoles = copyHoles.map Prod.fst)
+    (parameterNamesMatch : parameterNames parameters = some originalNames)
+    (parametersDistinct : Lexical.distinctNames originalNames = true)
+    (copySucceeded : copyWithMacros (macroNames rules) (copyFuel + 1) origin copyHoles []
+      fresh (.list [.atom lambdaHead, .list parameters, result, body]) = some (output, final))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule output childOutput = true)
+    (parsed : MacroTermination.parameters rule = some
+      (templateHoles, .list [.atom lambdaHead, .list parameters, result, body]))
+    (dependencyCheck : calls graphFuel rules templateHoles
+      (.list [.atom lambdaHead, .list parameters, result, body]) = some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tail) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, StaticCall rules templateHoles
+      (.list [.atom lambdaHead, .list parameters, result, body]) target ∧
+      rank ranks target < rank ranks index := by
+  obtain ⟨childHoles, childTemplate, childMember, childMatched, _childCopied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound childStepAccepted
+  exact lambda_hole_head_copy_rank_decreases graphFuel copyFuel rules index owner childOrigin
+    origin fresh final rule template childRule childTemplate output tail templateHoles copyHoles
+    lambdaHead parameters result body originalNames substitutedHead childHoles dependencies edges
+    ranks lambdaForm lambdaHole holesAgree parameterNamesMatch parametersDistinct copySucceeded
+    childMember childMatched parsed dependencyCheck graphAccepted ranksAccepted
 
 /-- The actual successful child-rule match on a copied special-form `match`
 whose literal head is also a template hole yields a strict decrease in the
@@ -3058,6 +3615,39 @@ theorem match_hole_head_default_copy_rank_decreases (graphFuel copyFuel : Nat)
     childMember (by simpa using childMatched) parsed dependencyCheck
     graphAccepted ranksAccepted
 
+/-- A successful expansion-certificate child step on the copied one-case
+`match` is enough to obtain the child rule match needed by the rank argument.
+This connects the special-form copy path to an actual accepted macro step. -/
+theorem match_hole_head_default_certified_rank_decreases
+    (graphFuel copyFuel childFuel : Nat)
+    (rules : List (Nat × Tree)) (index owner childOrigin origin fresh final childFresh childFinal : Nat)
+    (rule template childRule copied childOutput : Tree) (tail : List (Nat × Tree))
+    (templateHoles : List String) (copyHoles : Holes) (matchHead : Atom)
+    (scrutineeItems : List Tree) (caseBody : Tree) (dependencies : List Nat)
+    (edges : List Edge) (ranks : List Nat)
+    (matchHole : lookup matchHead.name copyHoles = some (.atom matchHead))
+    (matchForm : matchHead.name = "match")
+    (holesAgree : templateHoles = copyHoles.map Prod.fst)
+    (templateEq : template = .list [.atom matchHead, .list scrutineeItems, caseBody])
+    (copiedSuccessfully : copyWithMacros (macroNames rules) (copyFuel + 1) origin
+      copyHoles [] fresh (.list [.atom matchHead, .list scrutineeItems, caseBody]) =
+        some (copied, final))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule copied childOutput = true)
+    (parsed : parameters rule = some (templateHoles, template))
+    (dependencyCheck : calls graphFuel rules templateHoles template = some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tail) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, StaticCall rules templateHoles template target ∧
+      rank ranks target < rank ranks index := by
+  obtain ⟨childHoles, childTemplate, childMember, childMatched, _childCopied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound childStepAccepted
+  exact match_hole_head_default_copy_rank_decreases graphFuel copyFuel rules index owner
+    childOrigin origin fresh final rule template childRule childTemplate copied tail
+    templateHoles copyHoles matchHead scrutineeItems caseBody childHoles dependencies edges ranks
+    matchHole matchForm holesAgree templateEq copiedSuccessfully childMember childMatched
+    parsed dependencyCheck graphAccepted ranksAccepted
+
 /-- The same copy-to-rank argument covers the multi-case dispatcher path.
 The source call and copied call may have any arity; `copyCases` length
 preservation establishes that the child rule sees the same number of
@@ -3106,6 +3696,93 @@ theorem match_hole_head_cases_copy_rank_decreases (graphFuel copyFuel : Nat)
     (copiedScrutinee :: copiedCases) childRule childTemplate copied childHoles dependencies
     edges ranks matchHole holesAgree sourceTemplateShape outputShape sameArity.symm childMember
     (by simpa using childMatched) parsed dependencyCheck graphAccepted ranksAccepted
+
+/-- Multi-case hole-head `match` rank decrease from an actually accepted
+child expansion step. The certificate checker supplies the rule membership
+and successful child match consumed by the copy-to-rank proof. -/
+theorem match_hole_head_cases_certified_rank_decreases
+    (graphFuel copyFuel childFuel : Nat)
+    (rules : List (Nat × Tree)) (index owner childOrigin origin fresh final childFresh childFinal : Nat)
+    (rule template childRule copied childOutput : Tree) (tailRules : List (Nat × Tree))
+    (templateHoles : List String) (copyHoles : Holes) (matchHead : Atom)
+    (scrutineeItems : List Tree) (firstCase secondCase : Tree) (caseTail : List Tree)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (matchHole : lookup matchHead.name copyHoles = some (.atom matchHead))
+    (matchForm : matchHead.name = "match")
+    (holesAgree : templateHoles = copyHoles.map Prod.fst)
+    (templateEq : template = .list
+      (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail))
+    (copiedSuccessfully : copyWithMacros (macroNames rules) (copyFuel + 1) origin
+      copyHoles [] fresh
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)) =
+        some (copied, final))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule copied childOutput = true)
+    (parsed : parameters rule = some (templateHoles, template))
+    (dependencyCheck : calls graphFuel rules templateHoles template = some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tailRules) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, StaticCall rules templateHoles template target ∧
+      rank ranks target < rank ranks index := by
+  obtain ⟨childHoles, childTemplate, childMember, childMatched, _childCopied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound childStepAccepted
+  exact match_hole_head_cases_copy_rank_decreases graphFuel copyFuel rules index owner
+    childOrigin origin fresh final rule template childRule childTemplate copied tailRules
+    templateHoles copyHoles matchHead scrutineeItems firstCase secondCase caseTail childHoles
+    dependencies edges ranks matchHole matchForm holesAgree templateEq copiedSuccessfully
+    childMember childMatched parsed dependencyCheck graphAccepted ranksAccepted
+
+/-- Compose the operational next-step rank decrease with case-binder
+freshness for the same accepted hole-head match copy. -/
+theorem match_hole_head_cases_copy_rank_and_freshness
+    (graphFuel copyFuel : Nat) (rules : List (Nat × Tree))
+    (index owner childOrigin origin fresh final : Nat)
+    (rule template childRule childTemplate copied : Tree)
+    (tailRules : List (Nat × Tree)) (templateHoles : List String) (copyHoles : Holes)
+    (matchHead : Atom) (scrutineeItems : List Tree)
+    (firstCase secondCase : Tree) (caseTail : List Tree) (childHoles : Holes)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (matchHole : lookup matchHead.name copyHoles = some (.atom matchHead))
+    (matchForm : matchHead.name = "match")
+    (holesAgree : templateHoles = copyHoles.map Prod.fst)
+    (templateEq : template = .list
+      (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail))
+    (copiedSuccessfully : copyWithMacros (macroNames rules) (copyFuel + 1) origin
+      copyHoles [] fresh
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)) =
+        some (copied, final))
+    (childMember : (childOrigin, childRule) ∈ rules)
+    (childMatched : matchRule childRule copied = some (childHoles, childTemplate))
+    (parsed : parameters rule = some (templateHoles, template))
+    (dependencyCheck : calls graphFuel rules templateHoles template = some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tailRules) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true)
+    (safe : MacroCounterSafeCases (macroNames rules) (firstCase :: secondCase :: caseTail)) :
+    ∃ target copiedScrutinee afterScrutinee copiedCases,
+      StaticCall rules templateHoles template target ∧
+      rank ranks target < rank ranks index ∧
+      (operations (macroNames rules) copyFuel).copy origin copyHoles [] fresh
+        (.list scrutineeItems) = some (copiedScrutinee, afterScrutinee) ∧
+      copyCasesWithMacros (macroNames rules) copyFuel origin copyHoles [] afterScrutinee
+        (firstCase :: secondCase :: caseTail) = some (copiedCases, final) ∧
+      copied = .list (.atom matchHead :: copiedScrutinee :: copiedCases) ∧
+      Unique (counterPreservingCaseTokens copiedCases) ∧
+      (∀ sourceToken, sourceToken % 3 = 1 →
+        sourceToken ∉ counterPreservingCaseTokens copiedCases) ∧
+      (∀ token, token ∈ counterPreservingCaseTokens copiedCases →
+        ∃ counter, afterScrutinee < counter ∧ counter ≤ final ∧ token = 3 * counter + 2) := by
+  obtain ⟨target, staticCall, rankDecrease⟩ := match_hole_head_cases_copy_rank_decreases
+    graphFuel copyFuel rules index owner childOrigin origin fresh final rule template childRule
+    childTemplate copied tailRules templateHoles copyHoles matchHead scrutineeItems firstCase
+    secondCase caseTail childHoles dependencies edges ranks matchHole matchForm holesAgree
+    templateEq copiedSuccessfully childMember childMatched parsed dependencyCheck graphAccepted
+    ranksAccepted
+  obtain ⟨copiedScrutinee, afterScrutinee, copiedCases, scrutineeCopy, casesCopy, shape,
+      unique, sourceAvoid, interval⟩ := copyWithMacros_match_hole_case_tokens_fresh
+    (macroNames rules) copyFuel origin fresh final copyHoles [] matchHead scrutineeItems firstCase
+    secondCase caseTail copied (.atom matchHead) matchForm matchHole safe copiedSuccessfully
+  exact ⟨target, copiedScrutinee, afterScrutinee, copiedCases, staticCall, rankDecrease,
+    scrutineeCopy, casesCopy, shape, unique, sourceAvoid, interval⟩
 
 /-- The accepted graph rank decreases for the next macro step in a default
 match case, starting from a successful copy of the complete match form. -/
@@ -3787,6 +4464,39 @@ theorem root_next_macro_step_rank_decreases (graphFuel copyFuel : Nat)
     templateHoles (.list (.atom head :: arguments)) childTarget edges ranks parsed
     dependencyCheck templateCall graphAccepted ranksAccepted⟩
 
+/-- Root-template rank decrease with the child call supplied as an accepted
+expansion-certificate macro step. `checkStep_sound` recovers its exact rule
+membership, match, and bounded-copy derivation before applying the static
+parent-template edge theorem. -/
+theorem root_certified_macroStep_rank_decreases (graphFuel copyFuel childFuel : Nat)
+    (rules : List (Nat × Tree)) (index owner childOrigin origin fresh final childFresh childFinal : Nat)
+    (rule : Tree) (tail : List (Nat × Tree)) (templateHoles : List String)
+    (head : Atom) (arguments copiedArguments : List Tree)
+    (childRule output childOutput : Tree) (copyHoles : Holes)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (known : (macroNames rules).contains head.name = true)
+    (notHole : head.name ∉ templateHoles)
+    (lookupNone : (lookup head.name copyHoles).isNone = true)
+    (parsed : parameters rule = some (templateHoles, .list (.atom head :: arguments)))
+    (argumentsCopied : copyManyWithMacros (macroNames rules) copyFuel origin copyHoles []
+      fresh arguments = some (copiedArguments, final))
+    (copySucceeded : copyWithMacros (macroNames rules) (copyFuel + 1) origin copyHoles []
+      fresh (.list (.atom head :: arguments)) = some (output, final))
+    (childStepAccepted : NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel
+      childFresh childFinal childRule output childOutput = true)
+    (dependencyCheck : calls graphFuel rules templateHoles (.list (.atom head :: arguments)) =
+      some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tail) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ childTarget, rank ranks childTarget < rank ranks index := by
+  obtain ⟨childHoles, childTemplate, childMember, childMatched, _childCopied⟩ :=
+    NLisp.ExpansionCertificate.checkStep_sound childStepAccepted
+  exact root_next_macro_step_rank_decreases graphFuel copyFuel rules index owner childOrigin
+    origin fresh final rule tail templateHoles head arguments copiedArguments childRule
+    childTemplate output copyHoles childHoles dependencies edges ranks known notHole lookupNone
+    parsed argumentsCopied copySucceeded childMember childMatched dependencyCheck graphAccepted
+    ranksAccepted
+
 /-- Rank decrease for a literal-head child at any sibling position of the
 parent template's ordinary list. The accepted graph row is for the complete
 parent template, so the nested StaticCall inherits its checked edge. -/
@@ -4073,6 +4783,42 @@ decreasing_by exact checkRanks_decreases accepted _edge
 theorem ranked_graph_wellFounded (accepted : checkRanks edges ranks = true) :
     WellFounded (Calls edges) := ⟨accessible edges ranks accepted⟩
 
+/-- A user-supplied well-founded measure for a call relation.  The measure
+domain and decrease relation are independent of the finite `Nat` ranking
+checker, so structural orders and lexicographic measures can be used when the
+conservative static graph is too imprecise for a numeric rank vector. -/
+structure WellFoundedDecreaseCertificate (edges : List Edge) where
+  Carrier : Type
+  measure : Nat → Carrier
+  decrease : Carrier → Carrier → Prop
+  wellFounded : WellFounded decrease
+  calls_decrease : ∀ {child parent}, Calls edges child parent →
+    decrease (measure child) (measure parent)
+
+/-- Any certified well-founded measure on call edges induces a well-founded
+call graph.  This theorem is a reusable sufficient condition; it does not
+claim that a particular macro expansion step has been extracted as an edge. -/
+theorem wellFoundedDecreaseCertificate_calls_wellFounded
+    (certificate : WellFoundedDecreaseCertificate edges) :
+    WellFounded (Calls edges) := by
+  let motive : certificate.Carrier → Sort := fun measureValue =>
+    ∀ node, certificate.measure node = measureValue → Acc (Calls edges) node
+  have accessibleMeasure : ∀ measureValue, Acc certificate.decrease measureValue →
+      motive measureValue := by
+    intro measureValue accessible
+    induction accessible with
+    | intro measureValue smaller ih =>
+        intro node measureEq
+        apply Acc.intro
+        intro child edge
+        have childDecrease : certificate.decrease (certificate.measure child)
+            measureValue := by
+          rw [← measureEq]
+          exact certificate.calls_decrease edge
+        exact ih (certificate.measure child) childDecrease child rfl
+  exact ⟨fun node => accessibleMeasure (certificate.measure node)
+    (certificate.wellFounded.apply (certificate.measure node)) node rfl⟩
+
 /- A path is a finite prefix of nested recursive invocations. -/
 inductive Path (edges : List Edge) : Nat → Nat → Nat → Prop where
   | zero (node : Nat) : Path edges node node 0
@@ -4106,5 +4852,133 @@ theorem no_infinite_call_chain (accepted : checkRanks edges ranks = true)
     (step : ∀ index, Calls edges (chain (index + 1)) (chain index)) : False := by
   have bounded := call_chain_length_bounded accepted chain step (rank ranks (chain 0) + 1)
   omega
+
+/-- A call in a match scrutinee inherits the parent template's rank decrease
+even when the special-form `match` head is supplied by a template hole. The
+match-specific copy path keeps that head literal, so the scrutinee copy is
+extracted separately before following the nested call site. -/
+theorem match_hole_head_scrutinee_call_site_rank_decreases
+    (graphFuel copyFuel : Nat) (rules : List (Nat × Tree))
+    (index owner childOrigin origin fresh final : Nat) (rule : Tree)
+    (tailRules : List (Nat × Tree)) (templateHoles : List String)
+    (matchHead : Atom) (scrutineeItems : List Tree) (firstCase secondCase : Tree)
+    (caseTail : List Tree) (cost : Nat) (copied : Tree) (head : Atom)
+    (arguments : List Tree) (site : LiteralCallSite (macroNames rules) head arguments
+      scrutineeItems cost) (childRule : Tree) (copyHoles : Holes) (renames : Renames)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (matchForm : matchHead.name = "match")
+    (matchIsHole : lookup matchHead.name copyHoles = some (.atom matchHead))
+    (scrutineeHeadSafe : counterNeutralListHead (macroNames rules) scrutineeItems = true)
+    (known : (macroNames rules).contains head.name = true)
+    (notHole : head.name ∉ templateHoles)
+    (lookupNone : (lookup head.name copyHoles).isNone = true)
+    (parsed : parameters rule = some (templateHoles,
+      .list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)))
+    (wholeCopied : copyWithMacros (macroNames rules) (copyFuel + cost + 2) origin copyHoles
+      renames fresh
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)) =
+        some (copied, final))
+    (childMember : (childOrigin, childRule) ∈ rules)
+    (copiedChildMatches : ∀ copiedItems copiedBefore copiedCall copiedAfter,
+      copiedItems = copiedBefore ++ copiedCall :: copiedAfter →
+      ∃ childHoles childTemplate,
+        matchRule childRule copiedCall = some (childHoles, childTemplate))
+    (dependencyCheck : calls graphFuel rules templateHoles
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)) =
+        some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tailRules) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, rank ranks target < rank ranks index := by
+  obtain ⟨copiedScrutinee, afterScrutinee, _copiedCases, scrutineeCopied, _casesCopied,
+    _wholeShape⟩ := copyWithMacros_match_hole_head_cases_parts (macroNames rules)
+      (copyFuel + cost + 1) origin fresh final copyHoles renames matchHead
+      scrutineeItems firstCase secondCase caseTail copied (.atom matchHead) matchForm matchIsHole
+      wholeCopied
+  have scrutineeCopyOperation :
+      (operations (macroNames rules) (copyFuel + cost + 1)).copy origin copyHoles renames fresh
+        (.list scrutineeItems) = some (copiedScrutinee, afterScrutinee) := scrutineeCopied
+  rw [copyNeutralList_uses_copyMany (macroNames rules) (copyFuel + cost) origin copyHoles
+    renames fresh scrutineeItems scrutineeHeadSafe] at scrutineeCopyOperation
+  obtain ⟨pair, copiedMany, outputRun⟩ := option_bind_some scrutineeCopyOperation
+  rcases pair with ⟨copiedItems, afterCopy⟩
+  have outputEq : (Tree.list copiedItems, afterCopy) = (copiedScrutinee, afterScrutinee) := by
+    simpa using Option.some.inj outputRun
+  have listEq : Tree.list copiedItems = copiedScrutinee := congrArg Prod.fst outputEq
+  cases copiedScrutinee with
+  | atom _ => simp at listEq
+  | list copiedScrutineeItems =>
+      have itemsEq : copiedItems = copiedScrutineeItems := Tree.list.inj listEq
+      subst copiedScrutineeItems
+      have copiedArguments : copyManyWithMacros (macroNames rules) (copyFuel + cost) origin
+          copyHoles renames fresh scrutineeItems = some (copiedItems, afterScrutinee) := by
+        have afterEq : afterCopy = afterScrutinee := congrArg Prod.snd outputEq
+        rw [afterEq] at copiedMany
+        simpa [copyManyWithMacros] using copiedMany
+      obtain ⟨target, templateCall⟩ := literal_call_site_to_next_macro_step rules
+        (macroNames rules) templateHoles copyHoles renames origin childOrigin copyFuel fresh
+        afterScrutinee head arguments copiedItems childRule site known notHole lookupNone
+        copiedArguments childMember copiedChildMatches
+      have scrutineeMember : .list scrutineeItems ∈
+          .atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail :=
+        List.mem_cons_of_mem _ (List.mem_cons_self _ _)
+      have staticCall := StaticCall.nested scrutineeMember templateCall
+      exact ⟨target, template_static_call_rank_decreases graphFuel rules index owner rule tailRules
+        templateHoles
+        (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail))
+        target edges ranks parsed dependencyCheck staticCall graphAccepted ranksAccepted⟩
+
+/-- Certified version: for every copied redex selected by the scrutinee
+`LiteralCallSite`, an accepted child `checkStep` supplies the successful rule
+match consumed by the rank proof. Fresh counters and child outputs are allowed
+to depend on the selected occurrence. -/
+theorem match_hole_head_scrutinee_certified_rank_decreases
+    (graphFuel copyFuel childFuel : Nat) (rules : List (Nat × Tree))
+    (index owner childOrigin origin fresh final : Nat) (rule : Tree)
+    (tailRules : List (Nat × Tree)) (templateHoles : List String)
+    (matchHead : Atom) (scrutineeItems : List Tree) (firstCase secondCase : Tree)
+    (caseTail : List Tree) (cost : Nat) (copied : Tree) (head : Atom)
+    (arguments : List Tree) (site : LiteralCallSite (macroNames rules) head arguments
+      scrutineeItems cost) (childRule : Tree) (copyHoles : Holes) (renames : Renames)
+    (dependencies : List Nat) (edges : List Edge) (ranks : List Nat)
+    (matchForm : matchHead.name = "match")
+    (matchIsHole : lookup matchHead.name copyHoles = some (.atom matchHead))
+    (scrutineeHeadSafe : counterNeutralListHead (macroNames rules) scrutineeItems = true)
+    (known : (macroNames rules).contains head.name = true)
+    (notHole : head.name ∉ templateHoles)
+    (lookupNone : (lookup head.name copyHoles).isNone = true)
+    (parsed : parameters rule = some (templateHoles,
+      .list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)))
+    (wholeCopied : copyWithMacros (macroNames rules) (copyFuel + cost + 2) origin copyHoles
+      renames fresh
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)) =
+        some (copied, final))
+    (childMember : (childOrigin, childRule) ∈ rules)
+    (copiedChildSteps : ∀ copiedItems copiedBefore copiedCall copiedAfter,
+      copiedItems = copiedBefore ++ copiedCall :: copiedAfter →
+      ∃ childFresh childFinal childOutput,
+        NLisp.ExpansionCertificate.checkStep rules childOrigin childFuel childFresh childFinal
+          childRule copiedCall childOutput = true)
+    (dependencyCheck : calls graphFuel rules templateHoles
+      (.list (.atom matchHead :: .list scrutineeItems :: firstCase :: secondCase :: caseTail)) =
+        some dependencies)
+    (graphAccepted : graphRows graphFuel rules index ((owner, rule) :: tailRules) = some edges)
+    (ranksAccepted : checkRanks edges ranks = true) :
+    ∃ target, rank ranks target < rank ranks index := by
+  have childMatches : ∀ copiedItems copiedBefore copiedCall copiedAfter,
+      copiedItems = copiedBefore ++ copiedCall :: copiedAfter →
+      ∃ childHoles childTemplate,
+        matchRule childRule copiedCall = some (childHoles, childTemplate) := by
+    intro copiedItems copiedBefore copiedCall copiedAfter split
+    obtain ⟨childFresh, childFinal, childOutput, accepted⟩ :=
+      copiedChildSteps copiedItems copiedBefore copiedCall copiedAfter split
+    obtain ⟨childHoles, childTemplate, _member, matched, _copied⟩ :=
+      NLisp.ExpansionCertificate.checkStep_sound accepted
+    exact ⟨childHoles, childTemplate, matched⟩
+  exact match_hole_head_scrutinee_call_site_rank_decreases graphFuel copyFuel rules
+    index owner childOrigin origin fresh final rule tailRules templateHoles matchHead
+    scrutineeItems firstCase secondCase caseTail cost copied head arguments site childRule
+    copyHoles renames dependencies edges ranks matchForm matchIsHole scrutineeHeadSafe known
+    notHole lookupNone parsed wholeCopied childMember childMatches dependencyCheck graphAccepted
+    ranksAccepted
 
 end NLisp.MacroTermination

@@ -56,6 +56,119 @@ def lookup (id : Nat) : Environment → Option Value
 
 def bind (ids : List Nat) (values : List Value) : Environment := ids.zip values
 
+/-- Named `letMany` binds exactly the shorter of the identifier and value
+rows. Any semantic simulation that erases binder names must therefore carry
+an alignment premise; otherwise the Named environment and IR stack differ in
+length. -/
+theorem bind_length_eq_min (ids : List Nat) (values : List Value) :
+    (bind ids values).length = min ids.length values.length := by
+  induction ids generalizing values with
+  | nil => simp [bind]
+  | cons head tail ih =>
+      cases values with
+      | nil => simp [bind]
+      | cons value rest =>
+          change Nat.succ (bind tail rest).length =
+            min (Nat.succ tail.length) (Nat.succ rest.length)
+          rw [ih]
+          omega
+
+/-- A `letMany` binding row has one Named environment entry per binder iff
+the evaluated initializer/value row is at least as long as the binder row.
+The common well-scoped case is equality, but spelling out this weaker iff
+makes the truncation behavior of `List.zip` explicit. -/
+theorem bind_length_eq_ids_iff (ids : List Nat) (values : List Value) :
+    (bind ids values).length = ids.length ↔ ids.length ≤ values.length := by
+  rw [bind_length_eq_min]
+  omega
+
+/-- An aligned binder/value row is not truncated by `List.zip`. -/
+theorem bind_length_of_aligned (ids : List Nat) (values : List Value)
+    (aligned : values.length = ids.length) :
+    (bind ids values).length = ids.length := by
+  induction ids generalizing values with
+  | nil => simp [bind] at aligned ⊢
+  | cons head tail ih =>
+      cases values with
+      | nil => simp at aligned
+      | cons value rest =>
+          simp only [List.length_cons] at aligned
+          have tailAligned : rest.length = tail.length := by omega
+          change Nat.succ (List.zip tail rest).length = Nat.succ tail.length
+          exact congrArg Nat.succ (ih rest tailAligned)
+
+/-- Extending a named environment with an aligned `letMany` binding row does
+not change lookups for identities outside the binder list. The length premise
+is the same invariant used by `Evaluates.letMany`; keeping it explicit avoids
+silently relying on `List.zip` truncation in environment reasoning. -/
+theorem lookup_bind_append_of_not_mem
+    (identifier : Nat) (ids : List Nat) (values : List Value)
+    (environment : Environment)
+    (aligned : values.length = ids.length)
+    (outside : identifier ∉ ids) :
+    lookup identifier (bind ids values ++ environment) =
+      lookup identifier environment := by
+  induction ids generalizing values with
+  | nil => simp [bind]
+  | cons head tail ih =>
+      cases values with
+      | nil => simp at aligned
+      | cons value rest =>
+          have headNe : head ≠ identifier := by
+            intro equal
+            apply outside
+            simp [equal]
+          have tailOutside : identifier ∉ tail := by
+            intro member
+            apply outside
+            simp [member]
+          have tailAligned : rest.length = tail.length := by
+            simp at aligned
+            omega
+          change lookup identifier ((head, value) :: (bind tail rest ++ environment)) =
+            lookup identifier environment
+          simp only [lookup, if_neg headNe]
+          exact ih rest tailAligned tailOutside
+
+/-- A lookup of a binder at a given aligned `letMany` row position returns
+the value at the same position, provided no earlier binder shadows it. This
+is the positional invariant needed to relate identity environments to the
+IR's de Bruijn-style value lists. -/
+theorem lookup_bind_append_of_get
+    (identifier : Nat) (ids : List Nat) (values : List Value)
+    (environment : Environment) (index : Nat)
+    (aligned : values.length = ids.length)
+    (found : ids.get? index = some identifier)
+    (notEarlier : identifier ∉ ids.take index) :
+    lookup identifier (bind ids values ++ environment) = values.get? index := by
+  induction ids generalizing values index with
+  | nil => simp at found
+  | cons head tail ih =>
+      cases values with
+      | nil => simp at aligned
+      | cons value rest =>
+          cases index with
+          | zero =>
+              simp only [List.get?_cons_zero, Option.some.injEq] at found
+              subst identifier
+              simp [bind, lookup]
+          | succ index =>
+              have notHead : identifier ≠ head := by
+                intro equal
+                subst identifier
+                exact notEarlier (by simp)
+              have tailNotEarlier : identifier ∉ tail.take index := by
+                intro member
+                apply notEarlier
+                simp [member]
+              have tailAligned : rest.length = tail.length := by
+                simp at aligned
+                omega
+              change lookup identifier ((head, value) :: (bind tail rest ++ environment)) =
+                rest.get? index
+              simp only [lookup, if_neg (Ne.symm notHead)]
+              exact ih rest index tailAligned (by simpa using found) tailNotEarlier
+
 mutual
 inductive Evaluates (program : Definitions) : Environment → Expr → Value → Prop where
   | var : lookup binderId env = some value → Evaluates program env (.var binderId) value

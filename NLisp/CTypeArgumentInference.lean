@@ -47,7 +47,6 @@ theorem cMatchTypes_success_agrees_with_inferTypeArguments
     (header : Header) (result : CTypeNode)
     (patternsDecoded : decodeCTypes scheme patterns = some patternTypes)
     (actualsDecoded : decodeCTypes callerPointers actuals = some actualTypes)
-    (actualsMonotype : cMonotypes actuals = true)
     (headerArity : header.variables.length = scheme.length)
     (headerParameters : header.parameters.map Prod.snd = patternTypes)
     (inferrable : inferrable fuel header = true)
@@ -68,8 +67,9 @@ theorem cMatchTypes_success_agrees_with_inferTypeArguments
         some (header.result.instantiate solution.arguments) := by
   obtain ⟨candidate, output, candidateArity, candidateValid, candidateMatches,
       substituted, resultAgreement⟩ :=
-    cMatchTypes_success_infers_arguments_and_substitutes_result callerPointers scheme fuel
-      patterns actuals patternTypes actualTypes patternsDecoded actualsDecoded actualsMonotype
+    cMatchTypes_success_infers_arguments_and_substitutes_result_of_decoded_actuals
+      callerPointers scheme fuel patterns actuals patternTypes actualTypes
+      patternsDecoded actualsDecoded
       cFinal matched allAssigned result header.result resultDecoded
   have arity : candidate.length = header.variables.length := by
     rw [headerArity]
@@ -108,7 +108,6 @@ theorem cMatchTypes_success_agrees_with_inferTypeArguments_of_all_slots
     (header : Header) (result : CTypeNode)
     (patternsDecoded : decodeCTypes scheme patterns = some patternTypes)
     (actualsDecoded : decodeCTypes callerPointers actuals = some actualTypes)
-    (actualsMonotype : cMonotypes actuals = true)
     (headerArity : header.variables.length = scheme.length)
     (headerParameters : header.parameters.map Prod.snd = patternTypes)
     (collectorEnough : collectorTypesFuel patternTypes ≤ fuel)
@@ -126,6 +125,8 @@ theorem cMatchTypes_success_agrees_with_inferTypeArguments_of_all_slots
       cSubstituteType scheme (cFinal.map (Option.getD · .unit)) result = some output ∧
       decodeCType callerPointers output =
         some (header.result.instantiate solution.arguments) := by
+  have actualsMonotype := decodeCTypes_success_are_monotypes callerPointers actuals
+    actualTypes actualsDecoded
   obtain ⟨leanFinal, collected, stateAgree⟩ :=
     (cMatchType_and_types_state_simulation fuel).2 scheme callerPointers patterns actuals
       patternTypes actualTypes (List.replicate scheme.length none)
@@ -162,7 +163,7 @@ theorem cMatchTypes_success_agrees_with_inferTypeArguments_of_all_slots
     simpa [headerParameters] using occurs
   exact cMatchTypes_success_agrees_with_inferTypeArguments callerPointers scheme fuel
     patterns actuals patternTypes actualTypes header result patternsDecoded actualsDecoded
-    actualsMonotype headerArity headerParameters inferrableCondition collectorEnough
+    headerArity headerParameters inferrableCondition collectorEnough
     checkerEnough cFinal matched allAssigned resultDecoded
 
 /-- The monomorphic `check_call` case needs no separate inference-coverage or
@@ -175,7 +176,6 @@ theorem cMatchTypes_monomorphic_success_agrees_with_inferTypeArguments
     (schemeEmpty : scheme = [])
     (patternsDecoded : decodeCTypes scheme patterns = some patternTypes)
     (actualsDecoded : decodeCTypes callerPointers actuals = some actualTypes)
-    (actualsMonotype : cMonotypes actuals = true)
     (headerArity : header.variables.length = scheme.length)
     (headerParameters : header.parameters.map Prod.snd = patternTypes)
     (collectorEnough : collectorTypesFuel patternTypes ≤ fuel)
@@ -203,6 +203,8 @@ theorem cMatchTypes_monomorphic_success_agrees_with_inferTypeArguments
   have allAssigned : cFinal.length = scheme.length ∧
       ∀ index, index < scheme.length →
         ∃ ctype, cFinal[index]? = some (some ctype) := by
+    have actualsMonotype := decodeCTypes_success_are_monotypes callerPointers actuals
+      actualTypes actualsDecoded
     have initialState := cSubstitutionStateAgree_initial_empty callerPointers scheme
     obtain ⟨leanFinal, _collected, finalState⟩ :=
       (cMatchType_and_types_state_simulation fuel).2 scheme callerPointers patterns actuals
@@ -216,7 +218,336 @@ theorem cMatchTypes_monomorphic_success_agrees_with_inferTypeArguments
       omega
   exact cMatchTypes_success_agrees_with_inferTypeArguments callerPointers scheme fuel
     patterns actuals patternTypes actualTypes header result patternsDecoded actualsDecoded
-    actualsMonotype (by simpa [schemeEmpty] using headerArity) headerParameters coverage
+    (by simpa [schemeEmpty] using headerArity) headerParameters coverage
     collectorEnough checkerEnough cFinal matched allAssigned resultDecoded
+
+/-- The successful polymorphic `check_call` path includes both C's explicit
+arity guard and its left-to-right matcher. This records the arity fact that
+is implicit in matcher success alongside Lean's inferred arguments and the
+substituted result type. -/
+theorem cCheckCall_success_agrees_with_inferTypeArguments
+    (callerPointers scheme : List Nat) (fuel : Nat)
+    (patterns actuals : List CTypeNode) (patternTypes actualTypes : List Ty)
+    (header : Header) (result : CTypeNode)
+    (patternsDecoded : decodeCTypes scheme patterns = some patternTypes)
+    (actualsDecoded : decodeCTypes callerPointers actuals = some actualTypes)
+    (headerArity : header.variables.length = scheme.length)
+    (headerParameters : header.parameters.map Prod.snd = patternTypes)
+    (collectorEnough : collectorTypesFuel patternTypes ≤ fuel)
+    (checkerEnough : ∀ candidate, candidate.length = scheme.length →
+      checkerTypesFuel candidate ≤ fuel)
+    (cFinal : List (Option CTypeNode))
+    (matched : cMatchTypes fuel scheme patterns actuals
+      (List.replicate scheme.length (none : Option CTypeNode)) = some cFinal)
+    (allAssigned : cFinal.length = scheme.length ∧
+      ∀ index, index < scheme.length →
+        ∃ ctype, cFinal[index]? = some (some ctype))
+    (resultDecoded : decodeCType scheme result = some header.result) :
+    patterns.length = actuals.length ∧
+    ∃ solution output,
+      inferTypeArguments fuel callerPointers.length header actualTypes = some solution ∧
+      cSubstituteType scheme (cFinal.map (Option.getD · .unit)) result = some output ∧
+      decodeCType callerPointers output =
+        some (header.result.instantiate solution.arguments) := by
+  have matchedArity : patterns.length = actuals.length := by
+    by_cases arity : patterns.length = actuals.length
+    · exact arity
+    · have rejected := cMatchTypes_arity_mismatch fuel scheme patterns actuals
+        (List.replicate scheme.length (none : Option CTypeNode)) arity
+      rw [matched] at rejected
+      contradiction
+  refine ⟨matchedArity, ?_⟩
+  exact cMatchTypes_success_agrees_with_inferTypeArguments_of_all_slots
+    callerPointers scheme fuel patterns actuals patternTypes actualTypes header result
+    patternsDecoded actualsDecoded headerArity headerParameters
+    collectorEnough checkerEnough cFinal matched allAssigned resultDecoded
+
+/-- The same successful C call check also establishes caller-scope safety of
+the substituted result type. This records the postcondition of C's
+`substitute_type` step alongside argument inference and result decoding. -/
+theorem cCheckCall_success_resultWellFormed
+    (callerPointers scheme : List Nat) (fuel : Nat)
+    (patterns actuals : List CTypeNode) (patternTypes actualTypes : List Ty)
+    (header : Header) (result : CTypeNode)
+    (patternsDecoded : decodeCTypes scheme patterns = some patternTypes)
+    (actualsDecoded : decodeCTypes callerPointers actuals = some actualTypes)
+    (headerArity : header.variables.length = scheme.length)
+    (headerParameters : header.parameters.map Prod.snd = patternTypes)
+    (resultWellFormed : header.result.wellFormed
+      (header.variables.length + callerPointers.length))
+    (collectorEnough : collectorTypesFuel patternTypes ≤ fuel)
+    (checkerEnough : ∀ candidate, candidate.length = scheme.length →
+      checkerTypesFuel candidate ≤ fuel)
+    (cFinal : List (Option CTypeNode))
+    (matched : cMatchTypes fuel scheme patterns actuals
+      (List.replicate scheme.length (none : Option CTypeNode)) = some cFinal)
+    (allAssigned : cFinal.length = scheme.length ∧
+      ∀ index, index < scheme.length →
+        ∃ ctype, cFinal[index]? = some (some ctype))
+    (resultDecoded : decodeCType scheme result = some header.result) :
+    patterns.length = actuals.length ∧
+    ∃ solution output,
+      inferTypeArguments fuel callerPointers.length header actualTypes = some solution ∧
+      cSubstituteType scheme (cFinal.map (Option.getD · .unit)) result = some output ∧
+      decodeCType callerPointers output =
+        some (header.result.instantiate solution.arguments) ∧
+      (header.result.instantiate solution.arguments).wellFormed callerPointers.length := by
+  obtain ⟨arity, solution, output, inferred, substituted, decoded⟩ :=
+    cCheckCall_success_agrees_with_inferTypeArguments callerPointers scheme fuel
+      patterns actuals patternTypes actualTypes header result patternsDecoded actualsDecoded
+      headerArity headerParameters collectorEnough checkerEnough cFinal
+      matched allAssigned resultDecoded
+  exact ⟨arity, solution, output, inferred, substituted, decoded,
+    solution.instantiated_result_wellFormed resultWellFormed⟩
+
+/-- Reverse the decoded C matcher on certified atomic parameter rows from a
+successful Lean inference. The inference theorem exposes its actual collector
+result, which is then simulated in C while preserving the shared slot state. -/
+theorem typeArgumentSolution_cMatchTypes_atomicRows
+    {fuel : Nat} (callerPointers scheme : List Nat)
+    {patterns actuals : List CTypeNode} (rows : CAtomicMonotypeRows fuel patterns actuals)
+    {patternTypes actualTypes : List Ty} (header : Header)
+    (patternsDecoded : decodeCTypes scheme patterns = some patternTypes)
+    (actualsDecoded : decodeCTypes callerPointers actuals = some actualTypes)
+    (headerArity : header.variables.length = scheme.length)
+    (headerParameters : header.parameters.map Prod.snd = patternTypes)
+    (solution : TypeArgumentSolution callerPointers.length header actualTypes)
+    (inferred : inferTypeArguments fuel callerPointers.length header actualTypes =
+      some solution) :
+    ∃ cFinal, cMatchTypes fuel scheme patterns actuals
+      (List.replicate scheme.length (none : Option CTypeNode)) = some cFinal ∧
+      ∃ leanFinal, collectArguments fuel patternTypes actualTypes
+          (List.replicate scheme.length none) = some leanFinal ∧
+        CSubstitutionStateAgree callerPointers scheme cFinal leanFinal ∧
+        leanFinal.mapM (fun value => value) = some solution.arguments := by
+  obtain ⟨leanFinal, collected, finalAssignments⟩ :=
+    inferTypeArguments_success_collectArguments fuel callerPointers.length header actualTypes
+      solution inferred
+  have collectedPatterns : collectArguments fuel patternTypes actualTypes
+      (List.replicate scheme.length none) = some leanFinal := by
+    simpa [headerParameters, headerArity] using collected
+  have initialState := cSubstitutionStateAgree_initial_empty callerPointers scheme
+  obtain ⟨cFinal, matched, finalState⟩ :=
+    cMatchTypes_atomicMonotypeRows_state_simulation_reverse rows patternsDecoded actualsDecoded
+      (List.replicate scheme.length none) (List.replicate scheme.length none) leanFinal
+      initialState collectedPatterns
+  exact ⟨cFinal, matched, leanFinal, collectedPatterns, finalState, finalAssignments⟩
+
+/-- The same inference-to-C reverse simulation for the broader certificate
+whose rows may wrap an atomic constraint in arbitrarily many List/Option
+constructors. -/
+theorem typeArgumentSolution_cMatchTypes_wrappedAtomicRows
+    {scheme callerPointers : List Nat} {fuel : Nat}
+    {rows : List (CWrappedAtomicMonotypeRow scheme callerPointers)}
+    (rowProof : CWrappedAtomicMonotypeRows scheme callerPointers fuel rows)
+    (header : Header)
+    (headerArity : header.variables.length = scheme.length)
+    (headerParameters : header.parameters.map Prod.snd =
+      rows.map CWrappedAtomicMonotypeRow.patternIRType)
+    (solution : TypeArgumentSolution callerPointers.length header
+      (rows.map CWrappedAtomicMonotypeRow.actualIRType))
+    (inferred : inferTypeArguments fuel callerPointers.length header
+      (rows.map CWrappedAtomicMonotypeRow.actualIRType) = some solution) :
+    ∃ cFinal, cMatchTypes fuel scheme
+      (rows.map CWrappedAtomicMonotypeRow.patternNode)
+      (rows.map CWrappedAtomicMonotypeRow.actualNode)
+      (List.replicate scheme.length (none : Option CTypeNode)) = some cFinal ∧
+      ∃ leanFinal, collectArguments fuel
+          (rows.map CWrappedAtomicMonotypeRow.patternIRType)
+          (rows.map CWrappedAtomicMonotypeRow.actualIRType)
+          (List.replicate scheme.length none) = some leanFinal ∧
+        CSubstitutionStateAgree callerPointers scheme cFinal leanFinal ∧
+        leanFinal.mapM (fun value => value) = some solution.arguments := by
+  obtain ⟨leanFinal, collected, finalAssignments⟩ :=
+    inferTypeArguments_success_collectArguments fuel callerPointers.length header
+      (rows.map CWrappedAtomicMonotypeRow.actualIRType) solution inferred
+  have collectedRows : collectArguments fuel
+      (rows.map CWrappedAtomicMonotypeRow.patternIRType)
+      (rows.map CWrappedAtomicMonotypeRow.actualIRType)
+      (List.replicate scheme.length none) = some leanFinal := by
+    simpa [headerParameters, headerArity] using collected
+  have initialState := cSubstitutionStateAgree_initial_empty callerPointers scheme
+  obtain ⟨cFinal, matched, finalState⟩ :=
+    cMatchTypes_wrappedAtomicMonotypeRows_state_simulation_reverse rowProof
+      (List.replicate scheme.length none) (List.replicate scheme.length none) leanFinal
+      initialState collectedRows
+  exact ⟨cFinal, matched, leanFinal, collectedRows, finalState, finalAssignments⟩
+
+/-- Lift successful inference through a single Function-type argument. Its
+parameter list may have any length of List/Option-wrapped atomic constraints,
+and its result may also be wrapped; the C matcher follows the same
+parameter-then-result assignment order as Lean's collector. -/
+theorem typeArgumentSolution_cMatchTypes_function_wrappedAtomic
+    {scheme callerPointers : List Nat} {fuel : Nat}
+    {rows : List (CWrappedAtomicMonotypeRow scheme callerPointers)}
+    (rowProof : CWrappedAtomicMonotypeRows scheme callerPointers fuel rows)
+    (resultRow : CWrappedAtomicMonotypeRow scheme callerPointers)
+    (resultFuel : resultRow.baseFuel + resultRow.wrappers.length + 1 = fuel)
+    (resultCost : cTypeCost resultRow.actualNode < fuel)
+    (header : Header)
+    (headerArity : header.variables.length = scheme.length)
+    (headerParameters : header.parameters.map Prod.snd =
+      [.fn (rows.map CWrappedAtomicMonotypeRow.patternIRType) resultRow.patternIRType])
+    (solution : TypeArgumentSolution callerPointers.length header
+      [.fn (rows.map CWrappedAtomicMonotypeRow.actualIRType) resultRow.actualIRType])
+    (inferred : inferTypeArguments (fuel + 2) callerPointers.length header
+      [.fn (rows.map CWrappedAtomicMonotypeRow.actualIRType) resultRow.actualIRType] =
+        some solution) :
+    ∃ cFinal, cMatchTypes (fuel + 2) scheme
+      [.function (rows.map CWrappedAtomicMonotypeRow.patternNode) resultRow.patternNode]
+      [.function (rows.map CWrappedAtomicMonotypeRow.actualNode) resultRow.actualNode]
+      (List.replicate scheme.length (none : Option CTypeNode)) = some cFinal ∧
+      ∃ leanFinal,
+        CSubstitutionStateAgree callerPointers scheme cFinal leanFinal ∧
+        leanFinal.mapM (fun value => value) = some solution.arguments := by
+  obtain ⟨leanFinal, collected, finalAssignments⟩ :=
+    inferTypeArguments_success_collectArguments (fuel + 2) callerPointers.length header
+      [.fn (rows.map CWrappedAtomicMonotypeRow.actualIRType) resultRow.actualIRType]
+      solution inferred
+  have functionCollected : collectArgument (fuel + 1)
+      (.fn (rows.map CWrappedAtomicMonotypeRow.patternIRType) resultRow.patternIRType)
+      (.fn (rows.map CWrappedAtomicMonotypeRow.actualIRType) resultRow.actualIRType)
+      (List.replicate scheme.length none) = some leanFinal := by
+    have listCollected : collectArguments (fuel + 2)
+        [.fn (rows.map CWrappedAtomicMonotypeRow.patternIRType) resultRow.patternIRType]
+        [.fn (rows.map CWrappedAtomicMonotypeRow.actualIRType) resultRow.actualIRType]
+        (List.replicate scheme.length none) = some leanFinal := by
+      simpa [headerParameters, headerArity] using collected
+    simpa [collectArguments] using listCollected
+  have initialState := cSubstitutionStateAgree_initial_empty callerPointers scheme
+  obtain ⟨cNext, functionMatched, finalState⟩ :=
+    cMatchType_function_wrappedAtomicMonotypeRowsResult_state_simulation_reverse fuel
+      (rows := rows) rowProof resultRow resultFuel resultCost
+      (List.replicate scheme.length none) (List.replicate scheme.length none) leanFinal
+      initialState functionCollected
+  refine ⟨cNext, ?_, leanFinal, finalState, finalAssignments⟩
+  simpa [cMatchTypes, functionMatched]
+
+/-- A certified Function-type constraint whose parameter rows and result are
+each List/Option-wrapped atomic constraints. -/
+structure CFunctionWrappedAtomicMonotypeRow (scheme callerPointers : List Nat) where
+  functionFuel : Nat
+  parameters : List (CWrappedAtomicMonotypeRow scheme callerPointers)
+  parametersProof : CWrappedAtomicMonotypeRows scheme callerPointers functionFuel parameters
+  result : CWrappedAtomicMonotypeRow scheme callerPointers
+  resultFuel : result.baseFuel + result.wrappers.length + 1 = functionFuel
+  resultCost : cTypeCost result.actualNode < functionFuel
+
+def CFunctionWrappedAtomicMonotypeRow.patternNode
+    {scheme callerPointers : List Nat}
+    (row : CFunctionWrappedAtomicMonotypeRow scheme callerPointers) : CTypeNode :=
+  .function (row.parameters.map CWrappedAtomicMonotypeRow.patternNode)
+    row.result.patternNode
+
+def CFunctionWrappedAtomicMonotypeRow.actualNode
+    {scheme callerPointers : List Nat}
+    (row : CFunctionWrappedAtomicMonotypeRow scheme callerPointers) : CTypeNode :=
+  .function (row.parameters.map CWrappedAtomicMonotypeRow.actualNode)
+    row.result.actualNode
+
+def CFunctionWrappedAtomicMonotypeRow.patternIRType
+    {scheme callerPointers : List Nat}
+    (row : CFunctionWrappedAtomicMonotypeRow scheme callerPointers) : Ty :=
+  .fn (row.parameters.map CWrappedAtomicMonotypeRow.patternIRType) row.result.patternIRType
+
+def CFunctionWrappedAtomicMonotypeRow.actualIRType
+    {scheme callerPointers : List Nat}
+    (row : CFunctionWrappedAtomicMonotypeRow scheme callerPointers) : Ty :=
+  .fn (row.parameters.map CWrappedAtomicMonotypeRow.actualIRType) row.result.actualIRType
+
+/-- A left-to-right list of certified Function constraints. One outer matcher
+step is reserved for each argument row, while each row carries the fuel for
+its own parameter/result traversal. -/
+inductive CFunctionWrappedAtomicMonotypeRows (scheme callerPointers : List Nat) :
+    Nat → List (CFunctionWrappedAtomicMonotypeRow scheme callerPointers) → Prop where
+  | nil (fuel : Nat) : CFunctionWrappedAtomicMonotypeRows scheme callerPointers (fuel + 1) []
+  | cons (fuel : Nat) (row : CFunctionWrappedAtomicMonotypeRow scheme callerPointers)
+      (rest : List (CFunctionWrappedAtomicMonotypeRow scheme callerPointers)) :
+      row.functionFuel = fuel →
+      CFunctionWrappedAtomicMonotypeRows scheme callerPointers (fuel + 1) rest →
+      CFunctionWrappedAtomicMonotypeRows scheme callerPointers (fuel + 2) (row :: rest)
+
+/-- Reverse simulation for an arbitrary list of Function-type arguments built
+from wrapper-aware atomic parameter and result constraints. The shared
+substitution state flows from one argument, through its parameters and result,
+then into the next argument. -/
+theorem cMatchTypes_function_wrappedAtomicMonotypeRows_state_simulation_reverse
+    {scheme callerPointers : List Nat} {fuel : Nat}
+    {rows : List (CFunctionWrappedAtomicMonotypeRow scheme callerPointers)}
+    (rowProof : CFunctionWrappedAtomicMonotypeRows scheme callerPointers fuel rows)
+    (cAssignments : List (Option CTypeNode)) (leanAssignments leanFinal : List (Option Ty))
+    (stateAgree : CSubstitutionStateAgree callerPointers scheme cAssignments leanAssignments)
+    (collected : collectArguments fuel
+      (rows.map CFunctionWrappedAtomicMonotypeRow.patternIRType)
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualIRType) leanAssignments = some leanFinal) :
+    ∃ cFinal, cMatchTypes fuel scheme
+      (rows.map CFunctionWrappedAtomicMonotypeRow.patternNode)
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualNode) cAssignments = some cFinal ∧
+      CSubstitutionStateAgree callerPointers scheme cFinal leanFinal := by
+  induction rowProof generalizing cAssignments leanAssignments leanFinal with
+  | nil fuel =>
+      have finalEq : leanFinal = leanAssignments := by
+        simpa [collectArguments] using collected.symm
+      subst leanFinal
+      exact ⟨cAssignments, by simp [cMatchTypes], stateAgree⟩
+  | cons fuel row rest rowFuelEq tailProof ih =>
+      simp only [List.map, collectArguments] at collected
+      obtain ⟨leanNext, headCollected, tailCollected⟩ := Option.bind_eq_some.mp collected
+      have headCollected' : collectArgument (fuel + 1) row.patternIRType row.actualIRType
+          leanAssignments = some leanNext := by
+        simpa [CFunctionWrappedAtomicMonotypeRow.patternIRType,
+          CFunctionWrappedAtomicMonotypeRow.actualIRType] using headCollected
+      obtain ⟨cNext, headMatched, nextAgree⟩ :=
+        cMatchType_function_wrappedAtomicMonotypeRowsResult_state_simulation_reverse fuel
+          row.parameters (by simpa [rowFuelEq] using row.parametersProof)
+          row.result (by simpa [rowFuelEq] using row.resultFuel)
+          (by simpa [rowFuelEq] using row.resultCost)
+          cAssignments leanAssignments leanNext stateAgree headCollected'
+      obtain ⟨cFinal, tailMatched, finalAgree⟩ :=
+        ih cNext leanNext leanFinal nextAgree tailCollected
+      refine ⟨cFinal, ?_, finalAgree⟩
+      simp [CFunctionWrappedAtomicMonotypeRow.patternNode,
+        CFunctionWrappedAtomicMonotypeRow.actualNode, rowFuelEq, cMatchTypes,
+        headMatched, tailMatched]
+
+/-- End-to-end inference-to-C reverse simulation for lists of certified
+Function-type arguments. It extracts the real collector result from successful
+inference and feeds it to the ordered function-row matcher simulation. -/
+theorem typeArgumentSolution_cMatchTypes_functionRows
+    {scheme callerPointers : List Nat} {fuel : Nat}
+    {rows : List (CFunctionWrappedAtomicMonotypeRow scheme callerPointers)}
+    (rowProof : CFunctionWrappedAtomicMonotypeRows scheme callerPointers fuel rows)
+    (header : Header)
+    (headerArity : header.variables.length = scheme.length)
+    (headerParameters : header.parameters.map Prod.snd =
+      rows.map CFunctionWrappedAtomicMonotypeRow.patternIRType)
+    (solution : TypeArgumentSolution callerPointers.length header
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualIRType))
+    (inferred : inferTypeArguments fuel callerPointers.length header
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualIRType) = some solution) :
+    ∃ cFinal, cMatchTypes fuel scheme
+      (rows.map CFunctionWrappedAtomicMonotypeRow.patternNode)
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualNode)
+      (List.replicate scheme.length (none : Option CTypeNode)) = some cFinal ∧
+      ∃ leanFinal, collectArguments fuel
+          (rows.map CFunctionWrappedAtomicMonotypeRow.patternIRType)
+          (rows.map CFunctionWrappedAtomicMonotypeRow.actualIRType)
+          (List.replicate scheme.length none) = some leanFinal ∧
+        CSubstitutionStateAgree callerPointers scheme cFinal leanFinal ∧
+        leanFinal.mapM (fun value => value) = some solution.arguments := by
+  obtain ⟨leanFinal, collected, finalAssignments⟩ :=
+    inferTypeArguments_success_collectArguments fuel callerPointers.length header
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualIRType) solution inferred
+  have collectedRows : collectArguments fuel
+      (rows.map CFunctionWrappedAtomicMonotypeRow.patternIRType)
+      (rows.map CFunctionWrappedAtomicMonotypeRow.actualIRType)
+      (List.replicate scheme.length none) = some leanFinal := by
+    simpa [headerParameters, headerArity] using collected
+  have initialState := cSubstitutionStateAgree_initial_empty callerPointers scheme
+  obtain ⟨cFinal, matched, finalState⟩ :=
+    cMatchTypes_function_wrappedAtomicMonotypeRows_state_simulation_reverse rowProof
+      (List.replicate scheme.length none) (List.replicate scheme.length none) leanFinal
+      initialState collectedRows
+  exact ⟨cFinal, matched, leanFinal, collectedRows, finalState, finalAssignments⟩
 
 end NLisp.Surface

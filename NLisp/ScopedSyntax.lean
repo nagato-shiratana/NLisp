@@ -28,6 +28,62 @@ def uniqueIds : Scope → Bool
 
 def Valid (scope : Scope) : Prop := uniqueIds scope = true
 
+/- A metered version of `uniqueIds`. It deliberately scans each tail in full,
+so its comparison count is an upper bound for `List.all`, which can stop at
+the first collision. -/
+def allDistinctFromWithCost (identity : Nat) : Scope → Bool × Nat
+  | [] => (true, 0)
+  | binding :: tail =>
+      let (rest, cost) := allDistinctFromWithCost identity tail
+      (identity != binding.identity && rest, cost + 1)
+
+def uniqueIdsWithCost : Scope → Bool × Nat
+  | [] => (true, 0)
+  | binding :: tail =>
+      let (headUnique, headCost) := allDistinctFromWithCost binding.identity tail
+      let (tailUnique, tailCost) := uniqueIdsWithCost tail
+      (headUnique && tailUnique, headCost + tailCost)
+
+theorem allDistinctFromWithCost_result (identity : Nat) (scope : Scope) :
+    (allDistinctFromWithCost identity scope).1 =
+      scope.all (fun binding => identity != binding.identity) := by
+  induction scope with
+  | nil => rfl
+  | cons binding tail ih =>
+      simp [allDistinctFromWithCost, ih, beq_iff_eq]
+
+theorem uniqueIdsWithCost_result (scope : Scope) :
+    (uniqueIdsWithCost scope).1 = uniqueIds scope := by
+  induction scope with
+  | nil => rfl
+  | cons binding tail ih =>
+      simp [uniqueIdsWithCost, uniqueIds, allDistinctFromWithCost_result, ih]
+
+theorem allDistinctFromWithCost_cost_le (identity : Nat) (scope : Scope) :
+    (allDistinctFromWithCost identity scope).2 ≤ scope.length := by
+  induction scope with
+  | nil => simp [allDistinctFromWithCost]
+  | cons binding tail ih =>
+      simp only [allDistinctFromWithCost, List.length_cons]
+      omega
+
+theorem allDistinctFromWithCost_cost_eq_length (identity : Nat) (scope : Scope) :
+    (allDistinctFromWithCost identity scope).2 = scope.length := by
+  induction scope with
+  | nil => rfl
+  | cons binding tail ih => simp [allDistinctFromWithCost, ih]
+
+theorem uniqueIdsWithCost_cost_le (scope : Scope) :
+    (uniqueIdsWithCost scope).2 ≤ scope.length * scope.length := by
+  induction scope with
+  | nil => simp [uniqueIdsWithCost]
+  | cons binding tail ih =>
+      have headCost := allDistinctFromWithCost_cost_eq_length binding.identity tail
+      simp only [uniqueIdsWithCost, List.length_cons]
+      rw [headCost]
+      simp only [Nat.succ_mul, Nat.mul_succ]
+      omega
+
 instance (scope : Scope) : Decidable (Valid scope) :=
   inferInstanceAs (Decidable (uniqueIds scope = true))
 

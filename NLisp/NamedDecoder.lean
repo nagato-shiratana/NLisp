@@ -725,6 +725,93 @@ inductive IdentityScopedList : List Nat → List Expr → Prop where
       IdentityScopedList locals (head :: tail)
 end
 
+/-- The scoped function and argument list are available independently when
+splitting an application proof. -/
+theorem identityScoped_app_parts {locals : List Nat} (function : Expr)
+    (arguments : List Expr)
+    (scopeProof : IdentityScoped locals (.app function arguments)) :
+    IdentityScoped locals function ∧ IdentityScopedList locals arguments := by
+  cases scopeProof with
+  | app functionScoped argumentsScoped => exact ⟨functionScoped, argumentsScoped⟩
+
+/-- A lambda body is scoped beneath its parameter identities. -/
+theorem identityScoped_lambda_body {locals parameters : List Nat} (body : Expr)
+    (scopeProof : IdentityScoped locals (.lam parameters body)) :
+    IdentityScoped (parameters ++ locals) body := by
+  cases scopeProof with
+  | lam bodyScoped => exact bodyScoped
+
+/-- A parallel let scopes every initializer in the incoming environment and
+its body under the complete binder prefix. -/
+theorem identityScoped_letMany_parts {locals ids : List Nat}
+    (initializers : List Expr) (body : Expr)
+    (scopeProof : IdentityScoped locals (.letMany ids initializers body)) :
+    IdentityScopedList locals initializers ∧ IdentityScoped (ids ++ locals) body := by
+  cases scopeProof with
+  | letMany initializersScoped bodyScoped => exact ⟨initializersScoped, bodyScoped⟩
+
+/-- `begin` evaluates every child in the same identity context. -/
+theorem identityScoped_begin_parts {locals : List Nat} (first : Expr)
+    (rest : List Expr)
+    (scopeProof : IdentityScoped locals (.begin first rest)) :
+    IdentityScoped locals first ∧ IdentityScopedList locals rest := by
+  cases scopeProof with
+  | begin firstScoped restScoped => exact ⟨firstScoped, restScoped⟩
+
+/-- A list match keeps the empty branch in the incoming context and adds the
+head/tail identities only in the cons branch. -/
+theorem identityScoped_matchList_parts {locals : List Nat} (target empty : Expr)
+    (headIdentity tailIdentity : Nat) (full : Expr)
+    (scopeProof : IdentityScoped locals
+      (.matchList target empty headIdentity tailIdentity full)) :
+    IdentityScoped locals target ∧ IdentityScoped locals empty ∧
+      IdentityScoped (headIdentity :: tailIdentity :: locals) full := by
+  cases scopeProof with
+  | matchList targetScoped emptyScoped fullScoped =>
+      exact ⟨targetScoped, emptyScoped, fullScoped⟩
+
+/-- An option match adds its identity only in the Some branch. -/
+theorem identityScoped_matchOption_parts {locals : List Nat} (target empty : Expr)
+    (identity : Nat) (full : Expr)
+    (scopeProof : IdentityScoped locals (.matchOption target empty identity full)) :
+    IdentityScoped locals target ∧ IdentityScoped locals empty ∧
+      IdentityScoped (identity :: locals) full := by
+  cases scopeProof with
+  | matchOption targetScoped emptyScoped fullScoped =>
+      exact ⟨targetScoped, emptyScoped, fullScoped⟩
+
+/-- Every member of a scoped expression row inherits the same local identity
+context. -/
+theorem identityScopedList_mem {locals : List Nat} (expressions : List Expr)
+    (scopeProof : IdentityScopedList locals expressions) {expression : Expr}
+    (member : expression ∈ expressions) : IdentityScoped locals expression := by
+  induction expressions with
+  | nil => cases scopeProof; simp at member
+  | cons head tail ih =>
+      cases scopeProof with
+      | cons headScoped tailScoped =>
+          simp only [List.mem_cons] at member
+          rcases member with same | member
+          · cases same
+            exact headScoped
+          · exact ih tailScoped member
+
+/-- A scoped variable is lowered to an in-range PolyIR environment index.
+This rules out the out-of-range fallback used for a missing source identity. -/
+theorem identityScoped_variable_lower_index {locals : List Nat} {identity : Nat}
+    (scopeProof : IdentityScoped locals (.var identity)) :
+    position identity locals < locals.length := by
+  cases scopeProof with
+  | var present => exact position_lt_length_of_mem identity locals present
+
+/-- Every built-in function body synthesized by the decoder is scoped under
+the identities of its parameters. -/
+theorem readPrimitive_identityScoped {identity : Nat} {expression : Expr}
+    (decoded : readPrimitive identity = some expression) :
+    IdentityScoped [] expression := by
+  unfold readPrimitive at decoded
+  split at decoded <;> cases decoded <;> repeat' (first | constructor | simp)
+
 theorem acceptedSite_variable_identityScoped (site : CBindingWalk.Site)
     (accepted : CBindingWalk.accepts site = true) :
     IdentityScoped (site.caller.map (fun entry => entry.identity))
@@ -810,6 +897,211 @@ theorem lambdaValue_identityScoped (environment : Environment) (parameters : Lis
     ValueIdentityScoped (.closure parameters body environment) :=
   .closure bodyScoped environmentScoped
 
+/-- Every definition body is well-scoped under its parameter identities. -/
+def programIdentityScoped (program : Definitions) : Prop :=
+  ∀ parameters body, (parameters, body) ∈ program → IdentityScoped parameters body
+
+theorem programIdentityScoped_lookup (program : Definitions) (index : Nat)
+    (parameters : List Nat) (body : Expr)
+    (programScoped : programIdentityScoped program)
+    (found : program[index]? = some (parameters, body)) :
+    IdentityScoped parameters body := by
+  induction program generalizing index with
+  | nil =>
+      have indexInvalid : ¬ index < 0 := by omega
+      simp [getElem?_def, indexInvalid] at found
+  | cons definition rest ih =>
+      cases index with
+      | zero =>
+          have same : definition = (parameters, body) := by
+            simpa [getElem?_def] using found
+          cases same
+          exact programScoped parameters body (by simp)
+      | succ index =>
+          have foundTail : rest[index]? = some (parameters, body) := by
+            simpa [getElem?_def, List.length_cons, Nat.succ_lt_succ_iff] using found
+          have restScoped : programIdentityScoped rest := by
+            intro ps expression member
+            exact programScoped ps expression (List.mem_cons_of_mem _ member)
+          exact ih index restScoped foundTail
+
+theorem environmentIdentityScoped_lookup (environment : Environment) (identity : Nat)
+    (value : Value) (environmentScoped : EnvironmentIdentityScoped environment)
+    (found : lookup identity environment = some value) : ValueIdentityScoped value := by
+  induction environment with
+  | nil => simp [lookup] at found
+  | cons entry rest ih =>
+      rcases entry with ⟨key, current⟩
+      cases environmentScoped with
+      | cons currentScoped restScoped =>
+          by_cases same : key = identity
+          · subst key
+            have currentEq : current = value := by simpa [lookup] using found
+            cases currentEq
+            exact currentScoped
+          · have tailFound : lookup identity rest = some value := by
+              simpa [lookup, same] using found
+            exact ih restScoped tailFound
+
+/-- Identity scope is preserved by finite Named evaluation. In particular,
+closures retain a body scoped by their parameter identities followed by the
+identities of the captured environment. -/
+theorem evaluation_preserves_valueIdentityScoped (program : Definitions)
+    (programScoped : programIdentityScoped program) :
+    ∀ {environment : Environment} {expression : Expr} {value : Value},
+      Evaluates program environment expression value →
+      EnvironmentIdentityScoped environment →
+      IdentityScoped (identities environment) expression → ValueIdentityScoped value := by
+  apply Evaluates.rec (program := program)
+    (motive_1 := fun environment expression value _ =>
+      EnvironmentIdentityScoped environment →
+        IdentityScoped (identities environment) expression → ValueIdentityScoped value)
+    (motive_2 := fun environment expressions values _ =>
+      EnvironmentIdentityScoped environment →
+        IdentityScopedList (identities environment) expressions →
+        ∀ value ∈ values, ValueIdentityScoped value)
+    (motive_3 := fun environment expressions previous value _ =>
+      EnvironmentIdentityScoped environment →
+        IdentityScopedList (identities environment) expressions →
+        ValueIdentityScoped previous → ValueIdentityScoped value)
+  all_goals intros
+  all_goals try assumption
+  all_goals try exact ValueIdentityScoped.bool
+  all_goals try exact ValueIdentityScoped.int
+  all_goals try exact ValueIdentityScoped.float
+  all_goals try exact ValueIdentityScoped.string
+  all_goals try exact ValueIdentityScoped.character
+  all_goals try exact ValueIdentityScoped.unit
+  all_goals try exact ValueIdentityScoped.global
+  all_goals try exact ValueIdentityScoped.nil
+  all_goals try exact ValueIdentityScoped.none
+  case var =>
+    rename_i identity environment value found environmentScoped expressionScoped
+    exact environmentIdentityScoped_lookup environment identity value environmentScoped found
+  case lam =>
+    rename_i environment parameters body environmentScoped expressionScoped
+    cases expressionScoped with
+    | lam bodyScoped => exact ValueIdentityScoped.closure bodyScoped environmentScoped
+  case appClosure =>
+    rename_i environment function parameters body captured arguments values result
+      evalFunction evalArguments arity evalBody ihFunction ihArguments ihBody
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | app functionScoped argumentsScoped =>
+      have functionScopedValue := ihFunction environmentScoped functionScoped
+      have valuesScoped : ∀ value ∈ values, ValueIdentityScoped value :=
+        ihArguments environmentScoped argumentsScoped
+      cases functionScopedValue with
+      | closure bodyScoped capturedScoped =>
+          have bodyEnvironmentScoped := environmentIdentityScoped_bind_append
+            parameters values captured valuesScoped capturedScoped
+          have bodyScope : IdentityScoped
+              (identities (bind parameters values ++ captured)) body := by
+            rw [identities_bind_append parameters values captured arity]
+            exact bodyScoped
+          exact ihBody bodyEnvironmentScoped bodyScope
+  case appGlobal =>
+    rename_i environment function index arguments values parameters body result
+      evalFunction evalArguments definitionFound arity evalBody ihFunction ihArguments ihBody
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | app functionScoped argumentsScoped =>
+      have valuesScoped : ∀ value ∈ values, ValueIdentityScoped value :=
+        ihArguments environmentScoped argumentsScoped
+      have bodyScoped := programIdentityScoped_lookup program index parameters body
+        programScoped definitionFound
+      have bodyEnvironmentScoped := environmentIdentityScoped_bind_append
+        parameters values [] valuesScoped EnvironmentIdentityScoped.nil
+      have bodyScope : IdentityScoped (identities (bind parameters values)) body := by
+        rw [bind_identifiers parameters values arity]
+        simpa using bodyScoped
+      exact ihBody (by simpa using bodyEnvironmentScoped) bodyScope
+  case ifTrue =>
+    rename_i environment condition yes value no evalCondition evalYes ihCondition ihYes
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | ite _ yesScoped _ => exact ihYes environmentScoped yesScoped
+  case ifFalse =>
+    rename_i environment condition no value yes evalCondition evalNo ihCondition ihNo
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | ite _ _ noScoped => exact ihNo environmentScoped noScoped
+  case letMany =>
+    rename_i environment initializers values identifiers body result evalInitializers arity
+      evalBody ihInitializers ihBody environmentScoped expressionScoped
+    cases expressionScoped with
+    | letMany initializersScoped bodyScoped =>
+      have valuesScoped : ∀ value ∈ values, ValueIdentityScoped value :=
+        ihInitializers environmentScoped initializersScoped
+      have bodyEnvironmentScoped := environmentIdentityScoped_bind_append
+        identifiers values environment valuesScoped environmentScoped
+      have bodyScope : IdentityScoped
+          (identities (bind identifiers values ++ environment)) body := by
+        rw [identities_bind_append identifiers values environment arity]
+        exact bodyScoped
+      exact ihBody bodyEnvironmentScoped bodyScope
+  case begin =>
+    rename_i environment first previous rest result evalFirst evalRest ihFirst ihRest
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | begin firstScoped restScoped =>
+      exact ihRest environmentScoped restScoped (ihFirst environmentScoped firstScoped)
+  case cons =>
+    rename_i environment head headValue tail tailValue evalHead evalTail ihHead ihTail
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | cons headScoped tailScoped =>
+      exact ValueIdentityScoped.cons (ihHead environmentScoped headScoped)
+        (ihTail environmentScoped tailScoped)
+  case some =>
+    rename_i environment expression value evalExpression ihExpression environmentScoped
+      expressionScoped
+    cases expressionScoped with
+    | some valueScoped => exact ValueIdentityScoped.some (ihExpression environmentScoped valueScoped)
+  case matchNil =>
+    rename_i environment target empty value headBinder tailBinder full evalTarget evalEmpty
+      ihTarget ihEmpty environmentScoped expressionScoped
+    cases expressionScoped with
+    | matchList _ emptyScoped _ => exact ihEmpty environmentScoped emptyScoped
+  case matchCons =>
+    rename_i environment target headValue tailValue headBinder tailBinder full value empty
+      evalTarget evalFull ihTarget ihFull environmentScoped expressionScoped
+    cases expressionScoped with
+    | matchList _ _ fullScoped =>
+      cases ihTarget environmentScoped (by assumption) with
+      | cons headScoped tailScoped =>
+        exact ihFull (.cons headScoped (.cons tailScoped environmentScoped)) fullScoped
+  case matchNone =>
+    rename_i environment target empty value binder full evalTarget evalEmpty ihTarget ihEmpty
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | matchOption _ emptyScoped _ => exact ihEmpty environmentScoped emptyScoped
+  case matchSome =>
+    rename_i environment target item binder full value empty evalTarget evalFull ihTarget ihFull
+      environmentScoped expressionScoped
+    cases expressionScoped with
+    | matchOption targetScoped _ fullScoped =>
+      cases ihTarget environmentScoped targetScoped with
+      | some itemScoped => exact ihFull (.cons itemScoped environmentScoped) fullScoped
+  case nil =>
+    rename_i environmentScoped expressionsScoped value member
+    simp at member
+  case cons =>
+    rename_i environment head headValue tail values evalHead evalTail ihHead ihTail
+      environmentScoped expressionsScoped value member
+    cases expressionsScoped with
+    | cons headScoped tailScoped =>
+      rcases List.mem_cons.mp member with same | member
+      · cases same
+        exact ihHead environmentScoped headScoped
+      · exact ihTail environmentScoped tailScoped _ member
+  case cons =>
+    rename_i environment head headValue tail previous result evalHead evalTail ihHead ihTail
+      environmentScoped expressionsScoped previousScoped
+    cases expressionsScoped with
+    | cons headScoped tailScoped =>
+      exact ihTail environmentScoped tailScoped (ihHead environmentScoped headScoped)
+
 /- Runtime closures carry their source body and captured source environment.
 This recursive invariant records that every such body obeys the binder/value
 arity condition and that the condition remains true for closures nested in
@@ -839,6 +1131,42 @@ end
 
 abbrev valueWellScoped := ValueWellScoped
 abbrev environmentWellScoped := EnvironmentWellScoped
+
+/-- A closure's value-scope invariant packages both the body scope under its
+parameter/captured identities and the scope invariant for the captured cells. -/
+theorem valueIdentityScoped_closure_parts (parameters : List Nat) (body : Expr)
+    (captured : Environment)
+    (scopeProof : ValueIdentityScoped (.closure parameters body captured)) :
+    IdentityScoped (parameters ++ identities captured) body ∧
+      EnvironmentIdentityScoped captured := by
+  cases scopeProof with
+  | closure bodyScoped capturedScoped => exact ⟨bodyScoped, capturedScoped⟩
+
+/-- A closure's layout invariant packages aligned nested `letMany` forms in
+its body and well-scoped captured values. -/
+theorem valueWellScoped_closure_parts (parameters : List Nat) (body : Expr)
+    (captured : Environment)
+    (scopeProof : ValueWellScoped (.closure parameters body captured)) :
+    letLayoutsAligned body = true ∧ EnvironmentWellScoped captured := by
+  cases scopeProof with
+  | closure bodyAligned capturedScoped => exact ⟨bodyAligned, capturedScoped⟩
+
+/-- Combined checked `letMany` invariants: identity references in initializers
+use the old context, body references use the complete binder prefix, nested
+layouts are aligned, and the row lengths agree. -/
+theorem identityScoped_letMany_aligned {locals ids : List Nat}
+    (initializers : List Expr) (body : Expr)
+    (scopeProof : IdentityScoped locals (.letMany ids initializers body))
+    (layoutProof : letLayoutsAligned (.letMany ids initializers body) = true) :
+    IdentityScopedList locals initializers ∧
+      IdentityScoped (ids ++ locals) body ∧
+      ids.length = initializers.length ∧
+      letLayoutsAlignedList initializers = true ∧ letLayoutsAligned body = true := by
+  obtain ⟨initializersScoped, bodyScoped⟩ :=
+    identityScoped_letMany_parts initializers body scopeProof
+  obtain ⟨rowAligned, initializersAligned, bodyAligned⟩ :=
+    letLayoutsAligned_letMany_parts ids initializers body layoutProof
+  exact ⟨initializersScoped, bodyScoped, rowAligned, initializersAligned, bodyAligned⟩
 
 def programWellScoped (definitions : Definitions) : Prop :=
   definitionsLetLayoutsAligned definitions = true
@@ -885,7 +1213,10 @@ def decodeFunctions (fuel : Nat) (headers : List Header) : List Header → Optio
 zero-argument header. This puts value references after all function indices;
 the header body is retained as the initializer node. -/
 def GlobalHeader.decodeHeader (header : GlobalHeader) : Header :=
-  ⟨header.identity, [], [], header.type, header.initializer⟩
+  ⟨header.identity, [], [], header.type, header.initializer, header.order, header.name⟩
+
+@[simp] theorem GlobalHeader.decodeHeader_order (header : GlobalHeader) :
+    (GlobalHeader.decodeHeader header).order = header.order := rfl
 
 def decodeHeadersWithGlobals (functions : List Header) (values : List GlobalHeader) :
     List Header :=
@@ -980,6 +1311,34 @@ def decodeTopLevelProgram (fuel : Nat) (forms : List Node) :
     Option (Definitions × List Surface.Ty × List Expr) := do
   let layout ← readProgramHeaders fuel 0 forms
   decodeProgramWithGlobals fuel layout.functions layout.globals
+
+/- Preserve the mixed declaration sequence alongside the established decoded
+function/value projections. This is the interface needed by consumers that
+must reconstruct a source-order GlobalProgramEntry layout. -/
+def decodeTopLevelProgramWithHeaders (fuel : Nat) (forms : List Node) :
+    Option (ProgramHeaders × Definitions × List Surface.Ty × List Expr) := do
+  let layout ← readProgramHeaders fuel 0 forms
+  let (definitions, slotTypes, initializers) ←
+    decodeProgramWithGlobals fuel layout.functions layout.globals
+  return (layout, definitions, slotTypes, initializers)
+
+theorem decodeTopLevelProgramWithHeaders_project
+    (fuel : Nat) (forms : List Node) (layout : ProgramHeaders)
+    (definitions : Definitions) (slotTypes : List Surface.Ty) (initializers : List Expr)
+    (decoded : decodeTopLevelProgramWithHeaders fuel forms =
+      some (layout, definitions, slotTypes, initializers)) :
+    decodeTopLevelProgram fuel forms = some (definitions, slotTypes, initializers) := by
+  unfold decodeTopLevelProgramWithHeaders at decoded
+  cases layoutResult : readProgramHeaders fuel 0 forms with
+  | none => simp [layoutResult] at decoded
+  | some actualLayout =>
+      cases programResult : decodeProgramWithGlobals fuel actualLayout.functions actualLayout.globals with
+      | none => simp [layoutResult, programResult] at decoded
+      | some actualProgram =>
+          rcases actualProgram with ⟨actualDefinitions, actualTypes, actualInitializers⟩
+          simp [layoutResult, programResult] at decoded
+          obtain ⟨rfl, rfl, rfl, rfl⟩ := decoded
+          simp [decodeTopLevelProgram, layoutResult, programResult]
 
 theorem decodeProgramWithGlobals_layout (fuel : Nat) (functions : List Header)
     (values : List GlobalHeader) (definitions : Definitions) (slotTypes : List Surface.Ty)

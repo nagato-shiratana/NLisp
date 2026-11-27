@@ -3310,6 +3310,96 @@ theorem parameter_then_pattern_tokens_unique (fuel : Nat) (holes : Holes)
   rw [firstSequence, secondSequence, middleCounter, ← counterTokens_add]
   exact counterTokens_distinct fresh (parameters.length + pattern.length)
 
+/-- Let binders and a following match pattern share one fresh counter stream.
+Their generated token sequences are therefore jointly unique, even though
+the two copier functions maintain different rename environments. -/
+theorem bindings_then_pattern_tokens_unique (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (outside names : Renames) (fresh : Nat)
+    (bindings bindingCopies : List Tree) (middleNames : Renames) (middle : Nat)
+    (safe : CounterPreservingBindings macros bindings)
+    (bindingCopy : copyBindingsWithMacros macros fuel origin holes outside names fresh
+      bindings = some (bindingCopies, middleNames, middle))
+    (pattern patternCopies : List Tree) (finalNames : Renames) (final : Nat)
+    (patternCopy : copyPatternWithMacros macros fuel holes middleNames middle pattern =
+      some (patternCopies, finalNames, final)) :
+    Unique (bindingTokens bindingCopies ++ patternTokens patternCopies) := by
+  have middleCounter := copyBindingsWithMacros_preserving_counter macros fuel origin holes
+    outside names fresh bindings bindingCopies middleNames middle safe bindingCopy
+  have firstSequence := copyBindingsWithMacros_preserving_token_sequence macros fuel origin
+    holes outside names fresh bindings bindingCopies middleNames middle safe bindingCopy
+  have secondSequence := copyPatternWithMacros_token_sequence macros fuel holes middleNames
+    middle pattern patternCopies finalNames final patternCopy
+  rw [firstSequence, secondSequence, middleCounter, ← counterTokens_add]
+  exact counterTokens_distinct fresh (bindings.length + pattern.length)
+
+theorem bindings_then_pattern_tokens_avoid_source (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (outside names : Renames) (fresh : Nat)
+    (bindings bindingCopies : List Tree) (middleNames : Renames) (middle : Nat)
+    (safe : CounterPreservingBindings macros bindings)
+    (bindingCopy : copyBindingsWithMacros macros fuel origin holes outside names fresh
+      bindings = some (bindingCopies, middleNames, middle))
+    (pattern patternCopies : List Tree) (finalNames : Renames) (final : Nat)
+    (patternCopy : copyPatternWithMacros macros fuel holes middleNames middle pattern =
+      some (patternCopies, finalNames, final))
+    (sourceToken : Nat) (sourceClass : sourceToken % 3 = 1) :
+    sourceToken ∉ bindingTokens bindingCopies ++ patternTokens patternCopies := by
+  have middleCounter := copyBindingsWithMacros_preserving_counter macros fuel origin holes
+    outside names fresh bindings bindingCopies middleNames middle safe bindingCopy
+  have firstSequence := copyBindingsWithMacros_preserving_token_sequence macros fuel origin
+    holes outside names fresh bindings bindingCopies middleNames middle safe bindingCopy
+  have secondSequence := copyPatternWithMacros_token_sequence macros fuel holes middleNames
+    middle pattern patternCopies finalNames final patternCopy
+  rw [firstSequence, secondSequence, middleCounter, ← counterTokens_add]
+  intro member
+  have generatedClass := counterTokens_reserved_class fresh (bindings.length + pattern.length)
+    sourceToken member
+  omega
+
+/-- Compose pattern copying with the subsequent copying of match cases. The
+case patterns continue from the counter left by the outer pattern, so their
+generated binder identities cannot collide with those outer binders. -/
+theorem pattern_then_cases_tokens_unique (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (pattern patternCopies : List Tree) (middleRenames : Renames) (middle : Nat)
+    (patternCopy : copyPatternWithMacros macros fuel holes renames fresh pattern =
+      some (patternCopies, middleRenames, middle))
+    (cases caseCopies : List Tree) (final : Nat)
+    (safe : CounterPreservingCases macros cases)
+    (casesCopy : copyCasesWithMacros macros fuel origin holes middleRenames middle cases =
+      some (caseCopies, final)) :
+    Unique (patternTokens patternCopies ++ counterPreservingCaseTokens caseCopies) := by
+  have middleCounter := copyPatternWithMacros_counter macros fuel holes renames fresh pattern
+    patternCopies middleRenames middle patternCopy
+  have firstSequence := copyPatternWithMacros_token_sequence macros fuel holes renames fresh
+    pattern patternCopies middleRenames middle patternCopy
+  have secondSequence := copyCasesWithMacros_preserving_token_sequence macros fuel origin holes
+    middleRenames middle cases caseCopies final safe casesCopy
+  rw [firstSequence, secondSequence, middleCounter, ← counterTokens_add]
+  exact counterTokens_distinct fresh (pattern.length + counterPreservingCaseCount cases)
+
+theorem pattern_then_cases_tokens_avoid_source (macros : List String)
+    (fuel origin : Nat) (holes : Holes) (renames : Renames) (fresh : Nat)
+    (pattern patternCopies : List Tree) (middleRenames : Renames) (middle : Nat)
+    (patternCopy : copyPatternWithMacros macros fuel holes renames fresh pattern =
+      some (patternCopies, middleRenames, middle))
+    (cases caseCopies : List Tree) (final : Nat)
+    (safe : CounterPreservingCases macros cases)
+    (casesCopy : copyCasesWithMacros macros fuel origin holes middleRenames middle cases =
+      some (caseCopies, final)) (sourceToken : Nat)
+    (sourceClass : sourceToken % 3 = 1) :
+    sourceToken ∉ patternTokens patternCopies ++ counterPreservingCaseTokens caseCopies := by
+  have middleCounter := copyPatternWithMacros_counter macros fuel holes renames fresh pattern
+    patternCopies middleRenames middle patternCopy
+  have firstSequence := copyPatternWithMacros_token_sequence macros fuel holes renames fresh
+    pattern patternCopies middleRenames middle patternCopy
+  have secondSequence := copyCasesWithMacros_preserving_token_sequence macros fuel origin holes
+    middleRenames middle cases caseCopies final safe casesCopy
+  rw [firstSequence, secondSequence, middleCounter, ← counterTokens_add]
+  intro member
+  have generatedClass := counterTokens_reserved_class fresh
+    (pattern.length + counterPreservingCaseCount cases) sourceToken member
+  omega
+
 /-- Compose the binder token guarantees across parameter, let-binding,
 pattern, and match-case copy phases. Each phase starts at the previous phase's
 final counter, so the complete generated binder sequence occupies one

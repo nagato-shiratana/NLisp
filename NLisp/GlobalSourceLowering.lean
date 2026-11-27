@@ -3,6 +3,7 @@ import NLisp.ExpansionLowering
 import NLisp.GlobalProgramEntry
 import NLisp.NameLowering
 import NLisp.GlobalIRErrorCorrespondence
+import NLisp.ProcessCertificate
 
 namespace NLisp.GlobalSourceLowering
 
@@ -144,6 +145,39 @@ theorem resolvedCValueName_agrees_with_compiled_globalIR_getter
   exact ⟨nameReads, GlobalIR.getter_call_reads_current_store
     (GlobalProgramEntry.toDefinitions 0 entries) store fuel sourceIndex slot value getter stored⟩
 
+/-- If C-style name lookup reports a mixed declaration index, the
+position-preserving named layout supplies the identity correspondence needed
+to connect that lookup directly to the value's GlobalIR getter. -/
+theorem resolvedCValueName_from_namedLayout_agrees_with_compiled_globalIR_getter
+    (entries : List GlobalProgramEntry.Entry) (environment : List CNameResolution.Entry)
+    (layout : GlobalProgramEntry.NamedGlobalLayout environment entries)
+    (store : GlobalIR.Store) (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr) (value : PolyIR.Value)
+    (fuel : Nat)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (indexResolved : CNameResolution.findNameIndex environment name = some sourceIndex)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (stored : store[slot]? = some (some value)) :
+    CNameResolution.readName environment
+        (identityCellStore entries store) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries) store (fuel + 2) []
+        (.app (.global sourceIndex) []) = .ok value := by
+  obtain ⟨indexedBinding, indexedFound, namedAt⟩ :=
+    CNameResolution.findNameIndex_sound environment name sourceIndex indexResolved
+  have bindingEq : indexedBinding = binding := by
+    rw [resolved] at indexedFound
+    exact (Option.some.inj indexedFound).symm
+  subst indexedBinding
+  have identityMatches : binding.identity = identity :=
+    layout.2 sourceIndex binding (.value identity type valid initializer) namedAt entryAt
+  exact resolvedCValueName_agrees_with_compiled_globalIR_getter entries environment store name
+    binding sourceIndex slot identity type valid initializer value fuel resolved identityMatches
+    entryAt unique ordinal stored
+
 /-- A write to a declared mixed-layout value slot is observed identically by
 C's shared-cell name lookup and by the corresponding compiled GlobalIR
 getter. This composes source-order index translation, dense-slot mutation,
@@ -180,6 +214,285 @@ theorem declaredValue_write_agrees_with_C_name_and_globalIR_getter
     identity slot type valid initializer value entryAt unique ordinal slotFits
   rw [cellWrite] at observed
   exact observed
+
+/-- A closure that retains C's linked global name environment observes a
+later shared-cell write, while the corresponding GlobalIR closure reads the
+same newly populated dense slot through its getter body. -/
+theorem declaredValue_shared_closure_observes_later_cell_write
+    (entries : List GlobalProgramEntry.Entry) (environment : List CNameResolution.Entry)
+    (before : GlobalIR.Store) (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (value : PolyIR.Value) (fuel : Nat)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (identityMatches : binding.identity = identity)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (slotFits : slot < before.length)
+    (beforeEmpty : before[slot]? = some none) :
+    CNameResolution.readName environment
+        (identityCellStore entries (before.set slot (some value))) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries)
+        (before.set slot (some value)) (fuel + 4)
+        [.closure 0 (.app (.global sourceIndex) []) []] (.app (.var 0) []) = .ok value := by
+  have cObserved := CNameResolution.readName_after_cell_write environment
+    (identityCellStore entries before) name binding value resolved
+  have cObserved' : CNameResolution.readName environment
+      (CNameResolution.writeCell (identityCellStore entries before) identity value) name =
+      some value := by
+    rw [← identityMatches]
+    exact cObserved
+  have cellWrite := declaredValueCell_update_matches_C_cell_write entries before sourceIndex
+    identity slot type valid initializer value entryAt unique ordinal slotFits
+  have cReadAfterStore : CNameResolution.readName environment
+      (identityCellStore entries (before.set slot (some value))) name = some value := by
+    rw [cellWrite]
+    exact cObserved'
+  have slotFits' : slot < (before.set slot (some value)).length := by
+    simpa only [List.length_set] using slotFits
+  have afterInitialized : (before.set slot (some value))[slot]? = some (some value) := by
+    simp only [getElem?_def, dif_pos slotFits']
+    have setValue : (before.set slot (some value))[slot]'slotFits' = some value :=
+      List.get_set_eq before slot (some value) slotFits'
+    simp [setValue]
+  obtain ⟨getterType, getterLayout⟩ :=
+    GlobalProgramEntry.sourceValueSlotOrdinal_layout entries sourceIndex 0 slot ordinal
+  have layout : (GlobalProgramEntry.compiledLayout 0 entries).get? sourceIndex =
+      some (⟨0, [], getterType⟩, GlobalIR.Definition.getter slot) := by
+    simpa [Nat.zero_add] using getterLayout
+  have getterLookup := GlobalProgramEntry.toDefinitions_getter_of_layout 0 entries
+    sourceIndex ⟨0, [], getterType⟩ slot layout
+  have getter : (GlobalProgramEntry.toDefinitions 0 entries)[sourceIndex]? =
+      some (GlobalIR.Definition.getter slot) := by
+    rw [sourceGetElem?_eq_get?]
+    exact getterLookup
+  obtain ⟨_closureBefore, _earlyRead, closureAfter⟩ :=
+    GlobalIR.closure_created_before_initialization_reads_later_store
+      (GlobalProgramEntry.toDefinitions 0 entries) before (before.set slot (some value))
+      fuel sourceIndex slot value getter beforeEmpty afterInitialized
+  exact ⟨cReadAfterStore, closureAfter⟩
+
+/-- The same shared-cell/closure simulation also preserves the declared value
+type when the pre-write store is well typed and the initializer result has its
+slot type. -/
+theorem declaredValue_shared_closure_observes_later_cell_write_typed
+    (entries : List GlobalProgramEntry.Entry) (environment : List CNameResolution.Entry)
+    (globals : List Surface.Signature) (slotTypes : List Surface.Ty)
+    (before : GlobalIR.Store) (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (value : PolyIR.Value) (fuel : Nat)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (identityMatches : binding.identity = identity)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (slotFits : slot < before.length)
+    (beforeEmpty : before[slot]? = some none)
+    (slotType : slotTypes[slot]? = some type)
+    (beforeTyped : GlobalIR.StoreWellTyped globals slotTypes before)
+    (valueTyped : PolyIR.ValueTyped globals value type) :
+    CNameResolution.readName environment
+        (identityCellStore entries (before.set slot (some value))) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries)
+        (before.set slot (some value)) (fuel + 4)
+        [.closure 0 (.app (.global sourceIndex) []) []] (.app (.var 0) []) = .ok value ∧
+      PolyIR.ValueTyped globals value type := by
+  have observed := declaredValue_shared_closure_observes_later_cell_write entries
+    environment before name binding sourceIndex slot identity type valid initializer value fuel
+    resolved identityMatches entryAt unique ordinal slotFits beforeEmpty
+  have slotTypeGet : slotTypes.get? slot = some type := by
+    simpa only [sourceGetElem?_eq_get?] using slotType
+  have updatedTyped : GlobalIR.StoreWellTyped globals slotTypes
+      (before.set slot (some value)) :=
+    GlobalIR.StoreWellTyped.set globals slotTypes before slot value type beforeTyped
+      slotFits slotTypeGet valueTyped
+  have updatedStored : (before.set slot (some value)).get? slot = some (some value) := by
+    have slotFits' : slot < (before.set slot (some value)).length := by
+      simpa only [List.length_set] using slotFits
+    have updatedIndexed : (before.set slot (some value))[slot]? = some (some value) := by
+      simp only [getElem?_def, dif_pos slotFits']
+      have setValue : (before.set slot (some value))[slot]'slotFits' = some value :=
+        List.get_set_eq before slot (some value) slotFits'
+      simp [setValue]
+    simpa only [sourceGetElem?_eq_get?] using updatedIndexed
+  exact ⟨observed.1, observed.2, updatedTyped slot value type updatedStored slotTypeGet⟩
+
+/-- A successful complete GlobalIR initializer run populates the value slot
+selected by a mixed source declaration index. The resulting store is observed
+as the same value by C-style name lookup and the compiled GlobalIR getter. -/
+theorem declaredValue_successful_initialization_agrees_with_C_name_and_getter
+    (entries : List GlobalProgramEntry.Entry) (environment : List CNameResolution.Entry)
+    (result : GlobalIR.Store) (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity fuel getterFuel : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (identityMatches : binding.identity = identity)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (initialized : GlobalIR.initializeValues (GlobalProgramEntry.toDefinitions 0 entries) fuel
+      (List.replicate (GlobalProgramEntry.initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (GlobalProgramEntry.initializerTerms entries) =
+          .ok result) :
+    ∃ value,
+      CNameResolution.readName environment (identityCellStore entries result) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries) result
+        (getterFuel + 2) [] (.app (.global sourceIndex) []) = .ok value := by
+  obtain ⟨value, stored⟩ := GlobalProgramEntry.sourceValueSlotOrdinal_successful_initialization_populates
+    entries sourceIndex slot identity type valid initializer entryAt ordinal
+    (GlobalProgramEntry.toDefinitions 0 entries) fuel result initialized
+  have observed := resolvedCValueName_agrees_with_compiled_globalIR_getter entries environment
+    result name binding sourceIndex slot identity type valid initializer value getterFuel
+    resolved identityMatches entryAt unique ordinal stored
+  exact ⟨value, observed.1, observed.2⟩
+
+/-- Successful mixed-entry initialization also preserves the declared type of
+the value observed through C-style name lookup and the generated GlobalIR
+getter. This combines the initializer/source-index correspondence with the
+typed-store getter theorem, so both observations refer to one runtime value. -/
+theorem declaredValue_successful_initialization_agrees_with_C_name_and_typed_getter
+    (entries : List GlobalProgramEntry.Entry) (environment : List CNameResolution.Entry)
+    (globals : List Surface.Signature) (slotTypes : List Surface.Ty)
+    (result : GlobalIR.Store) (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity fuel getterFuel : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (identityMatches : binding.identity = identity)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (slotType : slotTypes[slot]? = some type)
+    (storeTyped : GlobalIR.StoreWellTyped globals slotTypes result)
+    (initialized : GlobalIR.initializeValues (GlobalProgramEntry.toDefinitions 0 entries) fuel
+      (List.replicate (GlobalProgramEntry.initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (GlobalProgramEntry.initializerTerms entries) =
+          .ok result) :
+    ∃ value,
+      CNameResolution.readName environment (identityCellStore entries result) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries) result
+        (getterFuel + 2) [] (.app (.global sourceIndex) []) = .ok value ∧
+      PolyIR.ValueTyped globals value type := by
+  obtain ⟨value, nameReads, getterReads⟩ :=
+    declaredValue_successful_initialization_agrees_with_C_name_and_getter
+      entries environment result name binding sourceIndex slot identity fuel getterFuel type
+      valid initializer resolved identityMatches entryAt unique ordinal initialized
+  obtain ⟨storedValue, stored⟩ :=
+    GlobalProgramEntry.sourceValueSlotOrdinal_successful_initialization_populates
+      entries sourceIndex slot identity type valid initializer entryAt ordinal
+      (GlobalProgramEntry.toDefinitions 0 entries) fuel result initialized
+  obtain ⟨typedValue, getterTyped, valueTyped⟩ := GlobalIR.getter_call_preserves_type
+    (GlobalProgramEntry.toDefinitions 0 entries) globals slotTypes result getterFuel
+    sourceIndex slot storedValue type
+    (by
+      obtain ⟨_type, getterLayout⟩ := GlobalProgramEntry.sourceValueSlotOrdinal_layout
+        entries sourceIndex 0 slot ordinal
+      have lookup := GlobalProgramEntry.toDefinitions_getter_of_layout 0 entries sourceIndex
+        ⟨0, [], _type⟩ slot (by simpa using getterLayout)
+      rw [sourceGetElem?_eq_get?]
+      exact lookup)
+    slotType storeTyped
+    stored
+  have valuesEqual : typedValue = value := by
+    have sameResults := getterTyped.symm.trans getterReads
+    exact Except.ok.inj sameResults
+  subst typedValue
+  exact ⟨value, nameReads, getterReads, valueTyped⟩
+
+/-- Compose the executable initializer checker with arithmetic initializer
+preservation, mixed-entry slot initialization, C-style shared-cell lookup,
+and the generated GlobalIR getter. The same typed value is observed through
+the C name environment and the compiled getter. -/
+theorem checkedArithmeticInitializer_agrees_with_C_name_and_typed_getter
+    (checkerFuel : Nat) (entries : List GlobalProgramEntry.Entry)
+    (environment : List CNameResolution.Entry) (globals : List Surface.Signature)
+    (result : GlobalIR.Store) (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity initializerFuel getterFuel : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (identityMatches : binding.identity = identity)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (slotType : (GlobalProgramEntry.valueTypes entries)[slot]? = some type)
+    (accepted : GlobalProgramEntry.checkInitializerRows checkerFuel entries
+      (GlobalProgramEntry.valueTypes entries) 0 entries = true)
+    (arithmeticRows : GlobalProgramEntry.ArithmeticInitializerRows
+      (GlobalProgramEntry.valueTypes entries) 0 entries)
+    (initialized : GlobalIR.initializeValues (GlobalProgramEntry.toDefinitions 0 entries)
+      initializerFuel
+      (List.replicate (GlobalProgramEntry.initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (GlobalProgramEntry.initializerTerms entries) =
+        .ok result) :
+    ∃ value,
+      CNameResolution.readName environment (identityCellStore entries result) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries) result
+        (getterFuel + 2) [] (.app (.global sourceIndex) []) = .ok value ∧
+      PolyIR.ValueTyped globals value type := by
+  have checkerRows := GlobalProgramEntry.checkInitializerRows_sound checkerFuel entries
+    (GlobalProgramEntry.valueTypes entries) 0 entries accepted
+  have typedRows := checkerRows.toTypedInitializerRows checkerFuel entries
+    (GlobalProgramEntry.valueTypes entries) 0 entries
+  have storeTyped := typedRows.initialization_preserves_store_arithmetic entries globals
+    (GlobalProgramEntry.valueTypes entries) (GlobalProgramEntry.toDefinitions 0 entries)
+    initializerFuel entries result arithmeticRows initialized
+  exact declaredValue_successful_initialization_agrees_with_C_name_and_typed_getter
+    entries environment globals (GlobalProgramEntry.valueTypes entries) result name binding
+    sourceIndex slot identity initializerFuel getterFuel type valid initializer resolved
+    identityMatches entryAt unique ordinal slotType storeTyped initialized
+
+/-- General initializer-row version of the C-name/getter composition. The
+only semantic premise is GlobalIR evaluation type preservation for the
+initializers; this isolates that remaining global safety result from the
+source-index, shared-cell, and getter bookkeeping. -/
+theorem checkedInitializer_agrees_with_C_name_and_typed_getter
+    (checkerFuel : Nat) (entries : List GlobalProgramEntry.Entry)
+    (environment : List CNameResolution.Entry) (globals : List Surface.Signature)
+    (initializerFuel getterFuel : Nat) (result : GlobalIR.Store)
+    (name : String) (binding : CNameResolution.Entry)
+    (sourceIndex slot identity : Nat) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (initializer : Surface.Expr)
+    (resolved : CNameResolution.findName environment name = some binding)
+    (identityMatches : binding.identity = identity)
+    (entryAt : entries.get? sourceIndex =
+      some (.value identity type valid initializer))
+    (unique : GlobalProgramEntry.DistinctIds (GlobalProgramEntry.identities entries))
+    (ordinal : GlobalProgramEntry.sourceValueSlotOrdinal entries sourceIndex = some slot)
+    (slotType : (GlobalProgramEntry.valueTypes entries)[slot]? = some type)
+    (accepted : GlobalProgramEntry.checkInitializerRows checkerFuel entries
+      (GlobalProgramEntry.valueTypes entries) 0 entries = true)
+    (evaluationTyped : ∀ currentStore remaining expression value expected,
+      GlobalIR.evaluate (GlobalProgramEntry.toDefinitions 0 entries)
+        currentStore remaining [] expression = .ok value →
+          PolyIR.ValueTyped globals value expected)
+    (initialization : GlobalIR.initializeValues (GlobalProgramEntry.toDefinitions 0 entries)
+      initializerFuel
+      (List.replicate (GlobalProgramEntry.initializerTerms entries).length
+        (none : Option PolyIR.Value)) 0 (GlobalProgramEntry.initializerTerms entries) =
+        .ok result) :
+    ∃ value,
+      CNameResolution.readName environment (identityCellStore entries result) name = some value ∧
+      GlobalIR.evaluate (GlobalProgramEntry.toRuntimeProgram entries entryIndex).definitions result
+        (getterFuel + 2) [] (.app (.global sourceIndex) []) = .ok value ∧
+      PolyIR.ValueTyped globals value type := by
+  have checkerRows := GlobalProgramEntry.checkInitializerRows_sound checkerFuel entries
+    (GlobalProgramEntry.valueTypes entries) 0 entries accepted
+  have typedRows := checkerRows.toTypedInitializerRows checkerFuel entries
+    (GlobalProgramEntry.valueTypes entries) 0 entries
+  have storeTyped := typedRows.initialization_preserves_store entries globals
+    (GlobalProgramEntry.valueTypes entries) (GlobalProgramEntry.toDefinitions 0 entries)
+    initializerFuel entries result evaluationTyped initialization
+  have initialized := declaredValue_successful_initialization_agrees_with_C_name_and_typed_getter
+    entries environment globals (GlobalProgramEntry.valueTypes entries) result name binding
+    sourceIndex slot identity initializerFuel getterFuel type valid initializer resolved
+    identityMatches entryAt unique ordinal slotType storeTyped initialization
+  exact initialized
 
 theorem resolvedCValueName_uninitialized_matches_globalIR_early_read
     (entries : List GlobalProgramEntry.Entry) (environment : List CNameResolution.Entry)
@@ -629,6 +942,76 @@ theorem initializerRow_of_typed_evaluation
   refine ⟨checked, rfl, ?_, evaluated⟩
   exact GlobalProgramEntry.TypedInitializerRows.value_of_checked_initializer
     entries slotTypes slot identity type valid expression tail rest slotType checked
+
+/-- A successful initializer type-check certificate plus its successful
+GlobalIR evaluation constructs the mixed-program typed initializer row. This
+composes checker output with runtime evidence instead of asking the caller to
+restate the `HasType` derivation carried by the certificate. -/
+theorem initializerRow_of_checker_and_evaluation
+    (entries : List GlobalProgramEntry.Entry) (slotTypes : List Surface.Ty)
+    (slot identity : Nat) (type : Surface.Ty) (valid : type.wellFormed 0)
+    (expression : Surface.Expr) (tail : List GlobalProgramEntry.Entry)
+    (rest : GlobalProgramEntry.TypedInitializerRows entries slotTypes (slot + 1) tail)
+    (slotType : slotTypes.get? slot = some type) (checkerFuel : Nat)
+    (checkerAccepted : (GlobalProgramEntry.checkInitializer checkerFuel entries
+      expression type).isSome = true)
+    (globals : List Surface.Signature)
+    (globalsAgree : GlobalProgramEntry.signatures entries = globals)
+    (program : List GlobalIR.Definition) (store : GlobalIR.Store)
+    (evaluationFuel : Nat) (environment : List PolyIR.Value) (value : PolyIR.Value)
+    (evaluated : GlobalIR.evaluate program store evaluationFuel environment
+      (PolyIR.erase expression) = .ok value) :
+    ∃ checked : GlobalProgramEntry.TypedInitializer entries type expression,
+      checked.expression = expression ∧
+      GlobalProgramEntry.TypedInitializerRows entries slotTypes slot
+        (.value identity type valid checked.expression :: tail) ∧
+      GlobalIR.evaluate program store evaluationFuel environment
+        (PolyIR.erase expression) = .ok value := by
+  obtain ⟨certified, _accepted, certifiedTyping, sourceExact, _erasure⟩ :=
+    GlobalProgramEntry.checkInitializer_sound checkerFuel entries expression type checkerAccepted
+  have expressionTyping : Surface.HasType (GlobalProgramEntry.signatures entries) 0 []
+      expression type := by
+    rw [← sourceExact]
+    exact certifiedTyping
+  have expressionTypingGlobals : Surface.HasType globals 0 [] expression type := by
+    rw [← globalsAgree]
+    exact expressionTyping
+  exact initializerRow_of_typed_evaluation entries slotTypes slot identity type valid expression
+    tail rest slotType globals globalsAgree expressionTypingGlobals program store evaluationFuel
+    environment value evaluated
+
+/-- End-to-end single-row bridge from the source initializer reader through
+the executable type checker and successful GlobalIR evaluation. -/
+theorem readClosedInitializer_typedRow_of_checker_and_evaluation
+    (entries visible : List GlobalProgramEntry.Entry) (forbidden : List Nat)
+    (slotTypes : List Surface.Ty)
+    (readerFuel checkerFuel slot identity : Nat) (node : Node) (type : Surface.Ty)
+    (valid : type.wellFormed 0) (expression : Surface.Expr)
+    (tail : List GlobalProgramEntry.Entry)
+    (rest : GlobalProgramEntry.TypedInitializerRows entries slotTypes (slot + 1) tail)
+    (slotType : slotTypes.get? slot = some type)
+    (decoded : readClosedInitializer entries visible forbidden readerFuel node =
+      some expression)
+    (checkerAccepted : (GlobalProgramEntry.checkInitializer checkerFuel entries
+      expression type).isSome = true)
+    (globals : List Surface.Signature)
+    (globalsAgree : GlobalProgramEntry.signatures entries = globals)
+    (program : List GlobalIR.Definition) (store : GlobalIR.Store)
+    (evaluationFuel : Nat) (environment : List PolyIR.Value) (value : PolyIR.Value)
+    (evaluated : GlobalIR.evaluate program store evaluationFuel environment
+      (PolyIR.erase expression) = .ok value) :
+    ∃ checked : GlobalProgramEntry.TypedInitializer entries type expression,
+      readClosedInitializer entries visible forbidden readerFuel node =
+        some checked.expression ∧ checked.expression = expression ∧
+      GlobalProgramEntry.TypedInitializerRows entries slotTypes slot
+        (.value identity type valid checked.expression :: tail) ∧
+      GlobalIR.evaluate program store evaluationFuel environment
+        (PolyIR.erase expression) = .ok value := by
+  obtain ⟨checked, expressionEq, rows, evaluation⟩ :=
+    initializerRow_of_checker_and_evaluation entries slotTypes slot identity type valid
+      expression tail rest slotType checkerFuel checkerAccepted globals globalsAgree program store
+      evaluationFuel environment value evaluated
+  exact ⟨checked, by rw [expressionEq]; exact decoded, expressionEq, rows, evaluation⟩
 
 /-- Generic row constructor for any expression in the proved arithmetic
 fragment. The caller supplies its evaluation result; typing follows from the
@@ -2592,6 +2975,72 @@ theorem readClosedInitializer_valueReference_runtime_reports_early_read
 /-- When a decoded top-level value reference is the first initializer and its
 getter slot is still empty, the source-resolved reference's early-read fault
 becomes the observable `GlobalIR.run` result. -/
+theorem readClosedInitializer_fault_reports_run_fault_after_prefix
+    (entries visible : List GlobalProgramEntry.Entry) (forbidden : List Nat)
+    (decodeFuel fuel : Nat) (node : CBindingWalk.Node) (expression : Surface.Expr)
+    (program : GlobalIR.Program) (initializersBefore tail : List PolyIR.Term)
+    (after : GlobalIR.Store) (fault : GlobalIR.Fault)
+    (decoded : readClosedInitializer entries visible forbidden decodeFuel node =
+      some expression)
+    (programLayout : program.initializers =
+      initializersBefore ++ PolyIR.erase expression :: tail)
+    (prefixSuccess : GlobalIR.initializeValues program.definitions
+      (fuel + initializersBefore.length + 2)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after)
+    (runtimeFault : GlobalIR.evaluate program.definitions after (fuel + 1) []
+      (PolyIR.erase expression) = .error fault) :
+    readClosedInitializer entries visible forbidden decodeFuel node = some expression ∧
+      GlobalIR.run program (fuel + initializersBefore.length + 2) = .error fault := by
+  exact ⟨decoded, GlobalIR.run_reports_initializer_fault_after_prefix program fuel
+    initializersBefore (PolyIR.erase expression) tail after fault programLayout
+    prefixSuccess runtimeFault⟩
+
+/-- Compose a C reader result at a node of an accepted finite expansion with
+the source-to-GlobalIR call-fragment fault theorem. The checked expansion
+retains the finite source/target syntax and scope certificate; source
+evaluation and prefix success are explicit semantic premises. -/
+theorem checkedExpansion_readClosedInitializer_fault_reports_run_after_prefix
+    (expansion : ProcessCertificate.CheckedExpansion)
+    (nodeIndex decodeFuel fuel : Nat) (entries visible : List GlobalProgramEntry.Entry)
+    (forbidden : List Nat) (node : CBindingWalk.Node) (expression : Surface.Expr)
+    (sourceProgram : Surface.Definitions) (initializersBefore tail : List PolyIR.Term)
+    (entry : Nat) (after : GlobalIR.Store) (fault : PolyIR.Fault)
+    (nodeFound : expansion.annotated[nodeIndex]? = some node)
+    (decoded : readClosedInitializer entries visible forbidden decodeFuel node = some expression)
+    (fragments : FunctionTableCallTerms (PolyIR.eraseDefinitions sourceProgram)
+      (initializersBefore ++ PolyIR.erase expression :: tail))
+    (prefixSuccess : initializeValuesCore (PolyIR.eraseDefinitions sourceProgram)
+      (fuel + initializersBefore.length + 2)
+      (List.replicate (initializersBefore ++ PolyIR.erase expression :: tail).length none)
+      0 initializersBefore = .ok after)
+    (sourceFault : Surface.evaluate sourceProgram (fuel + 1) [] expression = .error fault) :
+    expansion.text.toUTF8.data.data = expansion.bytes ∧
+      SourceReader.readWithFuel expansion.lexFuel expansion.parseFuel expansion.text =
+        some expansion.parsed ∧
+      SourceReader.normalize expansion.parsed = some expansion.normalized ∧
+      CExpansion.Expands (CExpansion.sourceRules 0 expansion.normalized)
+      (.list (CExpansion.programForms expansion.normalized)) (.list expansion.expanded) ∧
+      CExpansion.disjointIntervals
+        (ExpansionCertificate.freshIntervals expansion.localCertificate) = true ∧
+      expansion.annotated.map CBindingWalk.Node.erase = expansion.expanded ∧
+      (∃ sites, CBindingWalk.references expansion.scopeFuel expansion.annotated
+        CBindingWalk.builtinEnvironment = some sites ∧
+        ∀ site ∈ sites, CBindingWalk.Corresponds site) ∧
+      expansion.annotated[nodeIndex]? = some node ∧
+      readClosedInitializer entries visible forbidden decodeFuel node = some expression ∧
+      GlobalIR.run
+        ⟨(PolyIR.eraseDefinitions sourceProgram).map GlobalIR.Definition.function,
+          initializersBefore ++ PolyIR.erase expression :: tail, entry⟩
+        (fuel + initializersBefore.length + 2) = .error (.core fault) := by
+  have certificateFacts := ProcessCertificate.source_expands_with_scopes_and_freshness expansion
+  rcases certificateFacts with
+    ⟨bytesMatch, parses, normalizes, finiteExpansion, fresh, syntaxCorr, scope⟩
+  refine ⟨bytesMatch, parses, normalizes, finiteExpansion, fresh, syntaxCorr, scope,
+    nodeFound, decoded, ?_⟩
+  exact functionTable_sourceFault_run_reports_initializer_fault_after_prefix
+    sourceProgram initializersBefore tail expression entry fuel after fault fragments
+    prefixSuccess sourceFault
+
 theorem readClosedInitializer_firstInitializer_reports_early_read
     (entries visible : List GlobalProgramEntry.Entry) (forms : List Node)
     (formIndex fuel selected index : Nat) (atom : CMacroCopy.Atom)
@@ -2721,6 +3170,269 @@ theorem readClosedInitializer_intEq_builtin_wrong_shape_reports_run_fault
   exact readClosedInitializer_intEq_wrong_shape_reports_run_fault entries visible forbidden
     (decodeFuel + 1) fuel (.list [.atom operator selected, leftNode, rightNode])
     sourceProgram program decoded programDefinitions programInitializers
+
+/-- The concrete C reader's `integer=` wrong-shape fault remains observable
+when it occurs after an arbitrary successfully initialized top-level prefix. -/
+theorem readClosedInitializer_intEq_builtin_wrong_shape_reports_run_fault_after_prefix
+    (entries visible : List GlobalProgramEntry.Entry) (forbidden : List Nat)
+    (decodeFuel fuel selected : Nat) (operator : CMacroCopy.Atom)
+    (leftNode rightNode : CBindingWalk.Node) (initializersBefore : List PolyIR.Term)
+    (after : GlobalIR.Store) (sourceProgram : Surface.Definitions)
+    (program : GlobalIR.Program)
+    (selectedEq : selected = 24) (operatorName : operator.name = "integer=")
+    (notForbidden : selected ∉ forbidden)
+    (notVisibleFunction : visibleFunctionIndex entries visible selected = none)
+    (leftDecoded : readClosedInitializer entries visible forbidden decodeFuel leftNode =
+      some (.bool true))
+    (rightDecoded : readClosedInitializer entries visible forbidden decodeFuel rightNode =
+      some (.int 4))
+    (programDefinitions : program.definitions = [])
+    (programInitializers : program.initializers =
+      initializersBefore ++ [PolyIR.erase (.intEq (.bool true) (.int 4))])
+    (prefixSuccess : GlobalIR.initializeValues program.definitions
+      (fuel + initializersBefore.length + 3)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after) :
+    readClosedInitializer entries visible forbidden (decodeFuel + 1)
+        (.list [.atom operator selected, leftNode, rightNode]) =
+        some (.intEq (.bool true) (.int 4)) ∧
+      Surface.evaluate sourceProgram (fuel + 2) [] (.intEq (.bool true) (.int 4)) =
+        .error .wrongShape ∧
+      GlobalIR.run program (fuel + initializersBefore.length + 3) =
+        .error (.core .wrongShape) := by
+  have decoded := readClosedInitializer_intEq entries visible forbidden decodeFuel selected
+    operator leftNode rightNode (.bool true) (.int 4) selectedEq operatorName notForbidden
+    notVisibleFunction leftDecoded rightDecoded
+  have sourceLeft : Surface.evaluate sourceProgram (fuel + 1) [] (.bool true) =
+      .ok (.bool true) := by rfl
+  have sourceRight : Surface.evaluate sourceProgram (fuel + 1) [] (.int 4) =
+      .ok (.int 4) := by rfl
+  have runtimeLeft : GlobalIR.evaluate [] after (fuel + 1) [] (.bool true) =
+      .ok (.bool true) := by cases fuel <;> rfl
+  have runtimeRight : GlobalIR.evaluate [] after (fuel + 1) [] (.int 4) =
+      .ok (.int 4) := by cases fuel <;> rfl
+  have mismatch : ¬ ∃ leftInt rightInt,
+      Surface.Value.bool true = .int leftInt ∧ Surface.Value.int 4 = .int rightInt := by
+    rintro ⟨_, _, hLeft, _⟩
+    cases hLeft
+  have correspondingFault := NLisp.intEq_wrong_shape_fault_corresponds_to_globalIR
+    sourceProgram [] after (fuel + 1) [] (.bool true) (.int 4)
+    (.bool true) (.int 4) sourceLeft sourceRight runtimeLeft runtimeRight mismatch
+  have runtimeFault : GlobalIR.evaluate [] after (fuel + 2) []
+      (.intEq (.bool true) (.int 4)) = .error (.core .wrongShape) := by
+    cases fuel <;> simp [GlobalIR.evaluate]
+  have sourceFault := correspondingFault.mpr (by
+    simpa [PolyIR.erase] using runtimeFault)
+  have runFault := GlobalIR.run_reports_initializer_fault_after_prefix program (fuel + 1)
+    initializersBefore (PolyIR.erase (.intEq (.bool true) (.int 4))) [] after
+    (.core .wrongShape) programInitializers
+    (by simpa [programDefinitions, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm]
+      using prefixSuccess)
+    (by simpa [programDefinitions, PolyIR.erase] using runtimeFault)
+  exact ⟨decoded, by simpa [Nat.add_assoc] using sourceFault,
+    by simpa [programInitializers, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm]
+      using runFault⟩
+
+/-- The annotated C reader's Float builtin branch preserves a wrong-shape
+fault through an arbitrary successful initializer prefix and exposes it as
+the GlobalIR program result. -/
+theorem readClosedInitializer_floatBin_builtin_wrong_shape_reports_run_fault_after_prefix
+    (entries visible : List GlobalProgramEntry.Entry) (forbidden : List Nat)
+    (decodeFuel fuel selected : Nat) (operator : CMacroCopy.Atom)
+    (leftNode rightNode : CBindingWalk.Node) (operation : Surface.FloatBinOp)
+    (initializersBefore : List PolyIR.Term) (after : GlobalIR.Store)
+    (sourceProgram : Surface.Definitions) (program : GlobalIR.Program)
+    (builtin : (selected = 39 ∧ operator.name = "float+" ∧ operation = .add) ∨
+      (selected = 42 ∧ operator.name = "float-" ∧ operation = .sub) ∨
+      (selected = 45 ∧ operator.name = "float*" ∧ operation = .mul) ∨
+      (selected = 48 ∧ operator.name = "float/" ∧ operation = .div))
+    (notForbidden : selected ∉ forbidden)
+    (leftDecoded : readClosedInitializer entries visible forbidden decodeFuel leftNode =
+      some (.bool true))
+    (rightDecoded : readClosedInitializer entries visible forbidden decodeFuel rightNode =
+      some (.int 4))
+    (programDefinitions : program.definitions = [])
+    (programInitializers : program.initializers = initializersBefore ++
+      [PolyIR.erase (.floatBin operation (.bool true) (.int 4))])
+    (prefixSuccess : GlobalIR.initializeValues program.definitions
+      (fuel + initializersBefore.length + 3)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after) :
+    readClosedInitializer entries visible forbidden (decodeFuel + 1)
+        (.list [.atom operator selected, leftNode, rightNode]) =
+        some (.floatBin operation (.bool true) (.int 4)) ∧
+      Surface.evaluate sourceProgram (fuel + 2) []
+        (.floatBin operation (.bool true) (.int 4)) = .error .wrongShape ∧
+      GlobalIR.run program (fuel + initializersBefore.length + 3) =
+        .error (.core .wrongShape) := by
+  have decoded := readClosedInitializer_floatBin entries visible forbidden decodeFuel selected
+    operator leftNode rightNode operation (.bool true) (.int 4) builtin notForbidden
+    leftDecoded rightDecoded
+  have sourceLeft : Surface.evaluate sourceProgram (fuel + 1) [] (.bool true) =
+      .ok (.bool true) := by rfl
+  have sourceRight : Surface.evaluate sourceProgram (fuel + 1) [] (.int 4) =
+      .ok (.int 4) := by rfl
+  have runtimeLeft : GlobalIR.evaluate [] after (fuel + 1) [] (.bool true) =
+      .ok (.bool true) := by cases fuel <;> rfl
+  have runtimeRight : GlobalIR.evaluate [] after (fuel + 1) [] (.int 4) =
+      .ok (.int 4) := by cases fuel <;> rfl
+  have notBothFloats : ¬ ∃ x y, Surface.Value.bool true = .float x ∧
+      Surface.Value.int 4 = .float y := by
+    rintro ⟨_, _, leftIsFloat, _⟩
+    cases leftIsFloat
+  have correspondingFault := readClosedInitializer_floatBin_wrong_shape_fault_corresponds_to_globalIR
+    entries visible forbidden decodeFuel (fuel + 1) selected operator leftNode rightNode
+    operation (.bool true) (.int 4) sourceProgram [] after [] (.bool true) (.int 4)
+    builtin notForbidden leftDecoded rightDecoded sourceLeft sourceRight
+    runtimeLeft runtimeRight notBothFloats
+  have runtimeFault : GlobalIR.evaluate [] after (fuel + 2) []
+      (.floatBin operation (.bool true) (.int 4)) = .error (.core .wrongShape) := by
+    simp [GlobalIR.evaluate, runtimeLeft, runtimeRight, bind, Except.bind,
+      Except.pure, pure]
+  have sourceFault := correspondingFault.2.mpr runtimeFault
+  have prefixSuccess' : GlobalIR.initializeValues program.definitions
+      (fuel + 1 + initializersBefore.length + 2)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after := by
+    simpa [Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using prefixSuccess
+  have runFault := GlobalIR.run_reports_initializer_fault_after_prefix program (fuel + 1)
+    initializersBefore (PolyIR.erase (.floatBin operation (.bool true) (.int 4))) [] after
+    (.core .wrongShape) programInitializers prefixSuccess'
+    (by simpa [programDefinitions, PolyIR.erase] using runtimeFault)
+  exact ⟨decoded, sourceFault, by
+    simpa [programInitializers, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using runFault⟩
+
+/-- A C-reader `if` whose condition decodes to an integer preserves the
+source wrong-shape fault through a successful top-level initializer prefix
+and exposes the same fault as `GlobalIR.run`. -/
+theorem readClosedInitializer_if_wrong_condition_reports_run_fault_after_prefix
+    (entries visible : List GlobalProgramEntry.Entry) (forbidden : List Nat)
+    (decodeFuel fuel : Nat) (keyword : CMacroCopy.Atom) (keywordToken : Nat)
+    (conditionNode yesNode noNode : CBindingWalk.Node)
+    (initializersBefore : List PolyIR.Term) (after : GlobalIR.Store)
+    (sourceProgram : Surface.Definitions) (program : GlobalIR.Program)
+    (keywordName : keyword.name = "if")
+    (conditionDecoded : readClosedInitializer entries visible forbidden decodeFuel
+      conditionNode = some (.int 1))
+    (yesDecoded : readClosedInitializer entries visible forbidden decodeFuel yesNode =
+      some (.bool true))
+    (noDecoded : readClosedInitializer entries visible forbidden decodeFuel noNode =
+      some (.bool false))
+    (programInitializers : program.initializers = initializersBefore ++
+      [PolyIR.erase (.ite (.int 1) (.bool true) (.bool false))])
+    (prefixSuccess : GlobalIR.initializeValues program.definitions
+      (fuel + initializersBefore.length + 3)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after) :
+    readClosedInitializer entries visible forbidden (decodeFuel + 1)
+        (.list [.atom keyword keywordToken, conditionNode, yesNode, noNode]) =
+        some (.ite (.int 1) (.bool true) (.bool false)) ∧
+      Surface.evaluate sourceProgram (fuel + 2) []
+        (.ite (.int 1) (.bool true) (.bool false)) = .error .wrongShape ∧
+      GlobalIR.run program (fuel + initializersBefore.length + 3) =
+        .error (.core .wrongShape) := by
+  have decoded : readClosedInitializer entries visible forbidden (decodeFuel + 1)
+      (.list [.atom keyword keywordToken, conditionNode, yesNode, noNode]) =
+      some (.ite (.int 1) (.bool true) (.bool false)) := by
+    have noFloat : floatBuiltinOperator keywordToken "if" = none := by
+      by_cases h39 : keywordToken = 39
+      · subst keywordToken; rfl
+      · by_cases h42 : keywordToken = 42
+        · subst keywordToken; rfl
+        · by_cases h45 : keywordToken = 45
+          · subst keywordToken; rfl
+          · by_cases h48 : keywordToken = 48
+            · subst keywordToken; rfl
+            · simp [floatBuiltinOperator, h39, h42, h45, h48]
+    have ifNotTypeApp : "if" ≠ "type-app" := by decide
+    simp [readClosedInitializer, ExpansionLowering.name, noFloat, keywordName,
+      ifNotTypeApp,
+      conditionDecoded, yesDecoded, noDecoded]
+  have sourceFault : Surface.evaluate sourceProgram (fuel + 2) []
+      (.ite (.int 1) (.bool true) (.bool false)) = .error .wrongShape := by
+    simp [Surface.evaluate]
+  have runtimeFault : GlobalIR.evaluate program.definitions after (fuel + 2) []
+      (.ite (.int 1) (.bool true) (.bool false)) = .error (.core .wrongShape) := by
+    cases fuel <;> simp [GlobalIR.evaluate]
+  have prefixSuccess' : GlobalIR.initializeValues program.definitions
+      (fuel + 1 + initializersBefore.length + 2)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after := by
+    simpa [Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using prefixSuccess
+  have runFault := GlobalIR.run_reports_initializer_fault_after_prefix program (fuel + 1)
+    initializersBefore (PolyIR.erase (.ite (.int 1) (.bool true) (.bool false))) [] after
+    (.core .wrongShape) programInitializers prefixSuccess'
+    (by simpa [PolyIR.erase] using runtimeFault)
+  exact ⟨decoded, sourceFault, by
+    simpa [programInitializers, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using runFault⟩
+
+/-- General C-reader conditional fault correspondence. If the decoded
+condition evaluates to corresponding non-Boolean values in Surface and
+GlobalIR, then the reader-produced `if` reports `.wrongShape`; after any
+successful initializer prefix, this remains the observable `run` fault. -/
+theorem readClosedInitializer_if_nonboolean_condition_reports_run_fault_after_prefix
+    (entries visible : List GlobalProgramEntry.Entry) (forbidden : List Nat)
+    (decodeFuel fuel : Nat) (keyword : CMacroCopy.Atom) (keywordToken : Nat)
+    (conditionNode yesNode noNode : CBindingWalk.Node)
+    (condition yes no : Surface.Expr) (conditionValue : Surface.Value)
+    (initializersBefore : List PolyIR.Term) (after : GlobalIR.Store)
+    (sourceProgram : Surface.Definitions) (program : GlobalIR.Program)
+    (keywordName : keyword.name = "if")
+    (conditionDecoded : readClosedInitializer entries visible forbidden decodeFuel
+      conditionNode = some condition)
+    (yesDecoded : readClosedInitializer entries visible forbidden decodeFuel yesNode =
+      some yes)
+    (noDecoded : readClosedInitializer entries visible forbidden decodeFuel noNode =
+      some no)
+    (conditionEvaluates : Surface.evaluate sourceProgram (fuel + 1) [] condition =
+      .ok conditionValue)
+    (conditionRuntime : GlobalIR.evaluate program.definitions after (fuel + 1) []
+      (PolyIR.erase condition) = .ok (PolyIR.eraseValue conditionValue))
+    (conditionNotBoolean : ∀ boolean, conditionValue ≠ .bool boolean)
+    (programInitializers : program.initializers = initializersBefore ++
+      [PolyIR.erase (.ite condition yes no)])
+    (prefixSuccess : GlobalIR.initializeValues program.definitions
+      (fuel + initializersBefore.length + 3)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after) :
+    readClosedInitializer entries visible forbidden (decodeFuel + 1)
+        (.list [.atom keyword keywordToken, conditionNode, yesNode, noNode]) =
+        some (.ite condition yes no) ∧
+      Surface.evaluate sourceProgram (fuel + 2) [] (.ite condition yes no) =
+        .error .wrongShape ∧
+      GlobalIR.run program (fuel + initializersBefore.length + 3) =
+        .error (.core .wrongShape) := by
+  have decoded : readClosedInitializer entries visible forbidden (decodeFuel + 1)
+      (.list [.atom keyword keywordToken, conditionNode, yesNode, noNode]) =
+      some (.ite condition yes no) := by
+    have noFloat : floatBuiltinOperator keywordToken "if" = none := by
+      by_cases h39 : keywordToken = 39
+      · subst keywordToken; rfl
+      · by_cases h42 : keywordToken = 42
+        · subst keywordToken; rfl
+        · by_cases h45 : keywordToken = 45
+          · subst keywordToken; rfl
+          · by_cases h48 : keywordToken = 48
+            · subst keywordToken; rfl
+            · simp [floatBuiltinOperator, h39, h42, h45, h48]
+    have ifNotTypeApp : "if" ≠ "type-app" := by decide
+    simp [readClosedInitializer, ExpansionLowering.name, noFloat, keywordName,
+      ifNotTypeApp, conditionDecoded, yesDecoded, noDecoded]
+  have sourceFault : Surface.evaluate sourceProgram (fuel + 2) []
+      (.ite condition yes no) = .error .wrongShape := by
+    simp only [Surface.evaluate]
+    rw [conditionEvaluates]
+    cases conditionValue <;> simp_all [bind, pure, Except.bind, Except.pure]
+  have runtimeFault : GlobalIR.evaluate program.definitions after (fuel + 2) []
+      (PolyIR.erase (.ite condition yes no)) = .error (.core .wrongShape) := by
+    simp only [PolyIR.erase, GlobalIR.evaluate]
+    rw [conditionRuntime]
+    cases conditionValue <;>
+      simp_all [PolyIR.eraseValue, bind, pure, Except.bind, Except.pure]
+  have prefixSuccess' : GlobalIR.initializeValues program.definitions
+      (fuel + 1 + initializersBefore.length + 2)
+      (List.replicate program.initializers.length none) 0 initializersBefore = .ok after := by
+    simpa [Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using prefixSuccess
+  have runFault := GlobalIR.run_reports_initializer_fault_after_prefix program (fuel + 1)
+    initializersBefore (PolyIR.erase (.ite condition yes no)) [] after (.core .wrongShape)
+    programInitializers prefixSuccess'
+    (by simpa [PolyIR.erase] using runtimeFault)
+  exact ⟨decoded, sourceFault, by
+    simpa [programInitializers, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm] using runFault⟩
 
 theorem readClosedInitializer_valueReference_runtime_preserves_type
     (entries visible : List GlobalProgramEntry.Entry) (forms : List Node)

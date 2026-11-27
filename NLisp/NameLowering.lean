@@ -150,6 +150,21 @@ termination_by sizeOf env
 decreasing_by all_goals simp_wf; omega
 end
 
+/-- Inverting closure lowering recovers all three runtime components. This is
+the value-level bridge needed when an application evaluates its callee before
+dispatching: a related IR closure has the same arity, lowered body, and
+captured environment. -/
+theorem lowerValue_closure_injective (parameters : List Nat) (body : Expr)
+    (environment : Environment) (arity : Nat) (loweredBody : PolyIR.Term)
+    (loweredEnvironment : List PolyIR.Value)
+    (same : lowerValue (.closure parameters body environment) =
+      .closure arity loweredBody loweredEnvironment) :
+    parameters.length = arity ∧
+      lower (parameters ++ identities environment) body = loweredBody ∧
+      lowerEnv environment = loweredEnvironment := by
+  simp [lowerValue] at same
+  exact same
+
 def lowerValues (values : List Value) : List PolyIR.Value := values.map lowerValue
 
 def lowerDefinitions (program : Definitions) : List PolyIR.RuntimeDefinition :=
@@ -1047,6 +1062,28 @@ theorem divergence_preserved_and_reflected (program : Definitions) (env : Enviro
   · intro loweredDiverges sourceTerminates
     exact loweredDiverges ((termination_preserved_and_reflected program env expression
       reflection).1 sourceTerminates)
+
+/-- Binder arity is necessary for reverse reflection: lowering erases the
+identity list of a parallel `letMany`, so an unaligned source let can still
+evaluate in PolyIR even though the Named rule rejects its initializer count.
+Checked decoding rules out this counterexample through
+`decodeExprChecked_letMany_lengths`. -/
+theorem unaligned_letMany_lowered_terminates_without_named_evaluation :
+    LoweredTerminates [] [] (.letMany [] [.int 7] (.int 9)) ∧
+      ¬ SourceTerminates [] [] (.letMany [] [.int 7] (.int 9)) := by
+  constructor
+  · refine ⟨.int 9, ?_⟩
+    rw [lower_eq]
+    exact PolyIR.Evaluates.letMany
+      (PolyIR.ArgumentsEvaluate.cons PolyIR.Evaluates.int PolyIR.ArgumentsEvaluate.nil)
+      PolyIR.Evaluates.int
+  · rintro ⟨value, evaluated⟩
+    cases evaluated with
+    | letMany argumentsEval arity bodyEval =>
+        cases argumentsEval with
+        | cons _ tailEval =>
+            cases tailEval with
+            | nil => simp at arity
 
 end
 end NLisp.Named
