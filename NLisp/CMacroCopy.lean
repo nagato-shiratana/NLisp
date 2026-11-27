@@ -12,7 +12,7 @@ structure Atom where
 inductive Tree where
   | atom : Atom → Tree
   | list : List Tree → Tree
-  deriving Repr
+  deriving Repr, Inhabited
 
 /- Use the nested structural recursor. A sizeOf-based well-founded comparator
 would compute the size of every string/character during kernel reduction. -/

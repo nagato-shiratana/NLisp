@@ -65,14 +65,18 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/lean_bridge.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
       add_test(NAME macro_termination COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/macro_termination.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
+      add_test(NAME macro_reference_bridge COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/macro_reference_bridge.py
+        $<TARGET_FILE:nlisp> ${CMAKE_CURRENT_SOURCE_DIR}/examples/recursive_expansion.nlisp
+        --lake ${NLISP_LAKE})
       add_test(NAME source_reader COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/source_reader.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
       add_test(NAME poly_bridge COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_bridge.py $<TARGET_FILE:nlisp> ${NLISP_LAKE})
-      set_tests_properties(lean_bridge macro_termination source_reader poly_bridge PROPERTIES
+      set_tests_properties(lean_bridge macro_termination macro_reference_bridge source_reader poly_bridge PROPERTIES
         FIXTURES_REQUIRED lean_library)
       set_tests_properties(builtins_run syntax_run global_initialization independent_certificate
-        lean_bridge macro_termination source_reader poly_bridge PROPERTIES
+        lean_bridge macro_termination macro_reference_bridge source_reader poly_bridge PROPERTIES
         ENVIRONMENT "PYTHONUTF8=1")
       foreach(model SurfaceIR Erasure ErasureMagnitude EvaluatorCorrectness ErasureExecution SurfaceChecker ExpansionLowering NameLowering TypeArguments PolymorphicSafety GlobalIR CheckerCompleteness)
         add_test(NAME lean_${model} COMMAND ${NLISP_LAKE} env lean tests/${model}.lean)

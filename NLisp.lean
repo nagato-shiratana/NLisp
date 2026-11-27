@@ -12,6 +12,7 @@ import NLisp.ExpansionCertificate
 import NLisp.BinderCertificateComposition
 import NLisp.CertificateSize
 import NLisp.MacroTermination
+import NLisp.MacroReferenceModel
 import NLisp.SourceReader
 import NLisp.ProcessCertificate
 import NLisp.Surface
